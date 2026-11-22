@@ -32,7 +32,15 @@ and point any MCP client at that command as a stdio server. The
 client handshake is the standard one: `initialize`, then
 `notifications/initialized`, then `tools/list` / `tools/call`.
 
-What this is not (yet): no sampling. That is the next slice.
+Sampling is a client capability, so the server asks the client for
+completions instead of calling a model itself: the `blackbox_sample`
+tool sends a `sampling/createMessage` request to the connected
+client and returns the sampled text. The prompt is redacted before
+it is sent, and the sampled completion is recorded in the log as a
+`model_call` step, like any other model call. If the client
+declines or does not support sampling, the tool reports an error
+instead of failing the server. The Sampler in `sampling.py` is the
+same request over stdio, usable without the tool.
 """
 
 import json
@@ -43,11 +51,13 @@ from .costs import cost_for
 from .recorder import Recorder
 from .redact import REDACTED
 from .replay import _short, format_record, load_records
+from .sampling import (Sampler, SamplingDeclinedError, SamplingError,
+                       SamplingNotSupportedError, StdioTransport)
 from .verify import verify
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "blackbox"
-SERVER_VERSION = "0.7.0"
+SERVER_VERSION = "0.8.0"
 
 # JSON-RPC error codes.
 PARSE_ERROR = -32700
@@ -97,6 +107,47 @@ TOOLS = [
         "name": "blackbox_replay",
         "description": "Read the log back as a readable transcript.",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "blackbox_sample",
+        "description": ("Ask the connected client for an LLM completion "
+                        "(MCP sampling). The prompt is redacted before "
+                        "it is sent, and the sampled text is recorded in "
+                        "the log as a model_call step. Returns an error "
+                        "if the client declines or does not support "
+                        "sampling."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "messages": {"type": "array",
+                             "description": "Messages to sample from: "
+                                            "each {\"role\": \"user\" | "
+                                            "\"assistant\", \"content\": "
+                                            "text or a text block}"},
+                "systemPrompt": {"type": "string",
+                                 "description": "Optional system prompt"},
+                "modelPreferences": {"type": "object",
+                                     "description": "Optional model "
+                                                    "preferences: hints, "
+                                                    "costPriority, "
+                                                    "speedPriority, "
+                                                    "intelligencePriority"},
+                "maxTokens": {"type": "integer",
+                              "description": "Maximum tokens to sample "
+                                             "(default 1024)"},
+                "includeContext": {"type": "string",
+                                   "description": "Optional: none, "
+                                                  "thisServer or "
+                                                  "allServers"},
+                "temperature": {"type": "number",
+                                "description": "Optional sampling "
+                                               "temperature"},
+                "stopSequences": {"type": "array",
+                                  "description": "Optional stop "
+                                                 "sequences"},
+            },
+            "required": ["messages"],
+        },
     },
 ]
 
@@ -203,12 +254,35 @@ SUMMARIZE_ANOMALIES_PROMPT = (
 
 
 class MCPServer:
-    """A blackbox MCP server bound to one log file."""
+    """A blackbox MCP server bound to one log file.
 
-    def __init__(self, log_path, task=None, model=None):
+    `sampler` is an optional Sampler for MCP sampling: if given,
+    the `blackbox_sample` tool (and `sample()`) ask the connected
+    client for completions through it. When the server runs on
+    stdio via serve(), a Sampler over the same stdio streams is
+    attached automatically if none was given.
+    """
+
+    def __init__(self, log_path, task=None, model=None, sampler=None):
         self.log_path = log_path
         self.recorder = Recorder(log_path, task=task, model=model)
+        self.sampler = sampler
+        self._transport = None
         self._initialized = False
+
+    def sample(self, messages, **kwargs):
+        """Ask the connected client for one completion.
+
+        Raises SamplingNotSupportedError when no sampler is
+        attached (the server is not connected to a client that can
+        sample), and the Sampler's other errors when the client
+        declines or answers badly.
+        """
+        if self.sampler is None:
+            raise SamplingNotSupportedError(
+                "no sampling client attached: start the server with "
+                "serve() over stdio, or pass a Sampler")
+        return self.sampler.sample(messages, **kwargs)
 
     def handle_message(self, message):
         """Handle one decoded JSON-RPC message.
@@ -271,6 +345,8 @@ class MCPServer:
             return self._tool_verify(msg_id)
         if name == "blackbox_replay":
             return self._tool_replay(msg_id)
+        if name == "blackbox_sample":
+            return self._tool_sample(msg_id, arguments)
         return _error(msg_id, INVALID_PARAMS, "unknown tool: %r" % (name,))
 
     def _tool_result(self, msg_id, text, is_error=False):
@@ -306,6 +382,48 @@ class MCPServer:
 
     def _tool_replay(self, msg_id):
         return self._tool_result(msg_id, self._transcript())
+
+    def _tool_sample(self, msg_id, arguments):
+        messages = arguments.get("messages")
+        if messages is None:
+            return _error(msg_id, INVALID_PARAMS,
+                          "blackbox_sample needs 'messages'")
+        kwargs = {}
+        for key in ("model_preferences", "system_prompt",
+                    "include_context", "temperature", "max_tokens",
+                    "stop_sequences"):
+            # Tool arguments use the MCP wire names (camelCase);
+            # Sampler.sample() takes snake_case.
+            wire = {"model_preferences": "modelPreferences",
+                    "system_prompt": "systemPrompt",
+                    "include_context": "includeContext",
+                    "temperature": "temperature",
+                    "max_tokens": "maxTokens",
+                    "stop_sequences": "stopSequences"}[key]
+            if wire in arguments:
+                kwargs[key] = arguments[wire]
+        try:
+            result = self.sample(messages, **kwargs)
+        except SamplingNotSupportedError as exc:
+            return self._tool_result(msg_id, "sampling not supported: %s"
+                                     % exc, is_error=True)
+        except SamplingDeclinedError as exc:
+            return self._tool_result(msg_id, "sampling declined: %s" % exc,
+                                     is_error=True)
+        except SamplingError as exc:
+            return self._tool_result(msg_id, "sampling failed: %s" % exc,
+                                     is_error=True)
+        except ValueError as exc:
+            return _error(msg_id, INVALID_PARAMS, str(exc))
+        # A sampled completion is a model call in this session: record
+        # it like any other, so the flight record stays complete. The
+        # recorder redacts before writing, as always.
+        self.recorder.record("model_call", {
+            "model": result.model or "unknown",
+            "text": result.text,
+            "stop_reason": result.stop_reason,
+        })
+        return self._tool_result(msg_id, result.text)
 
     def _transcript(self):
         records = load_records(self.log_path)
@@ -516,16 +634,34 @@ class MCPServer:
                           "content": {"type": "text", "text": text}}],
         })
 
+    def _read_line(self, stdin):
+        """The next input line. When a stdio sampling transport is
+        attached, read through it: it drains lines it queued while
+        waiting for a sampling response first, so a sampling request
+        issued mid-session does not swallow the client's messages."""
+        if self._transport is not None:
+            return self._transport.next_line()
+        return stdin.readline()
+
     def serve(self, stdin=None, stdout=None):
         """Read JSON-RPC lines from stdin, write responses to stdout.
 
         Runs until EOF (or Ctrl-C / a broken pipe), then closes the
-        recorder, which writes the summary record.
+        recorder, which writes the summary record. A Sampler over
+        the same stdio streams is attached automatically if none
+        was given, so the blackbox_sample tool can ask the client
+        for completions.
         """
         stdin = stdin if stdin is not None else sys.stdin
         stdout = stdout if stdout is not None else sys.stdout
+        if self.sampler is None:
+            self._transport = StdioTransport(stdin, stdout)
+            self.sampler = Sampler(self._transport)
         try:
-            for line in stdin:
+            while True:
+                line = self._read_line(stdin)
+                if not line:
+                    break
                 if not line.strip():
                     continue
                 try:
@@ -534,6 +670,13 @@ class MCPServer:
                     response = _error(None, PARSE_ERROR,
                                       "line is not valid JSON")
                 else:
+                    if isinstance(message, dict) \
+                            and "method" not in message:
+                        # A response to a server-initiated request
+                        # (e.g. a sampling response answered out of
+                        # order and queued by the transport): not a
+                        # request, nothing to answer.
+                        continue
                     try:
                         response = self.handle_message(message)
                     except Exception as exc:  # keep the server alive

@@ -153,6 +153,20 @@ repeated call may be a legitimate retry.
 Point a client at that command as a stdio server. Closing the server
 (EOF / Ctrl-C) writes the summary record, like closing a Recorder.
 
+**Sampling.** A fourth tool, `blackbox_sample`, asks the connected
+client for an LLM completion (MCP `sampling/createMessage`): the
+server sends the messages and gets the sampled text back, without
+ever holding a model API key itself. The prompt is redacted before
+it is sent, and the sampled completion is recorded in the log as a
+`model_call` step, like any other model call. If the client declines
+or does not support sampling, the tool reports an error instead of
+failing the server. The `Sampler` class in `sampling.py` is the same
+request as a clean Python API — `sample()` returns the text, model
+and stop reason, `sample_or_none()` returns None on a decline
+instead of raising — over any transport with a `request()` method;
+`StdioTransport` is the stdio one, and `scripts/demo_sampling.py`
+shows the whole flow against a fake client, no real model needed.
+
 ## What it is not
 
 - Not a hosted platform. There is nothing to sign up for and nowhere
@@ -165,7 +179,7 @@ Point a client at that command as a stdio server. Closing the server
 
 ## Measured
 
-- 78 tests, all passing (`make test`).
+- 112 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -174,7 +188,7 @@ Point a client at that command as a stdio server. Closing the server
 - MCP server wrapper: stdio server with record/verify/replay tools
   done (v0.4.0); resources and prompts done (v0.5.0); second prompt
   (`summarize_costs`) done (v0.6.0); third prompt
-  (`summarize_anomalies`) done (v0.7.0). Next: sampling.
+  (`summarize_anomalies`) done (v0.7.0); sampling done (v0.8.0).
 - Span/trace export to OpenTelemetry.
 
 ## Layout
@@ -186,12 +200,16 @@ blackbox/
   costs.py        per-model cost tracking: list prices, cost math
   mcp_server.py   MCP server on stdio: record / verify / replay tools,
                   session resources, analyze_session,
-                  summarize_costs and summarize_anomalies prompts
+                  summarize_costs and summarize_anomalies prompts,
+                  blackbox_sample tool (MCP sampling)
+  sampling.py     MCP sampling client: Sampler, StdioTransport,
+                  SamplingError / NotSupported / Declined
   redact.py       redaction before write
   verify.py       replay the chain, find the first broken record
   replay.py       transcript printer + run diff
   __main__.py     CLI: verify | replay | diff | mcp
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
-tests/            74 tests, all passing
+  demo_sampling.py  MCP sampling against a fake client, no real model
+tests/            112 tests, all passing
 ```

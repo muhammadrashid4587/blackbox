@@ -60,7 +60,7 @@ class MCPServerTest(unittest.TestCase):
             _request(2, "tools/list"))
         names = [t["name"] for t in response["result"]["tools"]]
         self.assertEqual(names, ["blackbox_record", "blackbox_verify",
-                                 "blackbox_replay"])
+                                 "blackbox_replay", "blackbox_sample"])
         for tool in response["result"]["tools"]:
             self.assertIn("inputSchema", tool)
 
@@ -112,7 +112,7 @@ class MCPServerTest(unittest.TestCase):
         self.assertIn("resources", capabilities)
         self.assertIn("prompts", capabilities)
         self.assertEqual(response["result"]["serverInfo"]["version"],
-                         "0.7.0")
+                         "0.8.0")
 
     def test_resources_list(self):
         self._init()

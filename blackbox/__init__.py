@@ -11,8 +11,13 @@ from .costs import cost_for, price_for, register_pricing
 from .mcp_server import MCPServer
 from .recorder import Recorder
 from .replay import diff, load_records, replay
+from .sampling import (Sampler, SamplingDeclinedError, SamplingError,
+                       SamplingNotSupportedError, SamplingResult,
+                       StdioTransport)
 from .verify import verify
 
-__all__ = ["MCPServer", "Recorder", "cost_for", "diff", "load_records",
+__all__ = ["MCPServer", "Recorder", "Sampler", "SamplingDeclinedError",
+           "SamplingError", "SamplingNotSupportedError", "SamplingResult",
+           "StdioTransport", "cost_for", "diff", "load_records",
            "price_for", "register_pricing", "replay", "verify"]
-__version__ = "0.5.0"
+__version__ = "0.8.0"

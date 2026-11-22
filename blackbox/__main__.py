@@ -3,6 +3,8 @@
     python -m blackbox verify data/demo.jsonl
     python -m blackbox replay data/demo.jsonl
     python -m blackbox diff data/run-a.jsonl data/run-b.jsonl
+
+Any command takes a .jsonl log or a .db SQLite store.
 """
 
 import argparse

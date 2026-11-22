@@ -12,4 +12,4 @@ from .replay import diff, load_records, replay
 from .verify import verify
 
 __all__ = ["Recorder", "diff", "load_records", "replay", "verify"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -16,7 +16,8 @@ later edit is detectable, with secrets redacted before anything is
 written.
 
 It is a small local tool, not a platform. It has no server, no account,
-no database, no dependencies — pure Python 3 standard library.
+no dependencies — pure Python 3 standard library. The optional SQLite
+backend is the stdlib `sqlite3` module, still no server.
 
 ## Quickstart
 
@@ -51,6 +52,26 @@ the event count, start/end time and total tokens. If the file already
 exists, recording resumes after its last record without breaking the
 chain.
 
+SQLite backend: pass a `.db` path instead of `.jsonl` and records go
+to a SQLite table instead of a text log. Same API, same records, same
+hash chain — `verify`, `replay` and `diff` work on either, and `diff`
+can compare a `.jsonl` run against a `.db` run:
+
+```python
+with Recorder("data/run.db", task="research topic") as rec:
+    rec.record("model_call", {"model": "gpt-x", "prompt": "..."}, tokens=120)
+```
+
+```bash
+python -m blackbox verify data/run.db
+# OK: 4 records, hash chain intact
+
+python -m blackbox replay data/run.db
+
+# Query runs with plain SQL
+sqlite3 data/run.db "SELECT type, COUNT(*) FROM records GROUP BY type"
+```
+
 ## How it works
 
 **Hash chain.** Each record carries `prev_hash` (the previous record's
@@ -71,9 +92,19 @@ redacted if its key is a sensitive word (`api_key`, `token`, `password`,
 pattern (`sk-…` keys, `Bearer` tokens, GitHub PATs, AWS access key ids,
 Slack tokens).
 
-**Durability.** Every record is flushed and fsynced as it is written.
-A flight recorder that loses the last seconds of a crashed run is not
-much use.
+**Durability.** Every record is flushed and fsynced as it is written
+(JSONL), or committed with `synchronous=FULL` in WAL journal mode
+(SQLite). A flight recorder that loses the last seconds of a crashed
+run is not much use.
+
+**SQLite backend.** A `.db` (or `.sqlite`/`.sqlite3`) path selects the
+SQLite store: one `records` table with the same fields as the JSONL
+record (`seq`, `ts`, `type`, `payload`, `tokens`, `prev_hash`,
+`hash`), payload and tokens stored as JSON text. The hash is computed
+over the same canonical JSON as the JSONL record, so the chain is
+identical and a record verifies the same way in either backend.
+`close()` checkpoints the WAL into the `.db` file, so the file alone
+holds the whole run.
 
 ## What it is not
 
@@ -87,13 +118,12 @@ much use.
 
 ## Measured
 
-- 23 tests, all passing (`make test`).
+- 35 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
 ## Roadmap
 
-- SQLite backend for querying runs instead of grepping JSONL.
 - MCP server wrapper, so any MCP client can record through blackbox.
 - Span/trace export to OpenTelemetry.
 - Cost tracking per model.
@@ -102,12 +132,13 @@ much use.
 
 ```
 blackbox/
-  recorder.py   append-only hash-chained log, fsync per record
-  redact.py     redaction before write
-  verify.py     replay the chain, find the first broken record
-  replay.py     transcript printer + run diff
-  __main__.py   CLI: verify | replay | diff
+  recorder.py     append-only hash-chained log, fsync per record
+  sqlite_store.py SQLite store: same records, same chain, WAL + synchronous=FULL
+  redact.py       redaction before write
+  verify.py       replay the chain, find the first broken record
+  replay.py       transcript printer + run diff
+  __main__.py     CLI: verify | replay | diff
 scripts/
-  demo.py       scripted fake agent run, 8 steps, no real model calls
-tests/          23 tests, all passing
+  demo.py         scripted fake agent run, 8 steps, no real model calls
+tests/            35 tests, all passing
 ```

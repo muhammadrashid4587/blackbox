@@ -17,10 +17,17 @@ both runs are printed at the end.
 import json
 
 from .recorder import _tokens_total
+from .sqlite_store import is_sqlite_path, load_sqlite_records
 
 
 def load_records(path):
-    """Read a .jsonl log into a list of record dicts, in order."""
+    """Read a log into a list of record dicts, in order.
+
+    Works for both backends: a .db/.sqlite/.sqlite3 path reads the
+    SQLite store, anything else reads a .jsonl log.
+    """
+    if is_sqlite_path(path):
+        return load_sqlite_records(path)
     records = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:

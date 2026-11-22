@@ -139,7 +139,11 @@ the tools write to, so a client always sees the current session.
 One prompt template, `analyze_session`, hands the client a prompt
 for analysing the session, with an optional `focus` argument
 (`errors`, `cost`, `tool usage`, or anything else); the prompt
-includes the transcript and the chain-verification result.
+includes the transcript and the chain-verification result. A second
+prompt, `summarize_costs`, hands the client a prompt for the
+session's cost: per-model token usage and USD from the published
+list prices, with unpriced calls (no input/output split, or an
+unknown model) listed as unpriced, never guessed.
 Point a client at that command as a stdio server. Closing the server
 (EOF / Ctrl-C) writes the summary record, like closing a Recorder.
 
@@ -155,15 +159,15 @@ Point a client at that command as a stdio server. Closing the server
 
 ## Measured
 
-- 71 tests, all passing (`make test`).
+- 74 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
 ## Roadmap
 
 - MCP server wrapper: stdio server with record/verify/replay tools
-  done (v0.4.0); resources and prompts done (v0.5.0).
-  Next: sampling, or a second prompt.
+  done (v0.4.0); resources and prompts done (v0.5.0); second prompt
+  (`summarize_costs`) done (v0.6.0). Next: sampling.
 - Span/trace export to OpenTelemetry.
 
 ## Layout
@@ -174,12 +178,13 @@ blackbox/
   sqlite_store.py SQLite store: same records, same chain, WAL + synchronous=FULL
   costs.py        per-model cost tracking: list prices, cost math
   mcp_server.py   MCP server on stdio: record / verify / replay tools,
-                  session resources, analyze_session prompt
+                  session resources, analyze_session and
+                  summarize_costs prompts
   redact.py       redaction before write
   verify.py       replay the chain, find the first broken record
   replay.py       transcript printer + run diff
   __main__.py     CLI: verify | replay | diff | mcp
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
-tests/            71 tests, all passing
+tests/            74 tests, all passing
 ```

@@ -11,12 +11,14 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
-It also exposes the session as two resources, and one prompt:
+It also exposes the session as two resources, and two prompts:
 
     blackbox://session        the session as a readable transcript
     blackbox://session.json   the session's records as JSON
     analyze_session           a prompt template for analysing the
                               session (optional focus argument)
+    summarize_costs           a prompt template for summarising the
+                              session's cost per model
 
 Start it from the CLI:
 
@@ -32,13 +34,14 @@ What this is not (yet): no sampling. That is the next slice.
 import json
 import sys
 
+from .costs import cost_for
 from .recorder import Recorder
 from .replay import format_record, load_records
 from .verify import verify
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "blackbox"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.6.0"
 
 # JSON-RPC error codes.
 PARSE_ERROR = -32700
@@ -129,6 +132,13 @@ PROMPTS = [
             },
         ],
     },
+    {
+        "name": "summarize_costs",
+        "description": ("Summarise the recorded session's cost: tokens "
+                        "and USD per model, and which calls look "
+                        "wasteful."),
+        "arguments": [],
+    },
 ]
 
 PROMPT_FOCUS_LINES = {
@@ -151,6 +161,17 @@ ANALYZE_PROMPT = (
     "wasteful or surprising. {focus}\n\n"
     "Session transcript:\n{transcript}\n\n"
     "The session verifies as: {verification}"
+)
+
+SUMMARIZE_COSTS_PROMPT = (
+    "Summarise the cost of this blackbox session: which models were "
+    "called, how many tokens each used, what it cost in USD, and "
+    "whether any call looks wasteful. Prices are the providers' "
+    "published list prices and are estimates, not a bill. Calls with "
+    "no input/output token split, or a model with no published "
+    "price, are listed as unpriced, never guessed.\n\n"
+    "Cost breakdown:\n{costs}\n\n"
+    "Session transcript:\n{transcript}"
 )
 
 
@@ -263,6 +284,67 @@ class MCPServer:
         records = load_records(self.log_path)
         return "\n".join(format_record(r) for r in records)
 
+    def _cost_lines(self):
+        """Per-model token usage and USD cost, as readable lines.
+
+        Computed from the recorded model_call records, with the same
+        rules as the Recorder's summary: a plain int token count has
+        no input/output split and is not priced, and an unknown model
+        costs None, never a guessed number.
+        """
+        usage = {}
+        for record in load_records(self.log_path):
+            if record.get("type") != "model_call":
+                continue
+            model = ((record.get("payload") or {}).get("model")
+                     or self.recorder.model)
+            if not model:
+                continue
+            entry = usage.setdefault(
+                model, {"input_tokens": 0, "output_tokens": 0,
+                        "tokens": 0})
+            tokens = record.get("tokens")
+            if isinstance(tokens, dict):
+                if isinstance(tokens.get("input"), int):
+                    entry["input_tokens"] += tokens["input"]
+                if isinstance(tokens.get("output"), int):
+                    entry["output_tokens"] += tokens["output"]
+            elif isinstance(tokens, int):
+                entry["tokens"] += tokens
+        if not usage:
+            return "No model calls recorded yet."
+        lines = []
+        total = 0.0
+        priced_any = False
+        for model, entry in sorted(usage.items()):
+            parts = []
+            if entry["input_tokens"] or entry["output_tokens"]:
+                parts.append("%d input + %d output tokens"
+                             % (entry["input_tokens"],
+                                entry["output_tokens"]))
+            if entry["tokens"]:
+                parts.append("%d tokens with no input/output split"
+                             % entry["tokens"])
+            cost = None
+            if entry["input_tokens"] or entry["output_tokens"]:
+                cost = cost_for(model, entry["input_tokens"],
+                                entry["output_tokens"])
+            if cost is not None:
+                parts.append("$%s" % ("%.6f" % cost).rstrip("0")
+                             .rstrip("."))
+                total += cost
+                priced_any = True
+            elif entry["input_tokens"] or entry["output_tokens"]:
+                parts.append("cost unknown: no published price "
+                             "for this model")
+            else:
+                parts.append("not priced: no input/output split")
+            lines.append("%s: %s" % (model, ", ".join(parts)))
+        if priced_any:
+            lines.append("Total priced cost: $%s"
+                         % ("%.6f" % total).rstrip("0").rstrip("."))
+        return "\n".join(lines)
+
     def _resources_read(self, msg_id, params):
         uri = params.get("uri")
         if uri == "blackbox://session":
@@ -280,13 +362,24 @@ class MCPServer:
 
     def _prompts_get(self, msg_id, params):
         name = params.get("name")
-        if name != "analyze_session":
-            return _error(msg_id, INVALID_PARAMS,
-                          "unknown prompt: %r" % (name,))
         arguments = params.get("arguments") or {}
         if not isinstance(arguments, dict):
             return _error(msg_id, INVALID_PARAMS,
                           "arguments must be an object")
+        description = next((p["description"] for p in PROMPTS
+                            if p["name"] == name), None)
+        if description is None:
+            return _error(msg_id, INVALID_PARAMS,
+                          "unknown prompt: %r" % (name,))
+        if name == "summarize_costs":
+            text = SUMMARIZE_COSTS_PROMPT.format(
+                costs=self._cost_lines(),
+                transcript=self._transcript())
+            return _result(msg_id, {
+                "description": description,
+                "messages": [{"role": "user",
+                              "content": {"type": "text", "text": text}}],
+            })
         focus = arguments.get("focus")
         if focus is not None and not isinstance(focus, str):
             return _error(msg_id, INVALID_PARAMS,
@@ -305,7 +398,7 @@ class MCPServer:
             focus=focus_line, transcript=self._transcript(),
             verification=verification)
         return _result(msg_id, {
-            "description": PROMPTS[0]["description"],
+            "description": description,
             "messages": [{"role": "user",
                           "content": {"type": "text", "text": text}}],
         })

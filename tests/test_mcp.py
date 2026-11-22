@@ -112,7 +112,7 @@ class MCPServerTest(unittest.TestCase):
         self.assertIn("resources", capabilities)
         self.assertIn("prompts", capabilities)
         self.assertEqual(response["result"]["serverInfo"]["version"],
-                         "0.5.0")
+                         "0.6.0")
 
     def test_resources_list(self):
         self._init()
@@ -165,9 +165,10 @@ class MCPServerTest(unittest.TestCase):
             _request(2, "prompts/list"))
         prompts = response["result"]["prompts"]
         self.assertEqual([p["name"] for p in prompts],
-                         ["analyze_session"])
+                         ["analyze_session", "summarize_costs"])
         self.assertEqual(prompts[0]["arguments"][0]["name"], "focus")
         self.assertFalse(prompts[0]["arguments"][0]["required"])
+        self.assertEqual(prompts[1]["arguments"], [])
 
     def test_prompts_get_includes_transcript_and_verification(self):
         self._init()
@@ -203,6 +204,52 @@ class MCPServerTest(unittest.TestCase):
         response = self.server.handle_message(
             _request(2, "prompts/get", {"name": "nope"}))
         self.assertEqual(response["error"]["code"], -32602)
+
+    def test_prompts_get_summarize_costs(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "model_call",
+               "payload": {"model": "gpt-5", "prompt": "hi"},
+               "tokens": {"input": 1200, "output": 340}})
+        response = self.server.handle_message(
+            _request(3, "prompts/get",
+                     {"name": "summarize_costs"}))
+        message = response["result"]["messages"][0]
+        self.assertEqual(message["role"], "user")
+        text = message["content"]["text"]
+        # 1200 * 1.25 + 340 * 10.00 per 1M tokens = $0.0049.
+        self.assertIn("gpt-5", text)
+        self.assertIn("1200 input + 340 output tokens", text)
+        self.assertIn("$0.0049", text)
+        self.assertIn("Total priced cost: $0.0049", text)
+        self.assertIn("gpt-5", text)  # transcript included too
+
+    def test_prompts_get_summarize_costs_unpriced_calls(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "model_call",
+               "payload": {"model": "gpt-5", "prompt": "hi"},
+               "tokens": 500})
+        _call(self.server, 3, "blackbox_record",
+              {"type": "model_call",
+               "payload": {"model": "mystery-model", "prompt": "hi"},
+               "tokens": {"input": 10, "output": 5}})
+        response = self.server.handle_message(
+            _request(4, "prompts/get",
+                     {"name": "summarize_costs"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("500 tokens with no input/output split", text)
+        self.assertIn("not priced: no input/output split", text)
+        self.assertIn("cost unknown: no published price", text)
+        self.assertNotIn("Total priced cost", text)
+
+    def test_prompts_get_summarize_costs_empty_session(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "prompts/get",
+                     {"name": "summarize_costs"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("No model calls recorded yet.", text)
 
     def test_resources_read_before_initialize_is_rejected(self):
         response = self.server.handle_message(

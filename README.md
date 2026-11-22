@@ -132,9 +132,16 @@ dependencies), so any MCP client can record through blackbox. It
 exposes three tools: `blackbox_record` (append one step — same
 redaction, hash chain and fsync as the library), `blackbox_verify`
 (check the chain) and `blackbox_replay` (read the transcript back).
+The session is also readable as two resources:
+`blackbox://session` (the transcript) and `blackbox://session.json`
+(the raw records, hash chain included) — both read from the same log
+the tools write to, so a client always sees the current session.
+One prompt template, `analyze_session`, hands the client a prompt
+for analysing the session, with an optional `focus` argument
+(`errors`, `cost`, `tool usage`, or anything else); the prompt
+includes the transcript and the chain-verification result.
 Point a client at that command as a stdio server. Closing the server
 (EOF / Ctrl-C) writes the summary record, like closing a Recorder.
-Resources and prompts are not exposed yet — that is the next slice.
 
 ## What it is not
 
@@ -148,15 +155,15 @@ Resources and prompts are not exposed yet — that is the next slice.
 
 ## Measured
 
-- 61 tests, all passing (`make test`).
+- 71 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
 ## Roadmap
 
 - MCP server wrapper: stdio server with record/verify/replay tools
-  done (v0.4.0). Next: resources (read a log as an MCP resource) and
-  prompts.
+  done (v0.4.0); resources and prompts done (v0.5.0).
+  Next: sampling, or a second prompt.
 - Span/trace export to OpenTelemetry.
 
 ## Layout
@@ -166,12 +173,13 @@ blackbox/
   recorder.py     append-only hash-chained log, fsync per record
   sqlite_store.py SQLite store: same records, same chain, WAL + synchronous=FULL
   costs.py        per-model cost tracking: list prices, cost math
-  mcp_server.py   MCP server on stdio: record / verify / replay tools
+  mcp_server.py   MCP server on stdio: record / verify / replay tools,
+                  session resources, analyze_session prompt
   redact.py       redaction before write
   verify.py       replay the chain, find the first broken record
   replay.py       transcript printer + run diff
   __main__.py     CLI: verify | replay | diff | mcp
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
-tests/            61 tests, all passing
+tests/            71 tests, all passing
 ```

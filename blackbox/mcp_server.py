@@ -11,6 +11,13 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
+It also exposes the session as two resources, and one prompt:
+
+    blackbox://session        the session as a readable transcript
+    blackbox://session.json   the session's records as JSON
+    analyze_session           a prompt template for analysing the
+                              session (optional focus argument)
+
 Start it from the CLI:
 
     python -m blackbox mcp data/run.jsonl
@@ -19,8 +26,7 @@ and point any MCP client at that command as a stdio server. The
 client handshake is the standard one: `initialize`, then
 `notifications/initialized`, then `tools/list` / `tools/call`.
 
-What this is not (yet): no resources (`cinder://`-style URIs), no
-prompts, no sampling. Those are the next slices.
+What this is not (yet): no sampling. That is the next slice.
 """
 
 import json
@@ -32,7 +38,7 @@ from .verify import verify
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "blackbox"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 
 # JSON-RPC error codes.
 PARSE_ERROR = -32700
@@ -85,6 +91,68 @@ TOOLS = [
     },
 ]
 
+# The session as readable resources. Both read from the same log the
+# tools write to, so a client always sees the current session; the
+# records are already redacted at write time, so nothing secret
+# leaks through a resource read.
+RESOURCES = [
+    {
+        "uri": "blackbox://session",
+        "name": "session",
+        "description": ("The recorded session as a readable transcript, "
+                        "one step per line, like `blackbox replay`."),
+        "mimeType": "text/plain",
+    },
+    {
+        "uri": "blackbox://session.json",
+        "name": "session.json",
+        "description": ("The recorded session's raw records as a JSON "
+                        "array, hash chain included."),
+        "mimeType": "application/json",
+    },
+]
+
+PROMPTS = [
+    {
+        "name": "analyze_session",
+        "description": ("Analyse the recorded session: what the agent "
+                        "did, in what order, where it went wrong, and "
+                        "what it cost."),
+        "arguments": [
+            {
+                "name": "focus",
+                "description": ("What to focus on, e.g. errors, cost, "
+                                "tool usage, or a step type like "
+                                "model_call. Optional; defaults to the "
+                                "whole session."),
+                "required": False,
+            },
+        ],
+    },
+]
+
+PROMPT_FOCUS_LINES = {
+    "errors": ("Pay special attention to steps that look like errors or "
+               "failures: tool results reporting failure, retries, and "
+               "any step whose payload mentions an error."),
+    "cost": ("Pay special attention to cost: total tokens per model, "
+             "which model calls were the most expensive, and whether "
+             "any call looks wasteful."),
+    "tool usage": ("Pay special attention to tool usage: which tools "
+                   "were called, with what arguments, and whether any "
+                   "call looks redundant or wrong."),
+}
+
+ANALYZE_PROMPT = (
+    "Analyse this blackbox session: the recorded steps an AI agent "
+    "took, in order, with timestamps, token counts and a hash-chained "
+    "summary. Summarise what the agent was trying to do, list the "
+    "steps it took in order, and call out anything that looks wrong, "
+    "wasteful or surprising. {focus}\n\n"
+    "Session transcript:\n{transcript}\n\n"
+    "The session verifies as: {verification}"
+)
+
 
 class MCPServer:
     """A blackbox MCP server bound to one log file."""
@@ -123,6 +191,14 @@ class MCPServer:
             return _result(msg_id, {"tools": TOOLS})
         if method == "tools/call":
             return self._tools_call(msg_id, message.get("params") or {})
+        if method == "resources/list":
+            return _result(msg_id, {"resources": RESOURCES})
+        if method == "resources/read":
+            return self._resources_read(msg_id, message.get("params") or {})
+        if method == "prompts/list":
+            return _result(msg_id, {"prompts": PROMPTS})
+        if method == "prompts/get":
+            return self._prompts_get(msg_id, message.get("params") or {})
         return _error(msg_id, METHOD_NOT_FOUND,
                       "unknown method: %s" % method)
 
@@ -130,7 +206,7 @@ class MCPServer:
         self._initialized = True
         return _result(msg_id, {
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {"tools": {}},
+            "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
             "serverInfo": {"name": SERVER_NAME,
                            "version": SERVER_VERSION},
         })
@@ -181,9 +257,58 @@ class MCPServer:
         return self._tool_result(msg_id, text, is_error=not result["ok"])
 
     def _tool_replay(self, msg_id):
+        return self._tool_result(msg_id, self._transcript())
+
+    def _transcript(self):
         records = load_records(self.log_path)
-        text = "\n".join(format_record(r) for r in records)
-        return self._tool_result(msg_id, text)
+        return "\n".join(format_record(r) for r in records)
+
+    def _resources_read(self, msg_id, params):
+        uri = params.get("uri")
+        if uri == "blackbox://session":
+            text = self._transcript()
+            return _result(msg_id, {"contents": [
+                {"uri": uri, "mimeType": "text/plain", "text": text}]})
+        if uri == "blackbox://session.json":
+            records = load_records(self.log_path)
+            text = json.dumps(records, indent=2, sort_keys=True)
+            return _result(msg_id, {"contents": [
+                {"uri": uri, "mimeType": "application/json",
+                 "text": text}]})
+        return _error(msg_id, INVALID_PARAMS,
+                      "unknown resource: %r" % (uri,))
+
+    def _prompts_get(self, msg_id, params):
+        name = params.get("name")
+        if name != "analyze_session":
+            return _error(msg_id, INVALID_PARAMS,
+                          "unknown prompt: %r" % (name,))
+        arguments = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            return _error(msg_id, INVALID_PARAMS,
+                          "arguments must be an object")
+        focus = arguments.get("focus")
+        if focus is not None and not isinstance(focus, str):
+            return _error(msg_id, INVALID_PARAMS,
+                          "focus must be a string")
+        focus_line = ""
+        if focus:
+            focus_line = PROMPT_FOCUS_LINES.get(
+                focus, "Focus on: %s." % focus)
+        result = verify(self.log_path)
+        if result["ok"]:
+            verification = ("OK: %d records, hash chain intact"
+                            % result["records"])
+        else:
+            verification = "FAIL: %s" % result["error"]
+        text = ANALYZE_PROMPT.format(
+            focus=focus_line, transcript=self._transcript(),
+            verification=verification)
+        return _result(msg_id, {
+            "description": PROMPTS[0]["description"],
+            "messages": [{"role": "user",
+                          "content": {"type": "text", "text": text}}],
+        })
 
     def serve(self, stdin=None, stdout=None):
         """Read JSON-RPC lines from stdin, write responses to stdout.

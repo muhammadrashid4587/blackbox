@@ -106,10 +106,114 @@ class MCPServerTest(unittest.TestCase):
         response = _call(self.server, 2, "blackbox_nope", {})
         self.assertEqual(response["error"]["code"], -32602)
 
-    def test_unknown_method_is_an_error(self):
+    def test_initialize_advertises_resources_and_prompts(self):
+        response = self._init()
+        capabilities = response["result"]["capabilities"]
+        self.assertIn("resources", capabilities)
+        self.assertIn("prompts", capabilities)
+        self.assertEqual(response["result"]["serverInfo"]["version"],
+                         "0.5.0")
+
+    def test_resources_list(self):
         self._init()
         response = self.server.handle_message(
             _request(2, "resources/list"))
+        uris = [r["uri"] for r in response["result"]["resources"]]
+        self.assertEqual(uris, ["blackbox://session",
+                                "blackbox://session.json"])
+        for resource in response["result"]["resources"]:
+            self.assertIn("mimeType", resource)
+
+    def test_resources_read_session_transcript(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "search", "args": {"query": "mcp"}}})
+        response = self.server.handle_message(
+            _request(3, "resources/read",
+                     {"uri": "blackbox://session"}))
+        content = response["result"]["contents"][0]
+        self.assertEqual(content["uri"], "blackbox://session")
+        self.assertEqual(content["mimeType"], "text/plain")
+        self.assertIn("tool_call", content["text"])
+        self.assertIn("search", content["text"])
+
+    def test_resources_read_session_json(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "note", "payload": {"text": "hello"}})
+        response = self.server.handle_message(
+            _request(3, "resources/read",
+                     {"uri": "blackbox://session.json"}))
+        content = response["result"]["contents"][0]
+        self.assertEqual(content["mimeType"], "application/json")
+        records = json.loads(content["text"])
+        self.assertEqual(records[0]["type"], "note")
+        self.assertIn("hash", records[0])
+        self.assertIn("prev_hash", records[0])
+
+    def test_resources_read_unknown_uri_is_an_error(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://nope"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_prompts_list(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "prompts/list"))
+        prompts = response["result"]["prompts"]
+        self.assertEqual([p["name"] for p in prompts],
+                         ["analyze_session"])
+        self.assertEqual(prompts[0]["arguments"][0]["name"], "focus")
+        self.assertFalse(prompts[0]["arguments"][0]["required"])
+
+    def test_prompts_get_includes_transcript_and_verification(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "search", "args": {"query": "mcp"}}})
+        response = self.server.handle_message(
+            _request(3, "prompts/get",
+                     {"name": "analyze_session"}))
+        message = response["result"]["messages"][0]
+        self.assertEqual(message["role"], "user")
+        text = message["content"]["text"]
+        self.assertIn("tool_call", text)
+        self.assertIn("search", text)
+        self.assertIn("hash chain intact", text)
+
+    def test_prompts_get_with_focus(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "model_call",
+               "payload": {"model": "gpt-5", "prompt": "hi"},
+               "tokens": {"input": 10, "output": 5}})
+        response = self.server.handle_message(
+            _request(3, "prompts/get",
+                     {"name": "analyze_session",
+                      "arguments": {"focus": "cost"}}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("most expensive", text)
+        self.assertIn("gpt-5", text)
+
+    def test_prompts_get_unknown_prompt_is_an_error(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "prompts/get", {"name": "nope"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_before_initialize_is_rejected(self):
+        response = self.server.handle_message(
+            _request(1, "resources/read",
+                     {"uri": "blackbox://session"}))
+        self.assertEqual(response["error"]["code"], -32600)
+
+    def test_unknown_method_is_an_error(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "sampling/createMessage"))
         self.assertEqual(response["error"]["code"], -32601)
 
     def test_notification_gets_no_reply(self):

@@ -15,4 +15,4 @@ from .verify import verify
 
 __all__ = ["MCPServer", "Recorder", "cost_for", "diff", "load_records",
            "price_for", "register_pricing", "replay", "verify"]
-__version__ = "0.4.0"
+__version__ = "0.5.0"

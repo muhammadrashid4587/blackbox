@@ -112,7 +112,7 @@ class MCPServerTest(unittest.TestCase):
         self.assertIn("resources", capabilities)
         self.assertIn("prompts", capabilities)
         self.assertEqual(response["result"]["serverInfo"]["version"],
-                         "0.6.0")
+                         "0.7.0")
 
     def test_resources_list(self):
         self._init()
@@ -165,10 +165,12 @@ class MCPServerTest(unittest.TestCase):
             _request(2, "prompts/list"))
         prompts = response["result"]["prompts"]
         self.assertEqual([p["name"] for p in prompts],
-                         ["analyze_session", "summarize_costs"])
+                         ["analyze_session", "summarize_costs",
+                          "summarize_anomalies"])
         self.assertEqual(prompts[0]["arguments"][0]["name"], "focus")
         self.assertFalse(prompts[0]["arguments"][0]["required"])
         self.assertEqual(prompts[1]["arguments"], [])
+        self.assertEqual(prompts[2]["arguments"], [])
 
     def test_prompts_get_includes_transcript_and_verification(self):
         self._init()
@@ -250,6 +252,85 @@ class MCPServerTest(unittest.TestCase):
                      {"name": "summarize_costs"}))
         text = response["result"]["messages"][0]["content"]["text"]
         self.assertIn("No model calls recorded yet.", text)
+
+    def test_prompts_get_summarize_anomalies(self):
+        self._init()
+        # Error result, from a tool that was called twice with the
+        # same arguments.
+        _call(self.server, 2, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "search",
+                           "args": {"query": "mcp"}}})
+        _call(self.server, 3, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "search",
+                           "result": "Error: timed out"}})
+        _call(self.server, 4, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "search",
+                           "args": {"query": "mcp"}}})
+        # A call with no result at all, and a step that had a secret
+        # redacted before writing.
+        _call(self.server, 5, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "fetch",
+                           "args": {"url": "https://example.com"}}})
+        _call(self.server, 6, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "login",
+                           "args": {"api_key": "sk-abcdefghijklmnop"}}})
+        response = self.server.handle_message(
+            _request(7, "prompts/get",
+                     {"name": "summarize_anomalies"}))
+        message = response["result"]["messages"][0]
+        self.assertEqual(message["role"], "user")
+        text = message["content"]["text"]
+        self.assertIn("step 1: search returned an error result", text)
+        self.assertIn("Error: timed out", text)
+        self.assertIn("tool search called 2 times with identical "
+                      "arguments", text)
+        self.assertIn("step 3: tool_call fetch has no matching "
+                      "tool_result", text)
+        self.assertIn("step 4: tool_call contained a secret that was "
+                      "redacted before writing", text)
+        self.assertIn("heuristics", text)
+        self.assertIn("search", text)  # transcript included too
+
+    def test_prompts_get_summarize_anomalies_error_field(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "search",
+                           "error": "upstream 500"}})
+        response = self.server.handle_message(
+            _request(3, "prompts/get",
+                     {"name": "summarize_anomalies"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("step 0: search returned a result with an "
+                      "'error' field", text)
+
+    def test_prompts_get_summarize_anomalies_clean_session(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "search",
+                           "args": {"query": "mcp"}}})
+        _call(self.server, 3, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "search", "result": "3 results"}})
+        response = self.server.handle_message(
+            _request(4, "prompts/get",
+                     {"name": "summarize_anomalies"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("No anomalies found", text)
+
+    def test_prompts_get_summarize_anomalies_empty_session(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "prompts/get",
+                     {"name": "summarize_anomalies"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("No anomalies found", text)
 
     def test_resources_read_before_initialize_is_rejected(self):
         response = self.server.handle_message(

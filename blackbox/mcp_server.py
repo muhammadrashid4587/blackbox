@@ -11,7 +11,7 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
-It also exposes the session as two resources, and two prompts:
+It also exposes the session as two resources, and three prompts:
 
     blackbox://session        the session as a readable transcript
     blackbox://session.json   the session's records as JSON
@@ -19,6 +19,10 @@ It also exposes the session as two resources, and two prompts:
                               session (optional focus argument)
     summarize_costs           a prompt template for summarising the
                               session's cost per model
+    summarize_anomalies       a prompt template for summarising the
+                              session's suspicious steps: error
+                              results, repeated tool calls, unanswered
+                              calls, redacted secrets
 
 Start it from the CLI:
 
@@ -32,16 +36,18 @@ What this is not (yet): no sampling. That is the next slice.
 """
 
 import json
+import re
 import sys
 
 from .costs import cost_for
 from .recorder import Recorder
-from .replay import format_record, load_records
+from .redact import REDACTED
+from .replay import _short, format_record, load_records
 from .verify import verify
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "blackbox"
-SERVER_VERSION = "0.6.0"
+SERVER_VERSION = "0.7.0"
 
 # JSON-RPC error codes.
 PARSE_ERROR = -32700
@@ -139,6 +145,14 @@ PROMPTS = [
                         "wasteful."),
         "arguments": [],
     },
+    {
+        "name": "summarize_anomalies",
+        "description": ("Summarise the recorded session's suspicious "
+                        "steps: error results, repeated identical tool "
+                        "calls, tool calls with no result, and steps "
+                        "that had a secret redacted."),
+        "arguments": [],
+    },
 ]
 
 PROMPT_FOCUS_LINES = {
@@ -171,6 +185,19 @@ SUMMARIZE_COSTS_PROMPT = (
     "no input/output token split, or a model with no published "
     "price, are listed as unpriced, never guessed.\n\n"
     "Cost breakdown:\n{costs}\n\n"
+    "Session transcript:\n{transcript}"
+)
+
+SUMMARIZE_ANOMALIES_PROMPT = (
+    "Summarise the suspicious steps in this blackbox session: error "
+    "results, repeated identical tool calls, tool calls with no "
+    "result, and steps where a secret was redacted before writing. "
+    "For each anomaly, say what happened, which step it was, and "
+    "what the agent should have done differently. These findings "
+    "are heuristics computed from the log, not a verdict — a "
+    "repeated call may be a legitimate retry, and an error result "
+    "may be expected. Say so where it matters.\n\n"
+    "Anomalies found:\n{anomalies}\n\n"
     "Session transcript:\n{transcript}"
 )
 
@@ -345,6 +372,83 @@ class MCPServer:
                          % ("%.6f" % total).rstrip("0").rstrip("."))
         return "\n".join(lines)
 
+    def _anomaly_lines(self):
+        """Suspicious steps in the session, as readable lines.
+
+        Four heuristics, computed from the log (the summary record
+        is skipped — it is bookkeeping, not agent behaviour):
+        tool results that look like errors, the same tool called
+        with identical arguments more than once, tool calls with no
+        matching result, and steps that had a secret redacted before
+        writing. A repeated call may be a legitimate retry, so the
+        prompt says to treat these as leads, not verdicts.
+        """
+        records = [r for r in load_records(self.log_path)
+                   if r.get("type") != "summary"]
+        findings = []
+        for record in records:
+            if record.get("type") != "tool_result":
+                continue
+            payload = record.get("payload") or {}
+            result = payload.get("result", "")
+            if "error" in payload:
+                findings.append(
+                    "step %d: %s returned a result with an 'error' "
+                    "field" % (record["seq"], payload.get("tool", "?")))
+            elif (isinstance(result, str)
+                    and re.search(r"error|fail", result, re.IGNORECASE)):
+                findings.append(
+                    "step %d: %s returned an error result: %s"
+                    % (record["seq"], payload.get("tool", "?"),
+                       _short(result)))
+        calls = {}
+        for record in records:
+            if record.get("type") != "tool_call":
+                continue
+            payload = record.get("payload") or {}
+            key = json.dumps({"tool": payload.get("tool"),
+                              "args": payload.get("args", {})},
+                             sort_keys=True)
+            calls.setdefault(key, []).append(record["seq"])
+        for key, seqs in calls.items():
+            if len(seqs) > 1:
+                signature = json.loads(key)
+                findings.append(
+                    "tool %s called %d times with identical arguments "
+                    "%s (steps %s) — possible retry loop"
+                    % (signature.get("tool"), len(seqs),
+                       json.dumps(signature.get("args"), sort_keys=True),
+                       ", ".join(str(s) for s in seqs)))
+        pending = {}
+        for record in records:
+            payload = record.get("payload") or {}
+            tool = payload.get("tool")
+            if record.get("type") == "tool_call":
+                pending.setdefault(tool, []).append(record["seq"])
+            elif record.get("type") == "tool_result":
+                queue = pending.get(tool)
+                if queue:
+                    queue.pop(0)
+                    if not queue:
+                        del pending[tool]
+        for tool in sorted(pending, key=lambda t: pending[t][0]):
+            for seq in pending[tool]:
+                findings.append(
+                    "step %d: tool_call %s has no matching tool_result"
+                    % (seq, tool))
+        for record in records:
+            payload = record.get("payload") or {}
+            if REDACTED in json.dumps(payload):
+                findings.append(
+                    "step %d: %s contained a secret that was redacted "
+                    "before writing" % (record["seq"],
+                                        record.get("type")))
+        if not findings:
+            return ("No anomalies found: no error results, no repeated "
+                    "tool calls, no unanswered tool calls, and no "
+                    "redacted secrets.")
+        return "\n".join(findings)
+
     def _resources_read(self, msg_id, params):
         uri = params.get("uri")
         if uri == "blackbox://session":
@@ -374,6 +478,15 @@ class MCPServer:
         if name == "summarize_costs":
             text = SUMMARIZE_COSTS_PROMPT.format(
                 costs=self._cost_lines(),
+                transcript=self._transcript())
+            return _result(msg_id, {
+                "description": description,
+                "messages": [{"role": "user",
+                              "content": {"type": "text", "text": text}}],
+            })
+        if name == "summarize_anomalies":
+            text = SUMMARIZE_ANOMALIES_PROMPT.format(
+                anomalies=self._anomaly_lines(),
                 transcript=self._transcript())
             return _result(msg_id, {
                 "description": description,

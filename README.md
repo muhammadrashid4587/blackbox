@@ -143,7 +143,13 @@ includes the transcript and the chain-verification result. A second
 prompt, `summarize_costs`, hands the client a prompt for the
 session's cost: per-model token usage and USD from the published
 list prices, with unpriced calls (no input/output split, or an
-unknown model) listed as unpriced, never guessed.
+unknown model) listed as unpriced, never guessed. A third prompt,
+`summarize_anomalies`, hands the client a prompt for the session's
+suspicious steps: error results, repeated identical tool calls,
+tool calls with no result, and steps where a secret was redacted
+before writing. The findings are heuristics computed from the log,
+and the prompt says to treat them as leads, not verdicts — a
+repeated call may be a legitimate retry.
 Point a client at that command as a stdio server. Closing the server
 (EOF / Ctrl-C) writes the summary record, like closing a Recorder.
 
@@ -159,7 +165,7 @@ Point a client at that command as a stdio server. Closing the server
 
 ## Measured
 
-- 74 tests, all passing (`make test`).
+- 78 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -167,7 +173,8 @@ Point a client at that command as a stdio server. Closing the server
 
 - MCP server wrapper: stdio server with record/verify/replay tools
   done (v0.4.0); resources and prompts done (v0.5.0); second prompt
-  (`summarize_costs`) done (v0.6.0). Next: sampling.
+  (`summarize_costs`) done (v0.6.0); third prompt
+  (`summarize_anomalies`) done (v0.7.0). Next: sampling.
 - Span/trace export to OpenTelemetry.
 
 ## Layout
@@ -178,8 +185,8 @@ blackbox/
   sqlite_store.py SQLite store: same records, same chain, WAL + synchronous=FULL
   costs.py        per-model cost tracking: list prices, cost math
   mcp_server.py   MCP server on stdio: record / verify / replay tools,
-                  session resources, analyze_session and
-                  summarize_costs prompts
+                  session resources, analyze_session,
+                  summarize_costs and summarize_anomalies prompts
   redact.py       redaction before write
   verify.py       replay the chain, find the first broken record
   replay.py       transcript printer + run diff

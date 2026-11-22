@@ -28,6 +28,7 @@ import json
 import os
 from datetime import datetime, timezone
 
+from .costs import cost_for
 from .redact import redact
 from .sqlite_store import SQLiteStore, is_sqlite_path
 
@@ -69,6 +70,10 @@ class Recorder:
         self._prev_hash = GENESIS_PREV_HASH
         self._count = 0
         self._total_tokens = 0
+        # Per-model usage: model -> {"input_tokens", "output_tokens",
+        # "tokens"}. "tokens" holds unsplit int counts, which cannot be
+        # priced honestly; input/output come from tokens dicts.
+        self._cost = {}
         self._started = None
         self._closed = False
         self._sqlite = is_sqlite_path(path)
@@ -105,6 +110,20 @@ class Recorder:
         with open(self.path, "w", encoding="utf-8") as f:
             f.writelines(lines[:-1])
 
+    def _accumulate_cost(self, model, tokens):
+        """Fold one model_call's tokens into the per-model usage."""
+        if not model:
+            return
+        entry = self._cost.setdefault(
+            model, {"input_tokens": 0, "output_tokens": 0, "tokens": 0})
+        if isinstance(tokens, dict):
+            if isinstance(tokens.get("input"), int):
+                entry["input_tokens"] += tokens["input"]
+            if isinstance(tokens.get("output"), int):
+                entry["output_tokens"] += tokens["output"]
+        elif isinstance(tokens, int):
+            entry["tokens"] += tokens
+
     def _resume(self):
         records = self._load_existing()
         # A trailing summary describes the run up to the last close.
@@ -118,6 +137,9 @@ class Recorder:
             self._total_tokens += _tokens_total(record.get("tokens"))
             if self._started is None:
                 self._started = record.get("ts")
+            if record.get("type") == "model_call":
+                model = (record.get("payload") or {}).get("model") or self.model
+                self._accumulate_cost(model, record.get("tokens"))
         if records:
             last = records[-1]
             self._seq = last["seq"] + 1
@@ -152,17 +174,36 @@ class Recorder:
         self._seq += 1
         self._count += 1
         self._total_tokens += _tokens_total(tokens)
+        if event_type == "model_call":
+            model = record["payload"].get("model") or self.model
+            self._accumulate_cost(model, tokens)
         return record["seq"]
 
     def close(self):
         """Write the final summary record and close the log."""
         if self._closed:
             return
+        cost_by_model = {}
+        total_cost = 0.0
+        for model, entry in sorted(self._cost.items()):
+            # No input/output split means the usage cannot be priced
+            # honestly: a plain int token count has no split to apply
+            # rates to. cost_for() itself returns None for unknown
+            # models, so either way unpriced usage stays None, never 0.
+            cost = None
+            if entry["input_tokens"] or entry["output_tokens"]:
+                cost = cost_for(model, entry["input_tokens"],
+                                entry["output_tokens"])
+            cost_by_model[model] = dict(entry, cost_usd=cost)
+            if cost is not None:
+                total_cost += cost
         summary = {
             "events": self._count,
             "started": self._started,
             "ended": _now_iso(),
             "total_tokens": self._total_tokens,
+            "cost_usd": round(total_cost, 6),
+            "cost_by_model": cost_by_model,
             "task": self.task,
             "model": self.model,
         }

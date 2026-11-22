@@ -73,6 +73,16 @@ def format_record(record):
         lines.append("    events: %s  tokens: %s  %s -> %s" % (
             payload.get("events"), payload.get("total_tokens"),
             payload.get("started"), payload.get("ended")))
+        if payload.get("cost_usd") is not None:
+            lines.append("    cost: $%.6f" % payload["cost_usd"])
+            for model, entry in sorted(
+                    (payload.get("cost_by_model") or {}).items()):
+                cost = entry.get("cost_usd")
+                cost_text = "$%.6f" % cost if cost is not None else "unknown price"
+                lines.append("      %s: %d in / %d out / %d tokens -> %s" % (
+                    model, entry.get("input_tokens", 0),
+                    entry.get("output_tokens", 0), entry.get("tokens", 0),
+                    cost_text))
         return "\n".join(lines)
     # Any other event type: print the payload as compact JSON.
     return "%s  %s" % (header, _short(payload))

@@ -7,9 +7,11 @@ append-only log you can verify and replay.
 Pure Python 3 standard library. No dependencies.
 """
 
+from .costs import cost_for, price_for, register_pricing
 from .recorder import Recorder
 from .replay import diff, load_records, replay
 from .verify import verify
 
-__all__ = ["Recorder", "diff", "load_records", "replay", "verify"]
-__version__ = "0.2.0"
+__all__ = ["Recorder", "cost_for", "diff", "load_records", "price_for",
+           "register_pricing", "replay", "verify"]
+__version__ = "0.3.0"

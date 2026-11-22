@@ -106,6 +106,26 @@ identical and a record verifies the same way in either backend.
 `close()` checkpoints the WAL into the `.db` file, so the file alone
 holds the whole run.
 
+**Cost tracking.** Each `model_call` accrues its tokens against its
+model, and `close()` writes `cost_usd` and a per-model breakdown into
+the summary. Pass tokens as a dict to get a price — a plain int count
+has no input/output split, so it is counted but not priced:
+
+```python
+rec.record("model_call", {"model": "gpt-5", "prompt": "..."},
+           tokens={"input": 1200, "output": 340})
+# summary: cost_usd 0.0049, cost_by_model {"gpt-5": {"input_tokens": 1200,
+#   "output_tokens": 340, "tokens": 0, "cost_usd": 0.0049}}
+```
+
+Prices are the providers' published list prices per 1M tokens,
+checked 2026-11-22, for gpt-5 / gpt-5-mini / gpt-5-nano, Claude
+Opus 4.1 / 4.5, Sonnet 4.5, Haiku 4.5, and Gemini 2.5 Pro / Flash /
+Flash-Lite. They change often, so treat them as an estimate:
+`register_pricing("gpt-5", 1.25, 10.00)` overrides a rate, and an
+unknown model costs `None`, never a guessed number. `replay` prints
+the run's cost under the summary.
+
 ## What it is not
 
 - Not a hosted platform. There is nothing to sign up for and nowhere
@@ -118,7 +138,7 @@ holds the whole run.
 
 ## Measured
 
-- 35 tests, all passing (`make test`).
+- 49 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -126,7 +146,6 @@ holds the whole run.
 
 - MCP server wrapper, so any MCP client can record through blackbox.
 - Span/trace export to OpenTelemetry.
-- Cost tracking per model.
 
 ## Layout
 
@@ -134,6 +153,7 @@ holds the whole run.
 blackbox/
   recorder.py     append-only hash-chained log, fsync per record
   sqlite_store.py SQLite store: same records, same chain, WAL + synchronous=FULL
+  costs.py        per-model cost tracking: list prices, cost math
   redact.py       redaction before write
   verify.py       replay the chain, find the first broken record
   replay.py       transcript printer + run diff

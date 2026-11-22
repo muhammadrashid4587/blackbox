@@ -167,6 +167,18 @@ instead of raising — over any transport with a `request()` method;
 `StdioTransport` is the stdio one, and `scripts/demo_sampling.py`
 shows the whole flow against a fake client, no real model needed.
 
+**OpenTelemetry export.** `python -m blackbox otel data/run.jsonl`
+writes the session as OTLP/JSON spans, one per step, in a single
+trace — no OpenTelemetry SDK needed, the exporter only builds dicts.
+The trace id comes from the first record's hash, each span id from
+its own record's hash, and each span's parent from the previous
+record's hash, so the span tree is the hash chain. Span attributes
+carry the seq, type, hashes, tokens, model/tool names and the full
+payload, and each span runs from its step's timestamp to the next
+step's. The summary record is not a span. `spans_to_records` in
+`otel.py` rebuilds the steps from the spans, so an exported trace
+can be checked back against the log it came from.
+
 ## What it is not
 
 - Not a hosted platform. There is nothing to sign up for and nowhere
@@ -179,7 +191,7 @@ shows the whole flow against a fake client, no real model needed.
 
 ## Measured
 
-- 112 tests, all passing (`make test`).
+- 119 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -189,7 +201,10 @@ shows the whole flow against a fake client, no real model needed.
   done (v0.4.0); resources and prompts done (v0.5.0); second prompt
   (`summarize_costs`) done (v0.6.0); third prompt
   (`summarize_anomalies`) done (v0.7.0); sampling done (v0.8.0).
-- Span/trace export to OpenTelemetry.
+- Span/trace export to OpenTelemetry: OTLP/JSON exporter in `otel.py`
+  (trace/span ids from the hash chain, span attributes for model/tool
+  calls, `spans_to_records` round-trip) and an `otel` CLI command,
+  done (v0.9.0).
 
 ## Layout
 
@@ -204,12 +219,14 @@ blackbox/
                   blackbox_sample tool (MCP sampling)
   sampling.py     MCP sampling client: Sampler, StdioTransport,
                   SamplingError / NotSupported / Declined
+  otel.py         OpenTelemetry export: records to OTLP/JSON spans,
+                  trace/span ids from the hash chain, round-trip
   redact.py       redaction before write
   verify.py       replay the chain, find the first broken record
   replay.py       transcript printer + run diff
-  __main__.py     CLI: verify | replay | diff | mcp
+  __main__.py     CLI: verify | replay | diff | mcp | otel
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            112 tests, all passing
+tests/            119 tests, all passing
 ```

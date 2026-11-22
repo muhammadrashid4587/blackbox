@@ -7,8 +7,11 @@ append-only log you can verify and replay.
 Pure Python 3 standard library. No dependencies.
 """
 
+__version__ = "0.9.0"
+
 from .costs import cost_for, price_for, register_pricing
 from .mcp_server import MCPServer
+from .otel import export_otlp, export_otlp_file, records_to_spans, spans_to_records
 from .recorder import Recorder
 from .replay import diff, load_records, replay
 from .sampling import (Sampler, SamplingDeclinedError, SamplingError,
@@ -18,6 +21,7 @@ from .verify import verify
 
 __all__ = ["MCPServer", "Recorder", "Sampler", "SamplingDeclinedError",
            "SamplingError", "SamplingNotSupportedError", "SamplingResult",
-           "StdioTransport", "cost_for", "diff", "load_records",
-           "price_for", "register_pricing", "replay", "verify"]
-__version__ = "0.8.0"
+           "StdioTransport", "cost_for", "diff", "export_otlp",
+           "export_otlp_file", "load_records", "price_for",
+           "records_to_spans", "register_pricing", "replay",
+           "spans_to_records", "verify"]

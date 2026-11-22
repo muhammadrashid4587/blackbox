@@ -126,6 +126,16 @@ Flash-Lite. They change often, so treat them as an estimate:
 unknown model costs `None`, never a guessed number. `replay` prints
 the run's cost under the summary.
 
+**MCP server.** `python -m blackbox mcp data/run.jsonl` starts a
+minimal MCP server on stdio (newline-delimited JSON-RPC 2.0, no
+dependencies), so any MCP client can record through blackbox. It
+exposes three tools: `blackbox_record` (append one step — same
+redaction, hash chain and fsync as the library), `blackbox_verify`
+(check the chain) and `blackbox_replay` (read the transcript back).
+Point a client at that command as a stdio server. Closing the server
+(EOF / Ctrl-C) writes the summary record, like closing a Recorder.
+Resources and prompts are not exposed yet — that is the next slice.
+
 ## What it is not
 
 - Not a hosted platform. There is nothing to sign up for and nowhere
@@ -138,13 +148,15 @@ the run's cost under the summary.
 
 ## Measured
 
-- 49 tests, all passing (`make test`).
+- 61 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
 ## Roadmap
 
-- MCP server wrapper, so any MCP client can record through blackbox.
+- MCP server wrapper: stdio server with record/verify/replay tools
+  done (v0.4.0). Next: resources (read a log as an MCP resource) and
+  prompts.
 - Span/trace export to OpenTelemetry.
 
 ## Layout
@@ -154,11 +166,12 @@ blackbox/
   recorder.py     append-only hash-chained log, fsync per record
   sqlite_store.py SQLite store: same records, same chain, WAL + synchronous=FULL
   costs.py        per-model cost tracking: list prices, cost math
+  mcp_server.py   MCP server on stdio: record / verify / replay tools
   redact.py       redaction before write
   verify.py       replay the chain, find the first broken record
   replay.py       transcript printer + run diff
-  __main__.py     CLI: verify | replay | diff
+  __main__.py     CLI: verify | replay | diff | mcp
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
-tests/            35 tests, all passing
+tests/            61 tests, all passing
 ```

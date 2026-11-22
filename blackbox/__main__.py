@@ -1,8 +1,9 @@
-"""CLI: python -m blackbox verify|replay|diff <logfile> ...
+"""CLI: python -m blackbox verify|replay|diff|mcp <logfile> ...
 
     python -m blackbox verify data/demo.jsonl
     python -m blackbox replay data/demo.jsonl
     python -m blackbox diff data/run-a.jsonl data/run-b.jsonl
+    python -m blackbox mcp data/run.jsonl   # MCP server on stdio
 
 Any command takes a .jsonl log or a .db SQLite store.
 """
@@ -10,6 +11,7 @@ Any command takes a .jsonl log or a .db SQLite store.
 import argparse
 import sys
 
+from .mcp_server import serve_stdio
 from .replay import diff, replay
 from .verify import verify_cli
 
@@ -30,6 +32,11 @@ def main(argv=None):
     p_diff.add_argument("log_a")
     p_diff.add_argument("log_b")
 
+    p_mcp = sub.add_parser("mcp", help="serve blackbox over MCP on stdio")
+    p_mcp.add_argument("logfile")
+    p_mcp.add_argument("--task")
+    p_mcp.add_argument("--model")
+
     args = parser.parse_args(argv)
     if args.command == "verify":
         return verify_cli(args.logfile)
@@ -38,6 +45,9 @@ def main(argv=None):
         return 0
     if args.command == "diff":
         diff(args.log_a, args.log_b)
+        return 0
+    if args.command == "mcp":
+        serve_stdio(args.logfile, task=args.task, model=args.model)
         return 0
     return 2
 

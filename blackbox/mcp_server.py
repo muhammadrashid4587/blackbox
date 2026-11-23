@@ -11,7 +11,7 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
-It also exposes the session as two resources, and four prompts:
+It also exposes the session as two resources, and five prompts:
 
     blackbox://session        the session as a readable transcript
     blackbox://session.json   the session's records as JSON
@@ -29,6 +29,12 @@ It also exposes the session as two resources, and four prompts:
                               fired, parent gaps, and a per-model /
                               per-type breakdown of the sampled-out
                               spans
+    summarize_trace           a prompt template for summarising the
+                              session's reconstructed causal trace:
+                              step count, span-type breakdown, the
+                              slowest steps, error steps, parent gaps,
+                              and per-tool / per-model cost and token
+                              totals
 
 Start it from the CLI:
 
@@ -59,7 +65,9 @@ from .redact import REDACTED
 from .replay import _short, format_record, load_records
 from .sampling import (Sampler, SamplingDeclinedError, SamplingError,
                        SamplingNotSupportedError, StdioTransport)
-from .tail_sampling import tail_sample_records
+from .tail_sampling import (_is_error, _span_durations_ms,
+                            tail_sample_records)
+from .trace import _label, build_trace, link_parents
 from .verify import verify
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -220,6 +228,15 @@ PROMPTS = [
                         "spans."),
         "arguments": [],
     },
+    {
+        "name": "summarize_trace",
+        "description": ("Summarise the recorded session's reconstructed "
+                        "causal trace: step count, span-type breakdown, "
+                        "the slowest steps, error steps, parent gaps, "
+                        "and per-tool and per-model cost and token "
+                        "totals."),
+        "arguments": [],
+    },
 ]
 
 PROMPT_FOCUS_LINES = {
@@ -284,6 +301,43 @@ SUMMARIZE_SAMPLING_PROMPT = (
     "Sampling decision:\n{sampling}\n\n"
     "Session transcript:\n{transcript}"
 )
+
+SUMMARIZE_TRACE_PROMPT = (
+    "Summarise this blackbox session as one reconstructed causal "
+    "trace: the parent-child tree rebuilt from the steps, not the "
+    "flat log order. A tool_result hangs off the tool_call it "
+    "answers, a tool_call off the model_call that decided it, and "
+    "a model_call off the step before it — the links are a "
+    "reconstruction from step order, not recorded parent pointers, "
+    "so treat them as a best reading of the order, not a claim "
+    "about intent. For each part of the summary below, say what "
+    "it means for the run: which steps took the longest, which "
+    "steps errored, and where the trace would break apart. A "
+    "parent gap is a kept span whose causal parent — the step "
+    "the trace links it to — would be sampled out by the "
+    "tail-sample defaults (keep rate 0.5, seed 0, so the "
+    "decision is reproducible): in a sampled export that span "
+    "would dangle without its parent. The sampled-out spans are "
+    "still in the log — tail sampling only decides what an "
+    "export keeps, it never deletes steps.\n\n"
+    "Trace summary:\n{trace}\n\n"
+    "Session transcript:\n{transcript}"
+)
+
+
+def _tree_depth(node):
+    """Depth of a trace-tree node: 1 for a leaf, more below."""
+    if not node["children"]:
+        return 1
+    return 1 + max(_tree_depth(child) for child in node["children"])
+
+
+def _tree_lines(nodes, depth, lines):
+    """A trace forest as indented lines, like `blackbox trace`."""
+    for node in nodes:
+        lines.append("%s[%d] %s" % ("  " * depth, node["seq"],
+                                    node["label"]))
+        _tree_lines(node["children"], depth + 1, lines)
 
 
 class MCPServer:
@@ -668,6 +722,104 @@ class MCPServer:
                 lines.append("  %s: %d" % (label, by_label[label]))
         return "\n".join(lines)
 
+    def _trace_lines(self):
+        """The session's reconstructed causal trace, as readable
+        lines.
+
+        Step count and span-type breakdown, the slowest steps (a
+        step's duration is the time until the next step, as in the
+        tail-sampling decision), the error steps, the parent gaps,
+        and per-tool / per-model cost and token totals. The parent
+        gaps are causal, not chain, gaps: a span the tail-sample
+        defaults (keep rate 0.5, seed 0) would keep, whose causal
+        parent from trace.link_parents would be sampled out — in a
+        sampled export that span would dangle without its parent.
+        A kept-all trace (a trigger fired) has no gaps. The trace
+        tree itself is printed last, so the shape is visible, not
+        just the counts.
+        """
+        records = load_records(self.log_path)
+        steps = [r for r in records if r["type"] != "summary"]
+        if not steps:
+            return "No steps recorded yet."
+        parents = link_parents(records)
+        roots = build_trace(records)
+        lines = []
+        lines.append("Trace: %d steps, %d root(s), max depth %d"
+                     % (len(steps), len(roots),
+                        max(_tree_depth(r) for r in roots)))
+        by_type = {}
+        for record in steps:
+            by_type[record["type"]] = by_type.get(record["type"], 0) + 1
+        lines.append("By type: %s" % ", ".join(
+            "%s: %d" % (t, by_type[t]) for t in sorted(by_type)))
+        durations = _span_durations_ms(records)
+        timed = sorted(
+            ((d, r) for d, r in zip(durations, steps) if d is not None),
+            key=lambda pair: pair[0], reverse=True)[:3]
+        if not timed:
+            lines.append("Slowest steps: no timing available.")
+        else:
+            lines.append("Slowest steps:")
+            for duration, record in timed:
+                lines.append("  step %d: %s — %.1f ms"
+                             % (record["seq"], _label(record), duration))
+        errors = [r for r in steps if _is_error(r)]
+        if not errors:
+            lines.append("Error steps: none.")
+        else:
+            lines.append("Error steps:")
+            for record in errors:
+                payload = record.get("payload") or {}
+                detail = ""
+                if "error" in payload:
+                    detail = ": %s" % _short(str(payload["error"]))
+                lines.append("  step %d: %s%s"
+                             % (record["seq"], _label(record), detail))
+        kept, decision = tail_sample_records(
+            records, keep_rate=0.5, seed=0)
+        kept_seqs = {r["seq"] for r in kept}
+        gaps = []
+        for record in steps:
+            parent = parents.get(record["seq"])
+            if (record["seq"] in kept_seqs and parent is not None
+                    and parent not in kept_seqs):
+                gaps.append((record, parent))
+        if decision["decision"] == "kept_all":
+            lines.append(
+                "Parent gaps: none — the trace would be kept whole "
+                "(trigger: %s), so no parent is sampled out"
+                % ", ".join(decision["reasons"]))
+        elif not gaps:
+            lines.append(
+                "Parent gaps: none — every kept span's causal parent "
+                "is kept too.")
+        else:
+            lines.append(
+                "Parent gaps: %d kept span(s) whose causal parent "
+                "would be sampled out (keep rate 0.5, seed 0):"
+                % len(gaps))
+            for record, parent in gaps:
+                lines.append("  step %d: %s (causal parent step %d)"
+                             % (record["seq"], _label(record), parent))
+        lines.append("Cost and tokens (per model):")
+        lines.append(self._cost_lines())
+        tool_counts = {}
+        for record in steps:
+            if record["type"] != "tool_call":
+                continue
+            tool = (record.get("payload") or {}).get("tool") or "?"
+            tool_counts[tool] = tool_counts.get(tool, 0) + 1
+        if not tool_counts:
+            lines.append("Tool calls: none.")
+        else:
+            lines.append("Tool calls:")
+            for tool in sorted(tool_counts):
+                lines.append("  %s: %d" % (tool, tool_counts[tool]))
+        lines.append("Trace tree:")
+        _tree_lines(roots, 0, lines)
+        return "\n".join(lines)
+
     def _resources_read(self, msg_id, params):
         uri = params.get("uri")
         if uri == "blackbox://session":
@@ -715,6 +867,15 @@ class MCPServer:
         if name == "summarize_sampling":
             text = SUMMARIZE_SAMPLING_PROMPT.format(
                 sampling=self._sampling_lines(),
+                transcript=self._transcript())
+            return _result(msg_id, {
+                "description": description,
+                "messages": [{"role": "user",
+                              "content": {"type": "text", "text": text}}],
+            })
+        if name == "summarize_trace":
+            text = SUMMARIZE_TRACE_PROMPT.format(
+                trace=self._trace_lines(),
                 transcript=self._transcript())
             return _result(msg_id, {
                 "description": description,

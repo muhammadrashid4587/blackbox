@@ -166,12 +166,14 @@ class MCPServerTest(unittest.TestCase):
         prompts = response["result"]["prompts"]
         self.assertEqual([p["name"] for p in prompts],
                          ["analyze_session", "summarize_costs",
-                          "summarize_anomalies", "summarize_sampling"])
+                          "summarize_anomalies", "summarize_sampling",
+                          "summarize_trace"])
         self.assertEqual(prompts[0]["arguments"][0]["name"], "focus")
         self.assertFalse(prompts[0]["arguments"][0]["required"])
         self.assertEqual(prompts[1]["arguments"], [])
         self.assertEqual(prompts[2]["arguments"], [])
         self.assertEqual(prompts[3]["arguments"], [])
+        self.assertEqual(prompts[4]["arguments"], [])
 
     def test_prompts_get_includes_transcript_and_verification(self):
         self._init()
@@ -395,6 +397,92 @@ class MCPServerTest(unittest.TestCase):
         response = self.server.handle_message(
             _request(2, "prompts/get",
                      {"name": "summarize_sampling"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("No steps recorded yet.", text)
+
+    def test_prompts_get_summarize_trace(self):
+        self._init()
+        # Six steps, no trigger: with seed 0 the RNG keeps steps
+        # 2, 3 and 5 (draws 0.84, 0.76, 0.42, 0.26, 0.51, 0.40
+        # against 0.5), so the kept tool_result for search and the
+        # kept tool_result for fetch both have a causal parent
+        # that was sampled out — 2 parent gaps.
+        _call(self.server, 2, "blackbox_record",
+              {"type": "model_call",
+               "payload": {"model": "gpt-5", "prompt": "hi"},
+               "tokens": {"input": 1200, "output": 340}})
+        _call(self.server, 3, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "search",
+                           "args": {"query": "mcp"}}})
+        _call(self.server, 4, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "search", "result": "3 results"}})
+        _call(self.server, 5, "blackbox_record",
+              {"type": "model_call",
+               "payload": {"model": "gpt-5", "prompt": "again"},
+               "tokens": {"input": 100, "output": 50}})
+        _call(self.server, 6, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "fetch",
+                           "args": {"url": "https://example.com"}}})
+        _call(self.server, 7, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "fetch", "result": "ok"}})
+        response = self.server.handle_message(
+            _request(8, "prompts/get",
+                     {"name": "summarize_trace"}))
+        message = response["result"]["messages"][0]
+        self.assertEqual(message["role"], "user")
+        text = message["content"]["text"]
+        self.assertIn("Trace: 6 steps, 1 root(s), max depth 6", text)
+        self.assertIn("model_call: 2, tool_call: 2, tool_result: 2",
+                      text)
+        self.assertIn("Slowest steps:", text)
+        self.assertIn("ms", text)
+        self.assertIn("Error steps: none.", text)
+        self.assertIn("Parent gaps: 2 kept span(s) whose causal "
+                      "parent would be sampled out", text)
+        self.assertIn("step 2: tool_result search "
+                      "(causal parent step 1)", text)
+        self.assertIn("step 5: tool_result fetch "
+                      "(causal parent step 4)", text)
+        self.assertIn("gpt-5: 1300 input + 390 output tokens, "
+                      "$0.005525", text)
+        self.assertIn("Total priced cost: $0.005525", text)
+        self.assertIn("  fetch: 1", text)
+        self.assertIn("  search: 1", text)
+        self.assertIn("[0] model_call gpt-5", text)
+        self.assertIn("[5] tool_result fetch", text)
+        self.assertIn("reconstruction", text)
+        self.assertIn("search", text)  # transcript included too
+
+    def test_prompts_get_summarize_trace_kept_all(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "search",
+                           "args": {"query": "mcp"}}})
+        _call(self.server, 3, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "search",
+                           "error": "upstream 500"}})
+        response = self.server.handle_message(
+            _request(4, "prompts/get",
+                     {"name": "summarize_trace"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Trace: 2 steps, 1 root(s), max depth 2", text)
+        self.assertIn("step 1: tool_result search: upstream 500", text)
+        self.assertIn("Parent gaps: none — the trace would be kept "
+                      "whole (trigger: error)", text)
+        self.assertIn("Tool calls:", text)
+        self.assertIn("  search: 1", text)
+
+    def test_prompts_get_summarize_trace_empty_session(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "prompts/get",
+                     {"name": "summarize_trace"}))
         text = response["result"]["messages"][0]["content"]["text"]
         self.assertIn("No steps recorded yet.", text)
 

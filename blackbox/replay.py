@@ -68,6 +68,13 @@ def format_record(record):
         tool = payload.get("tool", "?")
         result = payload.get("result", "")
         return "%s  %s -> %s" % (header, tool, _short(result))
+    if event_type == "checkpoint":
+        lines = [header]
+        lines.append("    compacted %s records up to %s, kept %s"
+                     % (payload.get("compacted_count"),
+                        (payload.get("head_hash") or "")[:12],
+                        payload.get("kept_count")))
+        return "\n".join(lines)
     if event_type == "summary":
         lines = [header]
         lines.append("    events: %s  tokens: %s  %s -> %s" % (

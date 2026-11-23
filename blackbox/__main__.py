@@ -10,6 +10,8 @@
     python -m blackbox export data/run.jsonl --live  # POST spans to a collector
     python -m blackbox query data/run.jsonl --model gpt-5 --min-cost 0.01
     python -m blackbox trace data/run.jsonl  # causal parent-child tree
+    python -m blackbox compact data/run.jsonl --keep-days 30  # retention
+    python -m blackbox compact data/run.jsonl --keep-n 1000
 
 Any command takes a .jsonl log or a .db SQLite store.
 """
@@ -18,6 +20,7 @@ import argparse
 import json
 import sys
 
+from .compact import compact_log
 from .live_export import DEFAULT_OTLP_ENDPOINT, OtlpHttpExporter
 from .mcp_server import serve_stdio
 from .otel import export_otlp, export_otlp_metrics
@@ -131,6 +134,19 @@ def main(argv=None):
                          help="print the nested tree as JSON instead of "
                          "an indented tree")
 
+    p_compact = sub.add_parser(
+        "compact", help="retention: drop old records and anchor them "
+        "with a hash-chain checkpoint, so verify still passes on the "
+        "compacted log")
+    p_compact.add_argument("logfile")
+    p_compact.add_argument("--keep-days", type=float, default=None,
+                           help="keep records from the last N days")
+    p_compact.add_argument("--keep-n", type=int, default=None,
+                           help="keep the newest N records")
+    p_compact.add_argument("--dry-run", action="store_true",
+                           help="report what would be removed without "
+                           "writing anything")
+
     args = parser.parse_args(argv)
     if args.command == "verify":
         return verify_cli(args.logfile)
@@ -213,6 +229,29 @@ def main(argv=None):
         return 0
     if args.command == "trace":
         trace_log(args.logfile, as_json=args.as_json)
+        return 0
+    if args.command == "compact":
+        try:
+            result = compact_log(args.logfile, keep_days=args.keep_days,
+                                 keep_n=args.keep_n,
+                                 dry_run=args.dry_run)
+        except FileNotFoundError:
+            print("compact: file not found: %s" % args.logfile,
+                  file=sys.stderr)
+            return 1
+        except ValueError as exc:
+            print("compact: %s" % exc, file=sys.stderr)
+            return 2
+        if not result["changed"]:
+            print("compact: nothing to remove — kept %d records"
+                  % result["kept"])
+            return 0
+        action = "would remove" if args.dry_run else "removed"
+        print("compact: %s %d records, kept %d; checkpoint %s "
+              "(head %s)"
+              % (action, result["compacted"], result["kept"],
+                 (result["checkpoint_hash"] or "n/a")[:12],
+                 (result["head_hash"] or "")[:12]))
         return 0
     return 2
 

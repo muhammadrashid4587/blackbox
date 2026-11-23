@@ -24,6 +24,12 @@ What is checked, in order, for every record:
 
 A log with no summary still verifies: it just means the run never
 closed cleanly (crash, Ctrl-C), which is not tampering.
+
+A compacted log starts with a checkpoint record (type "checkpoint"),
+the new genesis of the chain after `compact` removed old records.
+It verifies the same way — the chain is replayed from the checkpoint
+forward — and the result reports how many records the checkpoint
+compacted away.
 """
 
 import json
@@ -82,8 +88,18 @@ def _finish(records):
     bad_seq, error = _check_summary(records)
     if bad_seq is not None:
         return _fail(len(records), bad_seq, error)
-    return {"ok": True, "records": len(records),
-            "first_bad_seq": None, "error": None}
+    result = {"ok": True, "records": len(records),
+              "first_bad_seq": None, "error": None}
+    # A compacted log starts with a checkpoint record, the new genesis
+    # of the chain: report how many records it compacted away.
+    if records and records[0].get("type") == "checkpoint":
+        result["compacted"] = (records[0].get("payload") or {}).get(
+            "compacted_count", 0) or 0
+        result["checkpoint_hash"] = records[0].get("hash")
+    else:
+        result["compacted"] = 0
+        result["checkpoint_hash"] = None
+    return result
 
 
 def verify(path):
@@ -131,7 +147,13 @@ def _verify_jsonl(path):
 def verify_cli(path):
     result = verify(path)
     if result["ok"]:
-        print("OK: %d records, hash chain intact" % result["records"])
+        message = "OK: %d records, hash chain intact" % result["records"]
+        if result.get("compacted"):
+            message += (" (compacted log: %d records removed, "
+                        "checkpoint %s)"
+                        % (result["compacted"],
+                           result["checkpoint_hash"][:12]))
+        print(message)
         return 0
     print("FAIL: %s" % result["error"])
     return 1

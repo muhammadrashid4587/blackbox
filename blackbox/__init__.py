@@ -7,8 +7,9 @@ append-only log you can verify and replay.
 Pure Python 3 standard library. No dependencies.
 """
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
+from .compact import compact_log
 from .costs import cost_for, price_for, register_pricing
 from .live_export import (DEFAULT_OTLP_ENDPOINT, LiveExporter,
                           OtlpHttpExporter)
@@ -34,7 +35,8 @@ __all__ = ["DEFAULT_OTLP_ENDPOINT", "DEFAULT_MAX_COST_USD",
            "OtlpHttpExporter", "Recorder", "Sampler",
            "SamplingDeclinedError",
            "SamplingError", "SamplingNotSupportedError", "SamplingResult",
-           "StdioTransport", "build_trace", "cost_for", "diff", "export_otlp",
+           "StdioTransport", "build_trace", "compact_log", "cost_for",
+           "diff", "export_otlp",
            "export_otlp_file", "export_otlp_metrics",
            "export_otlp_metrics_file", "export_tail_sampled_otlp",
            "export_tail_sampled_otlp_file", "link_parents", "load_records",

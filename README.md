@@ -249,6 +249,22 @@ reconstruction as a Python API, and both work on `.jsonl` logs and
 intent: the log records no parent pointers, so a result for a tool
 called twice in a row pairs with the earlier call by FIFO order.
 
+**Retention / compaction.** `python -m blackbox compact data/run.jsonl
+--keep-days 30` (or `--keep-n 1000`) drops the records older than the
+cutoff and writes a checkpoint record in their place: the hash of the
+last removed record, how many were removed, and the cutoff. The
+checkpoint is the new genesis of the hash chain — the kept records
+are renumbered from seq 1 and re-chained from it — so `verify` still
+passes on a compacted log, and tampering with a kept record, or with
+the checkpoint itself, is still caught at the exact seq. A trailing
+summary is dropped (a fresh one is written on the next close, as on
+resume) and its event/token totals are copied into the checkpoint.
+Compacting twice accumulates the count, and `--dry-run` reports what
+would be removed without writing. The checkpoint certifies that N
+records existed up to a given head hash and were removed — it does
+not let anyone re-verify the removed records themselves; they are
+gone. Compaction works on `.jsonl` logs and `.db` stores.
+
 ## What it is not
 
 - Not a hosted platform. There is nothing to sign up for and nowhere
@@ -261,7 +277,7 @@ called twice in a row pairs with the earlier call by FIFO order.
 
 ## Measured
 
-- 192 tests, all passing (`make test`).
+- 203 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -307,6 +323,12 @@ called twice in a row pairs with the earlier call by FIFO order.
   decided them, model_calls off the previous step — as an indented
   tree or nested JSON (`link_parents` / `build_trace` in `trace.py`),
   done (v0.15.0).
+- Retention / compaction: `blackbox compact` drops records older
+  than a cutoff (`--keep-days`) or beyond the newest N (`--keep-n`)
+  and anchors them with a checkpoint record (head hash, removed
+  count, cutoff) that becomes the new genesis of the hash chain, so
+  `verify` still passes and tampering after compaction is still
+  caught; `--dry-run` reports without writing, done (v0.16.0).
 
 ## Layout
 
@@ -331,6 +353,9 @@ blackbox/
   trace.py        causal trace reconstruction: parent-child tree
                   (tool_result -> tool_call, tool_call -> model_call),
                   indented tree or nested JSON; `blackbox trace` CLI
+  compact.py      retention / compaction: drop old records, anchor
+                  them with a hash-chain checkpoint record (head
+                  hash, removed count, cutoff); `blackbox compact` CLI
   otel.py         OpenTelemetry export: records to OTLP/JSON spans,
                   trace/span ids from the hash chain, round-trip, and
                   OTLP Sum metrics (per-model calls, tokens, latency,
@@ -342,9 +367,9 @@ blackbox/
   verify.py       replay the chain, find the first broken record
   replay.py       transcript printer + run diff
   __main__.py     CLI: verify | replay | diff | mcp | otel | export
-                  | metrics | tail-sample | query | trace
+                  | metrics | tail-sample | query | trace | compact
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            192 tests, all passing
+tests/            203 tests, all passing
 ```

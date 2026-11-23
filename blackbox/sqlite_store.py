@@ -121,6 +121,23 @@ class SQLiteStore:
             "(SELECT MAX(seq) FROM records)")
         self.conn.commit()
 
+    def replace_all(self, records):
+        """Replace the whole store with the given records, in one
+        transaction: delete every row, then insert the new ones.
+        Used by compaction, where the log is rewritten wholesale.
+        """
+        self.conn.execute("DELETE FROM records")
+        for record in records:
+            self.conn.execute(
+                "INSERT INTO records (%s) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                % _COLUMNS,
+                (record["seq"], record["ts"], record["type"],
+                 json.dumps(record["payload"], sort_keys=True),
+                 None if record["tokens"] is None else json.dumps(
+                     record["tokens"], sort_keys=True),
+                 record["prev_hash"], record["hash"]))
+        self.conn.commit()
+
     def close(self):
         """Checkpoint the WAL into the .db file, then close."""
         self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")

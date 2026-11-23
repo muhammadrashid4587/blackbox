@@ -16,6 +16,7 @@ both runs are printed at the end.
 
 import json
 
+from .costs import cost_for
 from .recorder import _tokens_total
 from .sqlite_store import is_sqlite_path, load_sqlite_records
 
@@ -141,6 +142,138 @@ def diff_records(records_a, records_b):
 
     return {"changed": changed, "added": added, "removed": removed,
             "tokens_a": _total(steps_a), "tokens_b": _total(steps_b)}
+
+
+def model_usage(records, default_model=None):
+    """Per-model token usage for a list of records.
+
+    Same rules as the Recorder's summary: a plain int token count
+    has no input/output split and is not priced, and an unknown
+    model costs None, never a guessed number. A model_call with no
+    model in its payload falls back to `default_model` (the
+    session's model, when there is one). This is the same
+    computation the MCP server's cost summary uses, so the prompt
+    and the diff resource always agree on a model's tokens.
+    """
+    usage = {}
+    for record in records:
+        if record.get("type") != "model_call":
+            continue
+        model = ((record.get("payload") or {}).get("model")
+                 or default_model)
+        if not model:
+            continue
+        entry = usage.setdefault(
+            model, {"input_tokens": 0, "output_tokens": 0,
+                    "tokens": 0})
+        tokens = record.get("tokens")
+        if isinstance(tokens, dict):
+            if isinstance(tokens.get("input"), int):
+                entry["input_tokens"] += tokens["input"]
+            if isinstance(tokens.get("output"), int):
+                entry["output_tokens"] += tokens["output"]
+        elif isinstance(tokens, int):
+            entry["tokens"] += tokens
+    return usage
+
+
+def _is_error(record):
+    """A step that looks like an error: an error step, a tool result
+    carrying an error, or a payload with status "error".
+
+    Mirrors the same rule in query.py and tail_sampling.py (replay
+    cannot import from either — both import this module — so the
+    three-line rule lives here too)."""
+    if record["type"] == "error":
+        return True
+    payload = record.get("payload") or {}
+    if "error" in payload:
+        return True
+    return payload.get("status") == "error"
+
+
+def session_diff(records_a, records_b, default_model_a=None,
+                 default_model_b=None):
+    """What changed between two runs, as JSON-able data.
+
+    The same comparison `blackbox diff` prints and the
+    `summarize_diff` MCP prompt summarises, as a dict: step counts
+    and token totals for both runs, changed steps (same position,
+    different type/payload/tokens, with both steps included),
+    steps added in run B and removed from run A, per-model token
+    and cost deltas (cost None where a model is unpriced in either
+    run — a plain int token count has no input/output split, an
+    unknown model has no published price, never a guessed number),
+    and new vs fixed errors (an error run B has where run A had
+    none, and one run A had that run B does not, compared by
+    position). The summary record is skipped in both runs — it is
+    bookkeeping, not a step. Read-only — it removes or changes
+    nothing.
+    """
+    findings = diff_records(records_a, records_b)
+    steps_a = [r for r in records_a if r["type"] != "summary"]
+    steps_b = [r for r in records_b if r["type"] != "summary"]
+    changed = [{"position": i, "step_a": steps_a[i],
+                "step_b": steps_b[i]}
+               for i in findings["changed"]]
+    added = [steps_b[i] for i in findings["added"]]
+    removed = [steps_a[i] for i in findings["removed"]]
+    usage_a = model_usage(records_a, default_model_a)
+    usage_b = model_usage(records_b, default_model_b)
+    per_model = {}
+    for model in sorted(set(usage_a) | set(usage_b)):
+        entry_a = usage_a.get(model, {"input_tokens": 0,
+                                      "output_tokens": 0,
+                                      "tokens": 0})
+        entry_b = usage_b.get(model, {"input_tokens": 0,
+                                      "output_tokens": 0,
+                                      "tokens": 0})
+        tokens_a = (entry_a["input_tokens"]
+                    + entry_a["output_tokens"] + entry_a["tokens"])
+        tokens_b = (entry_b["input_tokens"]
+                    + entry_b["output_tokens"] + entry_b["tokens"])
+        cost_a = (cost_for(model, entry_a["input_tokens"],
+                           entry_a["output_tokens"])
+                  if entry_a["input_tokens"] or entry_a["output_tokens"]
+                  else None)
+        cost_b = (cost_for(model, entry_b["input_tokens"],
+                           entry_b["output_tokens"])
+                  if entry_b["input_tokens"] or entry_b["output_tokens"]
+                  else None)
+        cost_delta = (cost_b - cost_a
+                      if cost_a is not None and cost_b is not None
+                      else None)
+        per_model[model] = {"tokens_a": tokens_a,
+                            "tokens_b": tokens_b,
+                            "tokens_delta": tokens_b - tokens_a,
+                            "cost_usd_a": cost_a,
+                            "cost_usd_b": cost_b,
+                            "cost_usd_delta": cost_delta}
+    new_errors = []
+    fixed_errors = []
+    for i in range(max(len(steps_a), len(steps_b))):
+        error_a = i < len(steps_a) and _is_error(steps_a[i])
+        error_b = i < len(steps_b) and _is_error(steps_b[i])
+        if error_b and not error_a:
+            new_errors.append(steps_b[i])
+        elif error_a and not error_b:
+            fixed_errors.append(steps_a[i])
+    return {"run_a": {"steps": len(steps_a),
+                      "tokens": findings["tokens_a"]},
+            "run_b": {"steps": len(steps_b),
+                      "tokens": findings["tokens_b"]},
+            "tokens_diff": findings["tokens_b"] - findings["tokens_a"],
+            "identical": (not findings["changed"]
+                          and not findings["added"]
+                          and not findings["removed"]),
+            "changed": changed,
+            "added": added,
+            "removed": removed,
+            "per_model": per_model,
+            "new_errors": new_errors,
+            "fixed_errors": fixed_errors,
+            "errors_a": sum(1 for r in steps_a if _is_error(r)),
+            "errors_b": sum(1 for r in steps_b if _is_error(r))}
 
 
 def diff(path_a, path_b):

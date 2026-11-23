@@ -11,7 +11,7 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
-It also exposes the session as four resources, and eight prompts:
+It also exposes the session as five resources, and eight prompts:
 
     blackbox://session        the session as a readable transcript
     blackbox://session.json   the session's records as JSON
@@ -21,6 +21,10 @@ It also exposes the session as four resources, and eight prompts:
     blackbox://session/trace  the session's reconstructed causal
                               trace as JSON, the same trace
                               `blackbox trace` prints
+    blackbox://session/diff?other_path=<path>
+                              what changed between this session and
+                              another run as JSON, the same diff
+                              `blackbox diff` prints
     analyze_session           a prompt template for analysing the
                               session (optional focus argument)
     summarize_costs           a prompt template for summarising the
@@ -83,13 +87,15 @@ import json
 import re
 import sys
 from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlparse
 
 from .aggregates import format_aggregates, session_aggregates
 from .compact import _parse_ts, compact_log
 from .costs import cost_for
 from .recorder import Recorder
 from .redact import REDACTED
-from .replay import (_short, diff_records, format_record, load_records)
+from .replay import (_short, diff_records, format_record, load_records,
+                    model_usage, session_diff)
 from .sampling import (Sampler, SamplingDeclinedError, SamplingError,
                        SamplingNotSupportedError, StdioTransport)
 from .tail_sampling import (_is_error, _span_durations_ms,
@@ -233,6 +239,21 @@ RESOURCES = [
                         "breakdown, the slowest steps, error steps, "
                         "parent gaps, and the parent-child tree — "
                         "the same trace `blackbox trace` prints."),
+        "mimeType": "application/json",
+    },
+    {
+        "uri": "blackbox://session/diff",
+        "name": "session/diff",
+        "description": ("What changed between the recorded session "
+                        "and another run as JSON: changed, added and "
+                        "removed steps (position by position, like "
+                        "`blackbox diff`), per-model token and cost "
+                        "deltas, and new vs fixed errors — the same "
+                        "diff the summarize_diff prompt summarises. "
+                        "Read it as blackbox://session/diff"
+                        "?other_path=<path to the other run's log "
+                        "(.jsonl or .db)>; without other_path the "
+                        "read is an error."),
         "mimeType": "application/json",
     },
 ]
@@ -674,32 +695,12 @@ class MCPServer:
     def _model_usage(self, records, default_model=None):
         """Per-model token usage for a list of records.
 
-        Same rules as the Recorder's summary: a plain int token
-        count has no input/output split and is not priced, and an
-        unknown model costs None, never a guessed number. A
-        model_call with no model in its payload falls back to
-        `default_model` (the session's model, when there is one).
+        The shared `model_usage` from replay.py — same rules as
+        the Recorder's summary, so the cost summary, the diff
+        prompt and the diff resource always agree on a model's
+        tokens.
         """
-        usage = {}
-        for record in records:
-            if record.get("type") != "model_call":
-                continue
-            model = ((record.get("payload") or {}).get("model")
-                     or default_model)
-            if not model:
-                continue
-            entry = usage.setdefault(
-                model, {"input_tokens": 0, "output_tokens": 0,
-                        "tokens": 0})
-            tokens = record.get("tokens")
-            if isinstance(tokens, dict):
-                if isinstance(tokens.get("input"), int):
-                    entry["input_tokens"] += tokens["input"]
-                if isinstance(tokens.get("output"), int):
-                    entry["output_tokens"] += tokens["output"]
-            elif isinstance(tokens, int):
-                entry["tokens"] += tokens
-        return usage
+        return model_usage(records, default_model)
 
     def _cost_lines(self):
         """Per-model token usage and USD cost, as readable lines.
@@ -1224,6 +1225,34 @@ class MCPServer:
             records = load_records(self.log_path)
             trace = session_trace(records)
             text = json.dumps(trace, indent=2, sort_keys=True)
+            return _result(msg_id, {"contents": [
+                {"uri": uri, "mimeType": "application/json",
+                 "text": text}]})
+        if (uri == "blackbox://session/diff"
+                or uri.startswith("blackbox://session/diff?")):
+            # A resource read takes no arguments, so the other
+            # run's log path rides in the URI as a query
+            # parameter: blackbox://session/diff?other_path=...
+            other_path = parse_qs(
+                urlparse(uri).query).get("other_path", [None])[0]
+            if not other_path:
+                return _error(
+                    msg_id, INVALID_PARAMS,
+                    "blackbox://session/diff needs an 'other_path' "
+                    "query parameter: the path of the second run's "
+                    "log, e.g. blackbox://session/diff"
+                    "?other_path=data/run-b.jsonl")
+            try:
+                records_a = load_records(self.log_path)
+                records_b = load_records(other_path)
+            except (OSError, ValueError) as exc:
+                return _error(msg_id, INVALID_PARAMS,
+                              "cannot read the other run's log %r: %s"
+                              % (other_path, exc))
+            diff = session_diff(
+                records_a, records_b,
+                default_model_a=self.recorder.model)
+            text = json.dumps(diff, indent=2, sort_keys=True)
             return _result(msg_id, {"contents": [
                 {"uri": uri, "mimeType": "application/json",
                  "text": text}]})

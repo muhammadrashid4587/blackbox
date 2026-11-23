@@ -123,7 +123,8 @@ class MCPServerTest(unittest.TestCase):
         self.assertEqual(uris, ["blackbox://session",
                                 "blackbox://session.json",
                                 "blackbox://session/aggregates",
-                                "blackbox://session/trace"])
+                                "blackbox://session/trace",
+                                "blackbox://session/diff"])
         for resource in response["result"]["resources"]:
             self.assertIn("mimeType", resource)
 
@@ -326,6 +327,96 @@ class MCPServerTest(unittest.TestCase):
         self.assertEqual(trace["error_seqs"], [])
         self.assertEqual(trace["parent_gaps"], [])
         self.assertEqual(trace["tree"], [])
+
+    def test_resources_read_session_diff(self):
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        self._write_other_run(other, query="other",
+                              extra=True, error_result=True)
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/diff?other_path="
+                            + other}))
+        content = response["result"]["contents"][0]
+        self.assertEqual(content["uri"],
+                         "blackbox://session/diff?other_path=" + other)
+        self.assertEqual(content["mimeType"], "application/json")
+        diff = json.loads(content["text"])
+        # Same diff `blackbox diff` prints for these runs: steps
+        # 1-2 changed (query, then an error result), one extra
+        # fetch call, same 1690 tokens on both sides.
+        self.assertEqual(diff["run_a"], {"steps": 4, "tokens": 1690})
+        self.assertEqual(diff["run_b"], {"steps": 5, "tokens": 1690})
+        self.assertEqual(diff["tokens_diff"], 0)
+        self.assertFalse(diff["identical"])
+        self.assertEqual([c["position"] for c in diff["changed"]],
+                         [1, 2])
+        self.assertEqual(len(diff["added"]), 1)
+        self.assertEqual(diff["added"][0]["payload"]["tool"], "fetch")
+        self.assertEqual(diff["removed"], [])
+        gpt5 = diff["per_model"]["gpt-5"]
+        self.assertEqual(gpt5["tokens_a"], 1690)
+        self.assertEqual(gpt5["tokens_b"], 1690)
+        self.assertEqual(gpt5["tokens_delta"], 0)
+        self.assertEqual(gpt5["cost_usd_a"], 0.005525)
+        self.assertEqual(gpt5["cost_usd_b"], 0.005525)
+        self.assertEqual(gpt5["cost_usd_delta"], 0)
+        self.assertEqual(len(diff["new_errors"]), 1)
+        self.assertEqual(diff["new_errors"][0]["payload"],
+                         {"tool": "search", "error": "timed out"})
+        self.assertEqual(diff["fixed_errors"], [])
+        self.assertEqual(diff["errors_a"], 0)
+        self.assertEqual(diff["errors_b"], 1)
+
+    def test_resources_read_session_diff_identical(self):
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        self._write_other_run(other)
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/diff?other_path="
+                            + other}))
+        diff = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertTrue(diff["identical"])
+        self.assertEqual(diff["changed"], [])
+        self.assertEqual(diff["added"], [])
+        self.assertEqual(diff["removed"], [])
+        self.assertEqual(diff["tokens_diff"], 0)
+
+    def test_resources_read_session_diff_empty_session(self):
+        self._init()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        with Recorder(other) as rec:
+            pass
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/diff?other_path="
+                            + other}))
+        diff = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertTrue(diff["identical"])
+        self.assertEqual(diff["run_a"], {"steps": 0, "tokens": 0})
+        self.assertEqual(diff["run_b"], {"steps": 0, "tokens": 0})
+        self.assertEqual(diff["per_model"], {})
+
+    def test_resources_read_session_diff_needs_other_path(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/diff"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_diff_missing_file_is_an_error(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/diff?other_path="
+                            + os.path.join(self.tmp.name,
+                                           "nope.jsonl")}))
+        self.assertEqual(response["error"]["code"], -32602)
 
     def test_resources_read_unknown_uri_is_an_error(self):
         self._init()

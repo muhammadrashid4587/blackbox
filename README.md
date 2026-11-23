@@ -132,7 +132,7 @@ dependencies), so any MCP client can record through blackbox. It
 exposes three tools: `blackbox_record` (append one step — same
 redaction, hash chain and fsync as the library), `blackbox_verify`
 (check the chain) and `blackbox_replay` (read the transcript back).
-The session is also readable as four resources:
+The session is also readable as five resources:
 `blackbox://session` (the transcript), `blackbox://session.json`
 (the raw records, hash chain included),
 `blackbox://session/aggregates` (the session totals as JSON —
@@ -145,7 +145,16 @@ JSON — step count, span-type breakdown, the slowest steps, error
 steps, parent gaps, and the parent-child tree, the same trace
 `blackbox trace` prints) — all read from the
 same log the tools write to, so a client always sees the current
-session.
+session. A fifth resource, `blackbox://session/diff`, exposes
+what changed between this session and another run as JSON —
+changed, added and removed steps (position by position, like
+`blackbox diff`), per-model token and cost deltas, and new vs
+fixed errors, the same diff the `summarize_diff` prompt
+summarises; read it as
+`blackbox://session/diff?other_path=<path to the other run's
+log>` — a resource read takes no arguments, so the other run's
+path rides in the URI as a query parameter, and reading the
+resource without it is an error.
 One prompt template, `analyze_session`, hands the client a prompt
 for analysing the session, with an optional `focus` argument
 (`errors`, `cost`, `tool usage`, or anything else); the prompt
@@ -364,7 +373,7 @@ session summary instead of the whole transcript. It works on
 
 ## Measured
 
-- 270 tests, all passing (`make test`).
+- 280 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -500,8 +509,23 @@ session summary instead of the whole transcript. It works on
   `session_trace` (step latencies and error steps use the
   same helpers as the `summarize_trace` prompt, so the
   resource and the prompt always agree), done (v0.27.0).
-  Next: an MCP resource for the diff, or a second trace
-  view — per-tool / per-model cost and token totals as JSON.
+- Diff resource: `blackbox://session/diff` exposes what
+  changed between this session and another run as JSON —
+  changed, added and removed steps (position by position,
+  like `blackbox diff`), per-model token and cost deltas, and
+  new vs fixed errors — so any client can read the diff
+  without a prompt round-trip, reusing `diff_records` and a
+  shared `session_diff` from `replay.py` (per-model usage
+  and pricing use the same rules as the `summarize_diff`
+  prompt, so the resource and the prompt always agree).
+  A resource read takes no arguments, so the other run's
+  log path rides in the URI as a query parameter —
+  `blackbox://session/diff?other_path=<path>` — and reading
+  it without one, or with an unreadable log, is an error,
+  done (v0.28.0).
+  Next: a second trace view — per-tool / per-model cost and
+  token totals as JSON, or an MCP resource template for the
+  diff so clients can discover the other_path parameter.
 
 ## Layout
 
@@ -553,12 +577,13 @@ blackbox/
                   thread, Recorder integration, `export --live` CLI
   redact.py       redaction before write
   verify.py       replay the chain, find the first broken record
-  replay.py       transcript printer + run diff
+  replay.py       transcript printer + run diff (`diff_records`,
+                  `session_diff` as JSON, per-model token usage)
   __main__.py     CLI: verify | replay | diff | mcp | otel | export
                   | metrics | tail-sample | query | trace | compact
                   | aggregates
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            270 tests, all passing
+tests/            280 tests, all passing
 ```

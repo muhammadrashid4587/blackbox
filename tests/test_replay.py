@@ -6,7 +6,8 @@ import tempfile
 import unittest
 
 from blackbox import Recorder
-from blackbox.replay import diff, diff_records, load_records, replay
+from blackbox.replay import (diff, diff_records, load_records,
+                             model_usage, replay, session_diff)
 
 
 def _write_run(path, tool="search", query="first", tokens=100):
@@ -115,6 +116,155 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(result["added"], [])
         self.assertEqual(result["removed"], [])
         self.assertEqual(result["tokens_a"], result["tokens_b"])
+
+    def test_model_usage_splits_priced_tokens(self):
+        records = [
+            {"type": "model_call", "payload": {"model": "gpt-5"},
+             "tokens": {"input": 1200, "output": 340}},
+            {"type": "model_call", "payload": {"model": "gpt-5"},
+             "tokens": 50},
+            {"type": "model_call", "payload": {},
+             "tokens": {"input": 10, "output": 5}},
+            {"type": "tool_call", "payload": {"tool": "search"},
+             "tokens": 99},
+        ]
+        usage = model_usage(records, default_model="gpt-5-mini")
+        self.assertEqual(usage["gpt-5"],
+                         {"input_tokens": 1200, "output_tokens": 340,
+                          "tokens": 50})
+        # No model in the payload falls back to the default model.
+        self.assertEqual(usage["gpt-5-mini"],
+                         {"input_tokens": 10, "output_tokens": 5,
+                          "tokens": 0})
+        # Tool calls are not model usage, whatever their tokens say.
+        self.assertNotIn("search", usage)
+
+    def test_session_diff_changed_added_per_model_new_error(self):
+        # Run A: 4 steps, gpt-5 1300 in + 390 out = $0.005525.
+        # Run B: same shape, a different query and an error result
+        # at steps 1-2, plus one extra fetch call at the end.
+        path_a = os.path.join(self.tmp.name, "a.jsonl")
+        path_b = os.path.join(self.tmp.name, "b.jsonl")
+        with Recorder(path_a) as rec:
+            rec.record("model_call", {"model": "gpt-5",
+                                      "prompt": "hi"},
+                       tokens={"input": 1200, "output": 340})
+            rec.record("tool_call", {"tool": "search",
+                                     "args": {"query": "mcp"}})
+            rec.record("tool_result", {"tool": "search",
+                                       "result": "3 results"})
+            rec.record("model_call", {"model": "gpt-5",
+                                      "prompt": "again"},
+                       tokens={"input": 100, "output": 50})
+        with Recorder(path_b) as rec:
+            rec.record("model_call", {"model": "gpt-5",
+                                      "prompt": "hi"},
+                       tokens={"input": 1200, "output": 340})
+            rec.record("tool_call", {"tool": "search",
+                                     "args": {"query": "other"}})
+            rec.record("tool_result", {"tool": "search",
+                                       "error": "timed out"})
+            rec.record("model_call", {"model": "gpt-5",
+                                      "prompt": "again"},
+                       tokens={"input": 100, "output": 50})
+            rec.record("tool_call", {"tool": "fetch",
+                                     "args": {"url":
+                                              "https://example.com"}})
+        result = session_diff(load_records(path_a),
+                              load_records(path_b))
+        self.assertEqual(result["run_a"], {"steps": 4, "tokens": 1690})
+        self.assertEqual(result["run_b"], {"steps": 5, "tokens": 1690})
+        self.assertEqual(result["tokens_diff"], 0)
+        self.assertFalse(result["identical"])
+        self.assertEqual([c["position"] for c in result["changed"]],
+                         [1, 2])
+        self.assertEqual(result["changed"][1]["step_a"]["type"],
+                         "tool_result")
+        self.assertEqual(result["changed"][1]["step_b"]["payload"],
+                         {"tool": "search", "error": "timed out"})
+        self.assertEqual(len(result["added"]), 1)
+        self.assertEqual(result["added"][0]["payload"]["tool"], "fetch")
+        self.assertEqual(result["removed"], [])
+        gpt5 = result["per_model"]["gpt-5"]
+        self.assertEqual(gpt5["tokens_a"], 1690)
+        self.assertEqual(gpt5["tokens_b"], 1690)
+        self.assertEqual(gpt5["tokens_delta"], 0)
+        self.assertEqual(gpt5["cost_usd_a"], 0.005525)
+        self.assertEqual(gpt5["cost_usd_b"], 0.005525)
+        self.assertEqual(gpt5["cost_usd_delta"], 0)
+        self.assertEqual(len(result["new_errors"]), 1)
+        self.assertEqual(result["new_errors"][0]["payload"],
+                         {"tool": "search", "error": "timed out"})
+        self.assertEqual(result["fixed_errors"], [])
+        self.assertEqual(result["errors_a"], 0)
+        self.assertEqual(result["errors_b"], 1)
+
+    def test_session_diff_fixed_error_removed_step_unpriced(self):
+        # Run A has an error step and a model call with a plain int
+        # token count on an unknown model; run B fixes the error
+        # and drops the model call.
+        path_a = os.path.join(self.tmp.name, "a.jsonl")
+        path_b = os.path.join(self.tmp.name, "b.jsonl")
+        with Recorder(path_a) as rec:
+            rec.record("tool_call", {"tool": "search",
+                                     "args": {"query": "mcp"}})
+            rec.record("tool_result", {"tool": "search",
+                                       "error": "upstream 500"})
+            rec.record("model_call", {"model": "demo-model",
+                                      "prompt": "again"}, tokens=100)
+        with Recorder(path_b) as rec:
+            rec.record("tool_call", {"tool": "search",
+                                     "args": {"query": "mcp"}})
+            rec.record("tool_result", {"tool": "search",
+                                       "result": "3 results"})
+        result = session_diff(load_records(path_a),
+                              load_records(path_b))
+        self.assertEqual(result["run_a"], {"steps": 3, "tokens": 100})
+        self.assertEqual(result["run_b"], {"steps": 2, "tokens": 0})
+        self.assertEqual(result["tokens_diff"], -100)
+        self.assertEqual([c["position"] for c in result["changed"]],
+                         [1])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(len(result["removed"]), 1)
+        self.assertEqual(result["removed"][0]["type"], "model_call")
+        # Unknown model, plain int tokens: counted, never priced.
+        demo = result["per_model"]["demo-model"]
+        self.assertEqual(demo["tokens_a"], 100)
+        self.assertEqual(demo["tokens_b"], 0)
+        self.assertEqual(demo["tokens_delta"], -100)
+        self.assertIsNone(demo["cost_usd_a"])
+        self.assertIsNone(demo["cost_usd_b"])
+        self.assertIsNone(demo["cost_usd_delta"])
+        self.assertEqual(result["new_errors"], [])
+        self.assertEqual(len(result["fixed_errors"]), 1)
+        self.assertEqual(result["fixed_errors"][0]["payload"],
+                         {"tool": "search", "error": "upstream 500"})
+        self.assertEqual(result["errors_a"], 1)
+        self.assertEqual(result["errors_b"], 0)
+
+    def test_session_diff_identical_runs(self):
+        path_a = os.path.join(self.tmp.name, "a.jsonl")
+        path_b = os.path.join(self.tmp.name, "b.jsonl")
+        _write_run(path_a)
+        _write_run(path_b)
+        result = session_diff(load_records(path_a),
+                              load_records(path_b))
+        self.assertTrue(result["identical"])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["tokens_diff"], 0)
+        self.assertEqual(result["new_errors"], [])
+        self.assertEqual(result["fixed_errors"], [])
+
+    def test_session_diff_empty_runs(self):
+        result = session_diff([], [])
+        self.assertTrue(result["identical"])
+        self.assertEqual(result["run_a"], {"steps": 0, "tokens": 0})
+        self.assertEqual(result["run_b"], {"steps": 0, "tokens": 0})
+        self.assertEqual(result["per_model"], {})
+        self.assertEqual(result["errors_a"], 0)
+        self.assertEqual(result["errors_b"], 0)
 
 
 if __name__ == "__main__":

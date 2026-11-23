@@ -7,7 +7,7 @@ append-only log you can verify and replay.
 Pure Python 3 standard library. No dependencies.
 """
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 from .costs import cost_for, price_for, register_pricing
 from .live_export import (DEFAULT_OTLP_ENDPOINT, LiveExporter,
@@ -16,6 +16,7 @@ from .mcp_server import MCPServer
 from .otel import (export_otlp, export_otlp_file, export_otlp_metrics,
                    export_otlp_metrics_file, records_to_metrics,
                    records_to_spans, spans_to_records)
+from .query import query_log, query_records
 from .recorder import Recorder
 from .replay import diff, load_records, replay
 from .sampling import (Sampler, SamplingDeclinedError, SamplingError,
@@ -36,5 +37,6 @@ __all__ = ["DEFAULT_OTLP_ENDPOINT", "DEFAULT_MAX_COST_USD",
            "export_otlp_file", "export_otlp_metrics",
            "export_otlp_metrics_file", "export_tail_sampled_otlp",
            "export_tail_sampled_otlp_file", "load_records", "price_for",
-           "records_to_metrics", "records_to_spans", "register_pricing",
+           "query_log", "query_records", "records_to_metrics",
+           "records_to_spans", "register_pricing",
            "replay", "spans_to_records", "tail_sample_records", "verify"]

@@ -218,6 +218,21 @@ failed batch is counted as dropped, never retried forever: a
 collector being down must not block the agent being recorded. The
 summary record is never exported.
 
+**Query.** `python -m blackbox query data/run.jsonl --model gpt-5
+--min-cost 0.01` prints only the steps matching every filter given:
+`--type` (repeatable), `--model`, `--tool`, `--min-tokens`,
+`--min-cost` (USD, from the published list prices — a call with a
+plain int token count or an unknown model has no cost and never
+matches), `--errors-only` (an error field, a status of "error", or a
+tool result mentioning an error), and `--since` / `--until` ISO
+timestamps. The summary record is never a match unless `--type
+summary` is given. `--json` prints each match as one raw JSON record
+per line, `--count` prints only the number of matches, and the
+default transcript output ends with a footer: matches, token total,
+priced cost total, and how many matched model calls were unpriced.
+`query_records` / `query_log` in `query.py` are the same filter as a
+Python API, and both work on `.jsonl` logs and `.db` stores.
+
 ## What it is not
 
 - Not a hosted platform. There is nothing to sign up for and nowhere
@@ -230,7 +245,7 @@ summary record is never exported.
 
 ## Measured
 
-- 161 tests, all passing (`make test`).
+- 178 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -265,6 +280,11 @@ summary record is never exported.
   sampled, triggers that fired, rate, kept/dropped counts) is
   recorded in the export summary, and `blackbox tail-sample` writes
   the sampled OTLP export.
+- Query CLI: `blackbox query` filters a session's steps by type,
+  model, tool, minimum tokens, minimum USD cost, errors only, and
+  time range (filters combine with AND, summary excluded unless
+  asked for), with `--json` and `--count` output modes and a footer
+  reporting matches, token total and priced cost, done (v0.14.0).
 
 ## Layout
 
@@ -283,6 +303,9 @@ blackbox/
   tail_sampling.py  tail-based sampling: keep whole error/slow/
                   expensive traces, sample the rest, decision in
                   the export summary, `blackbox tail-sample` CLI
+  query.py        query CLI: filter a session's steps by type,
+                  model, tool, min tokens, min cost, errors only,
+                  time range; --json and --count output modes
   otel.py         OpenTelemetry export: records to OTLP/JSON spans,
                   trace/span ids from the hash chain, round-trip, and
                   OTLP Sum metrics (per-model calls, tokens, latency,
@@ -294,8 +317,9 @@ blackbox/
   verify.py       replay the chain, find the first broken record
   replay.py       transcript printer + run diff
   __main__.py     CLI: verify | replay | diff | mcp | otel | export
+                  | metrics | tail-sample | query
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            161 tests, all passing
+tests/            178 tests, all passing
 ```

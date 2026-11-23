@@ -8,6 +8,7 @@
     python -m blackbox metrics data/run.jsonl --out metrics.json
     python -m blackbox tail-sample data/run.jsonl --out spans.json
     python -m blackbox export data/run.jsonl --live  # POST spans to a collector
+    python -m blackbox query data/run.jsonl --model gpt-5 --min-cost 0.01
 
 Any command takes a .jsonl log or a .db SQLite store.
 """
@@ -19,6 +20,7 @@ import sys
 from .live_export import DEFAULT_OTLP_ENDPOINT, OtlpHttpExporter
 from .mcp_server import serve_stdio
 from .otel import export_otlp, export_otlp_metrics
+from .query import query_log
 from .replay import diff, replay
 from .tail_sampling import (DEFAULT_MAX_COST_USD, DEFAULT_SLOW_MS,
                             export_tail_sampled_otlp)
@@ -90,6 +92,33 @@ def main(argv=None):
                           help="collector URL (default: %(default)s)")
     p_export.add_argument("--max-retries", type=int, default=3)
     p_export.add_argument("--timeout", type=float, default=10.0)
+
+    p_query = sub.add_parser(
+        "query", help="print the steps of a log matching filters "
+        "(--type, --model, --tool, --min-tokens, --min-cost, "
+        "--errors-only, --since/--until); filters combine with AND")
+    p_query.add_argument("logfile")
+    p_query.add_argument("--type", action="append", dest="types",
+                         help="event type to keep (repeatable)")
+    p_query.add_argument("--model", help="model_call records for this model")
+    p_query.add_argument("--tool",
+                         help="tool_call/tool_result records for this tool")
+    p_query.add_argument("--min-tokens", type=int, default=None,
+                         help="keep records with at least this many tokens")
+    p_query.add_argument("--min-cost", type=float, default=None,
+                         help="keep model_call records costing at least "
+                         "this many USD (unpriced calls never match)")
+    p_query.add_argument("--errors-only", action="store_true",
+                         help="keep only steps that look like errors")
+    p_query.add_argument("--since", help="keep records at or after this "
+                         "ISO timestamp")
+    p_query.add_argument("--until", help="keep records at or before this "
+                         "ISO timestamp")
+    p_query.add_argument("--json", action="store_true", dest="as_json",
+                         help="print each match as one raw JSON record "
+                         "per line instead of a transcript")
+    p_query.add_argument("--count", action="store_true",
+                         help="print only the number of matches")
 
     args = parser.parse_args(argv)
     if args.command == "verify":
@@ -163,6 +192,13 @@ def main(argv=None):
                 f.write(text)
         else:
             sys.stdout.write(text)
+        return 0
+    if args.command == "query":
+        query_log(args.logfile, types=args.types, model=args.model,
+                  tool=args.tool, min_tokens=args.min_tokens,
+                  min_cost=args.min_cost, errors_only=args.errors_only,
+                  since=args.since, until=args.until,
+                  as_json=args.as_json, count_only=args.count)
         return 0
     return 2
 

@@ -11,10 +11,13 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
-It also exposes the session as two resources, and eight prompts:
+It also exposes the session as three resources, and eight prompts:
 
     blackbox://session        the session as a readable transcript
     blackbox://session.json   the session's records as JSON
+    blackbox://session/aggregates
+                              the session's totals as JSON, the same
+                              totals `blackbox aggregates` prints
     analyze_session           a prompt template for analysing the
                               session (optional focus argument)
     summarize_costs           a prompt template for summarising the
@@ -204,6 +207,18 @@ RESOURCES = [
         "name": "session.json",
         "description": ("The recorded session's raw records as a JSON "
                         "array, hash chain included."),
+        "mimeType": "application/json",
+    },
+    {
+        "uri": "blackbox://session/aggregates",
+        "name": "session/aggregates",
+        "description": ("The recorded session's totals as JSON: step "
+                        "count and duration, per-type and per-tool "
+                        "counts, per-model tokens and cost, error "
+                        "steps, the slowest step, and how many "
+                        "records an earlier compaction removed or "
+                        "sampling dropped — the same totals "
+                        "`blackbox aggregates` prints."),
         "mimeType": "application/json",
     },
 ]
@@ -1188,6 +1203,13 @@ class MCPServer:
         if uri == "blackbox://session.json":
             records = load_records(self.log_path)
             text = json.dumps(records, indent=2, sort_keys=True)
+            return _result(msg_id, {"contents": [
+                {"uri": uri, "mimeType": "application/json",
+                 "text": text}]})
+        if uri == "blackbox://session/aggregates":
+            records = load_records(self.log_path)
+            agg = session_aggregates(records)
+            text = json.dumps(agg, indent=2, sort_keys=True)
             return _result(msg_id, {"contents": [
                 {"uri": uri, "mimeType": "application/json",
                  "text": text}]})

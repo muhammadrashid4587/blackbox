@@ -132,10 +132,16 @@ dependencies), so any MCP client can record through blackbox. It
 exposes three tools: `blackbox_record` (append one step — same
 redaction, hash chain and fsync as the library), `blackbox_verify`
 (check the chain) and `blackbox_replay` (read the transcript back).
-The session is also readable as two resources:
-`blackbox://session` (the transcript) and `blackbox://session.json`
-(the raw records, hash chain included) — both read from the same log
-the tools write to, so a client always sees the current session.
+The session is also readable as three resources:
+`blackbox://session` (the transcript), `blackbox://session.json`
+(the raw records, hash chain included), and
+`blackbox://session/aggregates` (the session totals as JSON —
+step count and duration, per-type and per-tool counts, per-model
+tokens and cost, error steps, the slowest step, and how many
+records an earlier compaction removed or sampling dropped, the
+same totals `blackbox aggregates` prints) — all read from the
+same log the tools write to, so a client always sees the current
+session.
 One prompt template, `analyze_session`, hands the client a prompt
 for analysing the session, with an optional `focus` argument
 (`errors`, `cost`, `tool usage`, or anything else); the prompt
@@ -354,7 +360,7 @@ session summary instead of the whole transcript. It works on
 
 ## Measured
 
-- 259 tests, all passing (`make test`).
+- 267 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -474,9 +480,15 @@ session summary instead of the whole transcript. It works on
   sampled-out counts) — via a shared `format_aggregates`
   report, read-only, with the transcript included; no
   arguments, done (v0.25.0).
-  Next: an aggregates resource, `blackbox://session/aggregates`,
-  exposing the same totals as JSON to any client without a
-  prompt round-trip.
+- Aggregates resource: `blackbox://session/aggregates` exposes
+  the same totals as JSON — step count and duration, per-type
+  and per-tool counts, per-model calls, tokens and cost, error
+  steps, the slowest step, compacted-away and sampled-out
+  counts — so any client can read the session at a glance
+  without a prompt round-trip, reusing `session_aggregates`
+  from `aggregates.py`, done (v0.26.0).
+  Next: a trace resource, `blackbox://session/trace`, exposing
+  the reconstructed causal trace as JSON.
 
 ## Layout
 

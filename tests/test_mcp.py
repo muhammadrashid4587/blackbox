@@ -121,7 +121,8 @@ class MCPServerTest(unittest.TestCase):
             _request(2, "resources/list"))
         uris = [r["uri"] for r in response["result"]["resources"]]
         self.assertEqual(uris, ["blackbox://session",
-                                "blackbox://session.json"])
+                                "blackbox://session.json",
+                                "blackbox://session/aggregates"])
         for resource in response["result"]["resources"]:
             self.assertIn("mimeType", resource)
 
@@ -152,6 +153,88 @@ class MCPServerTest(unittest.TestCase):
         self.assertEqual(records[0]["type"], "note")
         self.assertIn("hash", records[0])
         self.assertIn("prev_hash", records[0])
+
+    def test_resources_read_session_aggregates(self):
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/aggregates"}))
+        content = response["result"]["contents"][0]
+        self.assertEqual(content["uri"],
+                         "blackbox://session/aggregates")
+        self.assertEqual(content["mimeType"], "application/json")
+        agg = json.loads(content["text"])
+        # Same totals `blackbox aggregates` prints for this session:
+        # 4 steps, 1690 tokens, gpt-5 1300 in + 390 out = $0.005525.
+        self.assertEqual(agg["steps"], 4)
+        self.assertEqual(agg["total_tokens"], 1690)
+        self.assertEqual(agg["total_cost_usd"], 0.005525)
+        self.assertEqual(agg["by_type"],
+                         {"model_call": 2, "tool_call": 1,
+                          "tool_result": 1})
+        self.assertEqual(agg["by_tool"], {"search": 1})
+        self.assertEqual(agg["by_model"]["gpt-5"]["calls"], 2)
+        self.assertEqual(agg["by_model"]["gpt-5"]["input_tokens"],
+                         1300)
+        self.assertEqual(agg["by_model"]["gpt-5"]["output_tokens"],
+                         390)
+        self.assertEqual(agg["by_model"]["gpt-5"]["cost_usd"],
+                         0.005525)
+        self.assertEqual(agg["errors"], 0)
+        self.assertEqual(agg["error_seqs"], [])
+        self.assertIsNotNone(agg["slowest_step"])
+        self.assertEqual(agg["compacted_count"], 0)
+        self.assertEqual(agg["sampled_out"], 0)
+
+    def test_resources_read_session_aggregates_with_error(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "search",
+                           "args": {"query": "mcp"}}})
+        _call(self.server, 3, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "search",
+                           "result": "error: timeout"}})
+        response = self.server.handle_message(
+            _request(4, "resources/read",
+                     {"uri": "blackbox://session/aggregates"}))
+        agg = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(agg["steps"], 2)
+        self.assertEqual(agg["errors"], 1)
+        self.assertEqual(agg["error_seqs"], [1])
+
+    def test_resources_read_session_aggregates_compacted(self):
+        self._init()
+        self._record_session()
+        self.server.close()
+        from blackbox.compact import compact_log
+        result = compact_log(self.path, keep_n=2)
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["compacted"], 2)
+        self.server = MCPServer(self.path, task="mcp test")
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/aggregates"}))
+        agg = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(agg["steps"], 2)
+        self.assertEqual(agg["compacted_count"], 2)
+
+    def test_resources_read_session_aggregates_empty_session(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/aggregates"}))
+        agg = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(agg["steps"], 0)
+        self.assertEqual(agg["total_tokens"], 0)
+        self.assertEqual(agg["by_type"], {})
+        self.assertIsNone(agg["slowest_step"])
 
     def test_resources_read_unknown_uri_is_an_error(self):
         self._init()

@@ -1,10 +1,11 @@
-"""CLI: python -m blackbox verify|replay|diff|mcp|otel <logfile> ...
+"""CLI: python -m blackbox verify|replay|diff|mcp|otel|export <logfile> ...
 
     python -m blackbox verify data/demo.jsonl
     python -m blackbox replay data/demo.jsonl
     python -m blackbox diff data/run-a.jsonl data/run-b.jsonl
     python -m blackbox mcp data/run.jsonl   # MCP server on stdio
     python -m blackbox otel data/run.jsonl --out spans.json
+    python -m blackbox export data/run.jsonl --live  # POST spans to a collector
 
 Any command takes a .jsonl log or a .db SQLite store.
 """
@@ -13,6 +14,7 @@ import argparse
 import json
 import sys
 
+from .live_export import DEFAULT_OTLP_ENDPOINT, OtlpHttpExporter
 from .mcp_server import serve_stdio
 from .otel import export_otlp
 from .replay import diff, replay
@@ -45,6 +47,18 @@ def main(argv=None):
     p_otel.add_argument("--out", help="write JSON here (default: stdout)")
     p_otel.add_argument("--service-name", default="blackbox")
 
+    p_export = sub.add_parser(
+        "export", help="export a log as OTLP/JSON, to a file or live to a collector")
+    p_export.add_argument("logfile")
+    p_export.add_argument("--out", help="write JSON here (default: stdout)")
+    p_export.add_argument("--service-name", default="blackbox")
+    p_export.add_argument("--live", action="store_true",
+                          help="POST the spans to an OTLP/HTTP collector")
+    p_export.add_argument("--otlp-endpoint", default=DEFAULT_OTLP_ENDPOINT,
+                          help="collector URL (default: %(default)s)")
+    p_export.add_argument("--max-retries", type=int, default=3)
+    p_export.add_argument("--timeout", type=float, default=10.0)
+
     args = parser.parse_args(argv)
     if args.command == "verify":
         return verify_cli(args.logfile)
@@ -58,6 +72,28 @@ def main(argv=None):
         serve_stdio(args.logfile, task=args.task, model=args.model)
         return 0
     if args.command == "otel":
+        data = export_otlp(args.logfile, args.service_name)
+        text = json.dumps(data, indent=2) + "\n"
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(text)
+        else:
+            sys.stdout.write(text)
+        return 0
+    if args.command == "export":
+        if args.live:
+            exporter = OtlpHttpExporter(
+                args.otlp_endpoint, timeout=args.timeout,
+                max_retries=args.max_retries,
+                service_name=args.service_name)
+            ok = exporter.export_log(args.logfile)
+            if ok:
+                print("exported %d spans to %s"
+                      % (exporter.exported_spans, args.otlp_endpoint))
+                return 0
+            print("export failed: %s" % exporter.last_error,
+                  file=sys.stderr)
+            return 1
         data = export_otlp(args.logfile, args.service_name)
         text = json.dumps(data, indent=2) + "\n"
         if args.out:

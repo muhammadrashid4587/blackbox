@@ -190,6 +190,23 @@ step's. The summary record is not a span. `spans_to_records` in
 `otel.py` rebuilds the steps from the spans, so an exported trace
 can be checked back against the log it came from.
 
+**Live OTLP export.** `python -m blackbox export data/run.jsonl
+--live` POSTs the same spans to an OTLP/HTTP collector instead of
+writing a file (default `http://localhost:4318/v1/traces`, override
+with `--otlp-endpoint`). Connection errors and 429 / 5xx responses
+are retried with exponential backoff (`--max-retries`, default 3);
+other 4xx responses are not retried, and a failed export exits 1
+with the error on stderr instead of pretending it worked. For
+recording-time export, pass `otlp_endpoint` to the Recorder (a URL,
+or `True` for the default endpoint) and each kept step is sent by a
+background thread as it is recorded — `LiveExporter` in
+`live_export.py` batches up to 100 spans or 5 seconds, and
+`close()` flushes the queue before returning. A live span ends 1 ms
+after it starts (there is no next step yet to look ahead to), and a
+failed batch is counted as dropped, never retried forever: a
+collector being down must not block the agent being recorded. The
+summary record is never exported.
+
 ## What it is not
 
 - Not a hosted platform. There is nothing to sign up for and nowhere
@@ -202,7 +219,7 @@ can be checked back against the log it came from.
 
 ## Measured
 
-- 126 tests, all passing (`make test`).
+- 137 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -219,6 +236,11 @@ can be checked back against the log it came from.
 - Span sampling: probabilistic head-based sampling in the Recorder
   (`sample_rate`, seeded RNG, dropped steps counted in the summary,
   hash chain covers only what is kept), done (v0.10.0).
+- Live OTLP export: `OtlpHttpExporter` POSTs OTLP/JSON spans to a
+  collector with retry/backoff, `LiveExporter` batches spans on a
+  background thread, `Recorder(otlp_endpoint=...)` exports live as
+  it records, and `blackbox export --live` posts a whole log,
+  done (v0.11.0).
 
 ## Layout
 
@@ -236,12 +258,15 @@ blackbox/
                   SamplingError / NotSupported / Declined
   otel.py         OpenTelemetry export: records to OTLP/JSON spans,
                   trace/span ids from the hash chain, round-trip
+  live_export.py  live OTLP export: POST spans to a collector over
+                  HTTP with retry/backoff, background batching
+                  thread, Recorder integration, `export --live` CLI
   redact.py       redaction before write
   verify.py       replay the chain, find the first broken record
   replay.py       transcript printer + run diff
-  __main__.py     CLI: verify | replay | diff | mcp | otel
+  __main__.py     CLI: verify | replay | diff | mcp | otel | export
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            126 tests, all passing
+tests/            137 tests, all passing
 ```

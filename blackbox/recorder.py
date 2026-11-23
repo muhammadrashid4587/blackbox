@@ -75,10 +75,17 @@ class Recorder:
     never hashed — the chain covers exactly what is in the log.
     sample_seed makes the keep/drop choice reproducible; without it
     the choice is random per Recorder.
+
+    otlp_endpoint: post each kept step live to an OTLP/HTTP collector
+    (default collector endpoint if given as True, or a URL string).
+    The exporter runs on a background thread, so a slow or down
+    collector never blocks recording; a failed batch is counted as
+    dropped, not retried forever. The summary record is not exported.
     """
 
     def __init__(self, path, task=None, model=None, sample_rate=1.0,
-                 sample_seed=None):
+                 sample_seed=None, otlp_endpoint=None,
+                 otlp_batch_size=100, otlp_flush_interval=5.0):
         if not 0 < sample_rate <= 1.0:
             raise ValueError("sample_rate must be in (0, 1]")
         self.path = path
@@ -87,6 +94,19 @@ class Recorder:
         self.sample_rate = sample_rate
         self._rng = random.Random(sample_seed)
         self._sampled_out = 0
+        self._trace_id = None
+        if otlp_endpoint is True:
+            from .live_export import DEFAULT_OTLP_ENDPOINT
+            otlp_endpoint = DEFAULT_OTLP_ENDPOINT
+        self._live = None
+        if otlp_endpoint:
+            # Imported here, not at module level: live_export imports
+            # otel, which imports replay, which imports this module.
+            from .live_export import LiveExporter
+            self._live = LiveExporter(
+                otlp_endpoint, batch_size=otlp_batch_size,
+                flush_interval=otlp_flush_interval)
+            self._live.start()
         self._seq = 0
         self._prev_hash = GENESIS_PREV_HASH
         self._count = 0
@@ -165,6 +185,7 @@ class Recorder:
             last = records[-1]
             self._seq = last["seq"] + 1
             self._prev_hash = last["hash"]
+            self._trace_id = records[0]["hash"][:32]
 
     def _write_record(self, record):
         if self._sqlite:
@@ -203,6 +224,10 @@ class Recorder:
         self._seq += 1
         self._count += 1
         self._total_tokens += _tokens_total(tokens)
+        if self._live is not None:
+            if self._trace_id is None:
+                self._trace_id = record["hash"][:32]
+            self._live.enqueue_record(record, self._trace_id)
         if event_type == "model_call":
             model = record["payload"].get("model") or self.model
             self._accumulate_cost(model, tokens)
@@ -255,6 +280,8 @@ class Recorder:
             self._store.close()
         else:
             self._file.close()
+        if self._live is not None:
+            self._live.stop()
         self._closed = True
 
     def __enter__(self):

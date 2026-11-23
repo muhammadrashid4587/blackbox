@@ -178,6 +178,17 @@ sampled log is honest about what it skipped. Tokens and cost in the
 summary count only kept steps. The default rate is 1.0: everything
 kept, no sampling fields in the summary.
 
+**Tail-based sampling.** `blackbox tail-sample data/run.jsonl --out
+spans.json` exports the session as OTLP spans, decided after the
+full trace is known: a trace with an error step, a span slower than
+5 s (`--slow-ms`) or a cost over $1 (`--max-cost-usd`) keeps every
+span; a boring trace keeps each span with probability `--keep-rate`
+(default 0.5, `--seed` makes the choice reproducible). The decision
+is recorded in the export summary: `kept_all` or `sampled`, which
+triggers fired, the rate, and how many spans were kept and dropped.
+Kept spans keep their original ids, so they still point at the
+records they came from.
+
 **OpenTelemetry export.** `python -m blackbox otel data/run.jsonl`
 writes the session as OTLP/JSON spans, one per step, in a single
 trace — no OpenTelemetry SDK needed, the exporter only builds dicts.
@@ -219,7 +230,7 @@ summary record is never exported.
 
 ## Measured
 
-- 137 tests, all passing (`make test`).
+- 161 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -247,7 +258,13 @@ summary record is never exported.
   Sum metrics (`records_to_metrics`, `export_otlp_metrics`, and a
   `blackbox metrics` CLI command), done (v0.12.0).
 - Tail-based sampling: keep all error/anomalous traces, sample the
-  rest, so a busy session still exports a useful subset.
+  rest, so a busy session still exports a useful subset, done
+  (v0.13.0); `tail_sample_records` keeps every span of a trace with
+  an error, a slow span (>5 s) or high cost (>$1) and samples the
+  rest at a configurable rate with a seed, the decision (kept_all /
+  sampled, triggers that fired, rate, kept/dropped counts) is
+  recorded in the export summary, and `blackbox tail-sample` writes
+  the sampled OTLP export.
 
 ## Layout
 
@@ -263,6 +280,9 @@ blackbox/
                   blackbox_sample tool (MCP sampling)
   sampling.py     MCP sampling client: Sampler, StdioTransport,
                   SamplingError / NotSupported / Declined
+  tail_sampling.py  tail-based sampling: keep whole error/slow/
+                  expensive traces, sample the rest, decision in
+                  the export summary, `blackbox tail-sample` CLI
   otel.py         OpenTelemetry export: records to OTLP/JSON spans,
                   trace/span ids from the hash chain, round-trip, and
                   OTLP Sum metrics (per-model calls, tokens, latency,
@@ -277,5 +297,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            137 tests, all passing
+tests/            161 tests, all passing
 ```

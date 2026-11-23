@@ -1,4 +1,4 @@
-"""CLI: python -m blackbox verify|replay|diff|mcp|otel|export <logfile> ...
+"""CLI: python -m blackbox verify|replay|diff|mcp|otel|metrics|tail-sample|export <logfile> ...
 
     python -m blackbox verify data/demo.jsonl
     python -m blackbox replay data/demo.jsonl
@@ -6,6 +6,7 @@
     python -m blackbox mcp data/run.jsonl   # MCP server on stdio
     python -m blackbox otel data/run.jsonl --out spans.json
     python -m blackbox metrics data/run.jsonl --out metrics.json
+    python -m blackbox tail-sample data/run.jsonl --out spans.json
     python -m blackbox export data/run.jsonl --live  # POST spans to a collector
 
 Any command takes a .jsonl log or a .db SQLite store.
@@ -19,6 +20,8 @@ from .live_export import DEFAULT_OTLP_ENDPOINT, OtlpHttpExporter
 from .mcp_server import serve_stdio
 from .otel import export_otlp, export_otlp_metrics
 from .replay import diff, replay
+from .tail_sampling import (DEFAULT_MAX_COST_USD, DEFAULT_SLOW_MS,
+                            export_tail_sampled_otlp)
 from .verify import verify_cli
 
 
@@ -54,6 +57,27 @@ def main(argv=None):
     p_metrics.add_argument("logfile")
     p_metrics.add_argument("--out", help="write JSON here (default: stdout)")
     p_metrics.add_argument("--service-name", default="blackbox")
+
+    p_tail = sub.add_parser(
+        "tail-sample", help="export a log as tail-sampled OTLP/JSON "
+        "spans: keep every span of a trace with an error, a slow span "
+        "or high cost, sample the rest; the decision is recorded in "
+        "the export summary")
+    p_tail.add_argument("logfile")
+    p_tail.add_argument("--out", help="write JSON here (default: stdout)")
+    p_tail.add_argument("--service-name", default="blackbox")
+    p_tail.add_argument("--keep-rate", type=float, default=0.5,
+                        help="probability of keeping a span of a boring "
+                        "trace (default: %(default)s)")
+    p_tail.add_argument("--seed", type=int, default=None,
+                        help="seed the keep/drop choice (default: random)")
+    p_tail.add_argument("--slow-ms", type=float, default=DEFAULT_SLOW_MS,
+                        help="a span slower than this keeps the whole "
+                        "trace (default: %(default)s ms)")
+    p_tail.add_argument("--max-cost-usd", type=float,
+                        default=DEFAULT_MAX_COST_USD,
+                        help="a trace costing more than this keeps the "
+                        "whole trace (default: $%(default)s)")
 
     p_export = sub.add_parser(
         "export", help="export a log as OTLP/JSON, to a file or live to a collector")
@@ -94,6 +118,27 @@ def main(argv=None):
         if args.out:
             with open(args.out, "w", encoding="utf-8") as f:
                 f.write(text)
+        else:
+            sys.stdout.write(text)
+        return 0
+    if args.command == "tail-sample":
+        try:
+            data = export_tail_sampled_otlp(
+                args.logfile, keep_rate=args.keep_rate, seed=args.seed,
+                slow_ms=args.slow_ms, max_cost_usd=args.max_cost_usd,
+                service_name=args.service_name)
+        except ValueError as exc:
+            print("tail-sample: %s" % exc, file=sys.stderr)
+            return 2
+        text = json.dumps(data, indent=2) + "\n"
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(text)
+            decision = data["tail_sampling"]
+            reasons = ", ".join(decision["reasons"]) or "no trigger fired"
+            print("tail-sample: %s (%s) — kept %d of %d spans"
+                  % (decision["decision"], reasons,
+                     decision["kept_spans"], decision["total_spans"]))
         else:
             sys.stdout.write(text)
         return 0

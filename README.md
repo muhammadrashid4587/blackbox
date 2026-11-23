@@ -149,7 +149,14 @@ suspicious steps: error results, repeated identical tool calls,
 tool calls with no result, and steps where a secret was redacted
 before writing. The findings are heuristics computed from the log,
 and the prompt says to treat them as leads, not verdicts — a
-repeated call may be a legitimate retry.
+repeated call may be a legitimate retry. A fourth prompt,
+`summarize_sampling`, hands the client a prompt for the session's
+tail-sampling decisions: kept vs sampled-out counts, which
+triggers fired, parent gaps, and a per-model / per-type breakdown
+of the sampled-out spans, computed with the tail-sample defaults
+(keep rate 0.5, seed 0 so the decision is reproducible). The prompt
+says the sampled-out spans are still in the log — the decision
+describes what an export would keep, it never deletes steps.
 Point a client at that command as a stdio server. Closing the server
 (EOF / Ctrl-C) writes the summary record, like closing a Recorder.
 
@@ -301,7 +308,7 @@ gone. Compaction works on `.jsonl` logs and `.db` stores.
 
 ## Measured
 
-- 223 tests, all passing (`make test`).
+- 232 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -375,6 +382,13 @@ gone. Compaction works on `.jsonl` logs and `.db` stores.
   sampling, where closure guarantees every kept span's parent is
   in the export); a full export has no gaps and is unchanged, done
   (v0.19.0).
+- Fourth MCP prompt: `summarize_sampling` hands the client a prompt
+  for the session's tail-sampling decisions — kept vs sampled-out
+  counts, which triggers fired, parent gaps, and a per-model /
+  per-type breakdown of the sampled-out spans — computed with the
+  tail-sample defaults (keep rate 0.5, seed 0 so the decision is
+  reproducible); the prompt says the sampled-out spans are still
+  in the log, done (v0.20.0).
 
 ## Layout
 
@@ -386,7 +400,8 @@ blackbox/
   costs.py        per-model cost tracking: list prices, cost math
   mcp_server.py   MCP server on stdio: record / verify / replay tools,
                   session resources, analyze_session,
-                  summarize_costs and summarize_anomalies prompts,
+                  summarize_costs, summarize_anomalies and
+                  summarize_sampling prompts,
                   blackbox_sample tool (MCP sampling)
   sampling.py     MCP sampling client: Sampler, StdioTransport,
                   SamplingError / NotSupported / Declined
@@ -424,5 +439,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            229 tests, all passing
+tests/            232 tests, all passing
 ```

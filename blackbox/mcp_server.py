@@ -11,7 +11,7 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
-It also exposes the session as two resources, and three prompts:
+It also exposes the session as two resources, and four prompts:
 
     blackbox://session        the session as a readable transcript
     blackbox://session.json   the session's records as JSON
@@ -23,6 +23,12 @@ It also exposes the session as two resources, and three prompts:
                               session's suspicious steps: error
                               results, repeated tool calls, unanswered
                               calls, redacted secrets
+    summarize_sampling        a prompt template for summarising the
+                              session's tail-sampling decisions: kept
+                              vs sampled-out spans, which triggers
+                              fired, parent gaps, and a per-model /
+                              per-type breakdown of the sampled-out
+                              spans
 
 Start it from the CLI:
 
@@ -53,6 +59,7 @@ from .redact import REDACTED
 from .replay import _short, format_record, load_records
 from .sampling import (Sampler, SamplingDeclinedError, SamplingError,
                        SamplingNotSupportedError, StdioTransport)
+from .tail_sampling import tail_sample_records
 from .verify import verify
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -204,6 +211,15 @@ PROMPTS = [
                         "that had a secret redacted."),
         "arguments": [],
     },
+    {
+        "name": "summarize_sampling",
+        "description": ("Summarise the recorded session's tail-sampling "
+                        "decisions: kept vs sampled-out spans, which "
+                        "triggers fired, parent gaps, and a per-model "
+                        "and per-type breakdown of the sampled-out "
+                        "spans."),
+        "arguments": [],
+    },
 ]
 
 PROMPT_FOCUS_LINES = {
@@ -249,6 +265,23 @@ SUMMARIZE_ANOMALIES_PROMPT = (
     "repeated call may be a legitimate retry, and an error result "
     "may be expected. Say so where it matters.\n\n"
     "Anomalies found:\n{anomalies}\n\n"
+    "Session transcript:\n{transcript}"
+)
+
+SUMMARIZE_SAMPLING_PROMPT = (
+    "Summarise the tail-sampling decisions for this blackbox "
+    "session: which spans a tail-sampled export would keep and "
+    "which it would sample out, which triggers fired, and what "
+    "was sampled out by type and model. The decision below uses "
+    "the tail-sample defaults: a trace with an error step, a span "
+    "slower than 5 s or a cost over $1 keeps every span, and a "
+    "boring trace is sampled down at keep rate 0.5 with seed 0, "
+    "so the decision is reproducible. The sampled-out spans are "
+    "still in the log — tail sampling only decides what an export "
+    "keeps, it never deletes steps. A parent gap is a kept span "
+    "whose chain parent was sampled out, so the export names a "
+    "parent that is not in it.\n\n"
+    "Sampling decision:\n{sampling}\n\n"
     "Session transcript:\n{transcript}"
 )
 
@@ -567,6 +600,74 @@ class MCPServer:
                     "redacted secrets.")
         return "\n".join(findings)
 
+    def _sampling_lines(self):
+        """The tail-sampling decision for the session, as readable
+        lines.
+
+        The same decision `blackbox tail-sample` makes with its
+        defaults (keep rate 0.5, a slow span over 5 s or a cost
+        over $1 keeps the whole session), with a fixed seed (0) so
+        the summary is reproducible. The summary record is skipped
+        — it is bookkeeping, not a span. The decision describes the
+        export only: sampled-out spans are still in the log.
+        """
+        records = load_records(self.log_path)
+        steps = [r for r in records if r["type"] != "summary"]
+        if not steps:
+            return "No steps recorded yet."
+        kept, decision = tail_sample_records(
+            records, keep_rate=0.5, seed=0)
+        kept_seqs = {r["seq"] for r in kept}
+        lines = []
+        if decision["decision"] == "kept_all":
+            lines.append(
+                "Decision: kept_all — a trigger fired (%s), so every "
+                "span would be kept"
+                % ", ".join(decision["reasons"]))
+        else:
+            lines.append(
+                "Decision: sampled — no trigger fired, so the session "
+                "would be sampled down at keep rate 0.5 (seed 0, "
+                "reproducible)")
+        lines.append(
+            "Kept %d of %d spans, %d sampled out"
+            % (decision["kept_spans"], decision["total_spans"],
+               decision["dropped_spans"]))
+        if decision["max_span_ms"] is not None:
+            lines.append("Longest span: %.1f ms (slow threshold 5000 ms)"
+                         % decision["max_span_ms"])
+        if decision["total_cost_usd"] is not None:
+            lines.append("Total priced cost: $%.6f (high-cost threshold "
+                         "$1.00)" % decision["total_cost_usd"])
+        else:
+            lines.append("Total priced cost: unpriced (no model call "
+                         "with an input/output split and a known price)")
+        if decision["parent_gaps"]:
+            lines.append(
+                "Parent gaps: %d kept span(s) whose chain parent was "
+                "sampled out" % decision["parent_gaps"])
+        dropped = [r for r in steps if r["seq"] not in kept_seqs]
+        if not dropped:
+            lines.append("Nothing sampled out: every span was kept.")
+        else:
+            lines.append("Sampled out (%d):" % len(dropped))
+            by_label = {}
+            for record in dropped:
+                payload = record.get("payload") or {}
+                label = record["type"]
+                if record["type"] == "model_call":
+                    model = payload.get("model")
+                    if model:
+                        label = "model_call (%s)" % model
+                elif record["type"] in ("tool_call", "tool_result"):
+                    tool = payload.get("tool")
+                    if tool:
+                        label = "%s (%s)" % (record["type"], tool)
+                by_label[label] = by_label.get(label, 0) + 1
+            for label in sorted(by_label):
+                lines.append("  %s: %d" % (label, by_label[label]))
+        return "\n".join(lines)
+
     def _resources_read(self, msg_id, params):
         uri = params.get("uri")
         if uri == "blackbox://session":
@@ -605,6 +706,15 @@ class MCPServer:
         if name == "summarize_anomalies":
             text = SUMMARIZE_ANOMALIES_PROMPT.format(
                 anomalies=self._anomaly_lines(),
+                transcript=self._transcript())
+            return _result(msg_id, {
+                "description": description,
+                "messages": [{"role": "user",
+                              "content": {"type": "text", "text": text}}],
+            })
+        if name == "summarize_sampling":
+            text = SUMMARIZE_SAMPLING_PROMPT.format(
+                sampling=self._sampling_lines(),
                 transcript=self._transcript())
             return _result(msg_id, {
                 "description": description,

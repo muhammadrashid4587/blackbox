@@ -166,11 +166,12 @@ class MCPServerTest(unittest.TestCase):
         prompts = response["result"]["prompts"]
         self.assertEqual([p["name"] for p in prompts],
                          ["analyze_session", "summarize_costs",
-                          "summarize_anomalies"])
+                          "summarize_anomalies", "summarize_sampling"])
         self.assertEqual(prompts[0]["arguments"][0]["name"], "focus")
         self.assertFalse(prompts[0]["arguments"][0]["required"])
         self.assertEqual(prompts[1]["arguments"], [])
         self.assertEqual(prompts[2]["arguments"], [])
+        self.assertEqual(prompts[3]["arguments"], [])
 
     def test_prompts_get_includes_transcript_and_verification(self):
         self._init()
@@ -331,6 +332,71 @@ class MCPServerTest(unittest.TestCase):
                      {"name": "summarize_anomalies"}))
         text = response["result"]["messages"][0]["content"]["text"]
         self.assertIn("No anomalies found", text)
+
+    def test_prompts_get_summarize_sampling(self):
+        self._init()
+        # Four steps, no trigger: with seed 0 the RNG keeps steps
+        # 2 and 3 (draws 0.84, 0.76, 0.42, 0.26 against 0.5), so
+        # the model_call and the search call are sampled out and
+        # the kept fetch call has a parent gap.
+        _call(self.server, 2, "blackbox_record",
+              {"type": "model_call",
+               "payload": {"model": "gpt-5", "prompt": "hi"},
+               "tokens": 100})
+        _call(self.server, 3, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "search",
+                           "args": {"query": "mcp"}}})
+        _call(self.server, 4, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "fetch",
+                           "args": {"url": "https://example.com"}}})
+        _call(self.server, 5, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "fetch", "result": "ok"}})
+        response = self.server.handle_message(
+            _request(6, "prompts/get",
+                     {"name": "summarize_sampling"}))
+        message = response["result"]["messages"][0]
+        self.assertEqual(message["role"], "user")
+        text = message["content"]["text"]
+        self.assertIn("Decision: sampled", text)
+        self.assertIn("Kept 2 of 4 spans, 2 sampled out", text)
+        self.assertIn("seed 0", text)
+        self.assertIn("Parent gaps: 1 kept span(s)", text)
+        self.assertIn("model_call (gpt-5): 1", text)
+        self.assertIn("tool_call (search): 1", text)
+        self.assertIn("Total priced cost: unpriced", text)
+        self.assertIn("still in the log", text)
+        self.assertIn("search", text)  # transcript included too
+
+    def test_prompts_get_summarize_sampling_kept_all(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "search",
+                           "args": {"query": "mcp"}}})
+        _call(self.server, 3, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "search",
+                           "error": "upstream 500"}})
+        response = self.server.handle_message(
+            _request(4, "prompts/get",
+                     {"name": "summarize_sampling"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Decision: kept_all", text)
+        self.assertIn("error", text)
+        self.assertIn("Kept 2 of 2 spans, 0 sampled out", text)
+        self.assertIn("Nothing sampled out", text)
+        self.assertNotIn("Parent gaps", text)
+
+    def test_prompts_get_summarize_sampling_empty_session(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "prompts/get",
+                     {"name": "summarize_sampling"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("No steps recorded yet.", text)
 
     def test_resources_read_before_initialize_is_rejected(self):
         response = self.server.handle_message(

@@ -169,7 +169,8 @@ class MCPServerTest(unittest.TestCase):
                          ["analyze_session", "summarize_costs",
                           "summarize_anomalies", "summarize_sampling",
                           "summarize_trace", "summarize_diff",
-                          "summarize_retention"])
+                          "summarize_retention",
+                          "summarize_aggregates"])
         self.assertEqual(prompts[0]["arguments"][0]["name"], "focus")
         self.assertFalse(prompts[0]["arguments"][0]["required"])
         self.assertEqual(prompts[1]["arguments"], [])
@@ -184,6 +185,7 @@ class MCPServerTest(unittest.TestCase):
             ["keep_days", "keep_n"])
         self.assertFalse(prompts[6]["arguments"][0]["required"])
         self.assertFalse(prompts[6]["arguments"][1]["required"])
+        self.assertEqual(prompts[7]["arguments"], [])
 
     def test_prompts_get_includes_transcript_and_verification(self):
         self._init()
@@ -696,6 +698,70 @@ class MCPServerTest(unittest.TestCase):
                          {"name": "summarize_retention",
                           "arguments": arguments}))
             self.assertEqual(response["error"]["code"], -32602)
+
+    def test_prompts_get_summarize_aggregates(self):
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "prompts/get",
+                     {"name": "summarize_aggregates"}))
+        message = response["result"]["messages"][0]
+        self.assertEqual(message["role"], "user")
+        text = message["content"]["text"]
+        self.assertIn("session: 4 steps", text)
+        self.assertIn("tokens: 1690  cost: $0.005525", text)
+        self.assertIn("  model_call: 2", text)
+        self.assertIn("  tool search: 1 calls", text)
+        # gpt-5: 1300 in + 390 out = $0.005525.
+        self.assertIn("gpt-5: 2 calls, 1300 in / 390 out / 0 tokens "
+                      "-> $0.005525", text)
+        self.assertIn("slowest step: seq", text)
+        self.assertIn("not in these totals", text)
+        self.assertIn("read-only", text)
+        self.assertIn("search", text)  # transcript included too
+
+    def test_prompts_get_summarize_aggregates_with_error(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "search",
+                           "args": {"query": "mcp"}}})
+        _call(self.server, 3, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "search",
+                           "result": "error: timeout"}})
+        response = self.server.handle_message(
+            _request(4, "prompts/get",
+                     {"name": "summarize_aggregates"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("session: 2 steps", text)
+        self.assertIn("errors: 1 (seqs 1)", text)
+
+    def test_prompts_get_summarize_aggregates_compacted(self):
+        self._init()
+        self._record_session()
+        self.server.close()
+        from blackbox.compact import compact_log
+        result = compact_log(self.path, keep_n=2)
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["compacted"], 2)
+        self.server = MCPServer(self.path, task="mcp test")
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "prompts/get",
+                     {"name": "summarize_aggregates"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("session: 2 steps", text)
+        self.assertIn("compacted away earlier: 2 records "
+                      "(not in these totals)", text)
+
+    def test_prompts_get_summarize_aggregates_empty_session(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "prompts/get",
+                     {"name": "summarize_aggregates"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("No steps recorded yet.", text)
 
     def test_resources_read_before_initialize_is_rejected(self):
         response = self.server.handle_message(

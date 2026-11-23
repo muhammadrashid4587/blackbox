@@ -180,6 +180,16 @@ log and how old it is, and what `blackbox compact --keep-days`
 and `--keep-n` would remove next, as dry runs — asking for the
 prompt removes nothing. It takes optional `keep_days` (default
 30) and `keep_n` (default 1000) arguments for the projections.
+An eighth prompt, `summarize_aggregates`, hands the client a
+prompt for the session at a glance: the same totals `blackbox
+aggregates` prints — step count and duration, per-type and
+per-tool counts, per-model tokens and cost, error steps, the
+slowest step, and how many records an earlier compaction
+removed or sampling dropped — with the transcript included so
+the client can see the totals in context. The totals count
+steps only, so compacted-away records and sampled-out steps
+are reported separately, and asking for the prompt removes
+nothing.
 Point a client at that command as a stdio server. Closing the server
 (EOF / Ctrl-C) writes the summary record, like closing a Recorder.
 
@@ -456,8 +466,17 @@ session summary instead of the whole transcript. It works on
   and cost, error steps, the slowest step, and how many records an
   earlier compaction removed — read-only, with a `blackbox
   aggregates` CLI command (report or `--json`), done (v0.24.0).
-  Next: an eighth MCP prompt, `summarize_aggregates`, over these
-  totals.
+- Eighth MCP prompt: `summarize_aggregates` hands the client a
+  prompt for the session at a glance — the same totals
+  `session_aggregates` computes (step count and duration,
+  per-type and per-tool counts, per-model calls, tokens and
+  cost, error steps, the slowest step, compacted-away and
+  sampled-out counts) — via a shared `format_aggregates`
+  report, read-only, with the transcript included; no
+  arguments, done (v0.25.0).
+  Next: an aggregates resource, `blackbox://session/aggregates`,
+  exposing the same totals as JSON to any client without a
+  prompt round-trip.
 
 ## Layout
 

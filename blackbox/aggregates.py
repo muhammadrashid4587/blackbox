@@ -138,6 +138,54 @@ def session_aggregates(records):
             "sampled_out": sampled_out}
 
 
+def format_aggregates(agg):
+    """A session aggregates dict as a short human-readable report.
+
+    The same report `aggregates_log` prints: step count and
+    duration, total tokens and priced cost, per-type and per-tool
+    counts, per-model calls/tokens/cost, error steps, the slowest
+    step, and how many records an earlier compaction removed or
+    sampling dropped. Returns the report as one string."""
+    lines = []
+    first = "session: %d steps" % agg["steps"]
+    if agg["duration_seconds"] is not None:
+        first += " in %.3fs" % agg["duration_seconds"]
+    first += "  (%s -> %s)" % (agg["started"], agg["ended"])
+    lines.append(first)
+    lines.append("tokens: %d  cost: $%.6f (%d unpriced model calls)"
+                 % (agg["total_tokens"], agg["total_cost_usd"],
+                    agg["unpriced_model_calls"]))
+    for event_type in sorted(agg["by_type"]):
+        lines.append("  %s: %d" % (event_type, agg["by_type"][event_type]))
+    for tool in sorted(agg["by_tool"]):
+        lines.append("  tool %s: %d calls" % (tool, agg["by_tool"][tool]))
+    for model in sorted(agg["by_model"]):
+        entry = agg["by_model"][model]
+        cost = entry["cost_usd"]
+        cost_text = "$%.6f" % cost if cost is not None else "unpriced"
+        lines.append("  model %s: %d calls, %d in / %d out / %d tokens "
+                     "-> %s"
+                     % (model, entry["calls"], entry["input_tokens"],
+                        entry["output_tokens"], entry["tokens"],
+                        cost_text))
+    if agg["errors"]:
+        lines.append("errors: %d (seqs %s)"
+                     % (agg["errors"],
+                        ", ".join(str(s) for s in agg["error_seqs"])))
+    if agg["slowest_step"] is not None:
+        slowest = agg["slowest_step"]
+        lines.append("slowest step: seq %d (%s), %.3fs until the next "
+                     "step" % (slowest["seq"], slowest["type"],
+                               slowest["latency_seconds"]))
+    if agg["compacted_count"]:
+        lines.append("compacted away earlier: %d records (not in these "
+                     "totals)" % agg["compacted_count"])
+    if agg["sampled_out"]:
+        lines.append("sampled out: %d steps (not in these totals)"
+                     % agg["sampled_out"])
+    return "\n".join(lines)
+
+
 def aggregates_log(path, as_json=False):
     """Compute a log's session aggregates and print them.
 
@@ -148,36 +196,5 @@ def aggregates_log(path, as_json=False):
     if as_json:
         print(json.dumps(agg, indent=2, sort_keys=True))
         return agg
-    print("session: %d steps" % agg["steps"], end="")
-    if agg["duration_seconds"] is not None:
-        print(" in %.3fs" % agg["duration_seconds"], end="")
-    print("  (%s -> %s)" % (agg["started"], agg["ended"]))
-    print("tokens: %d  cost: $%.6f (%d unpriced model calls)"
-          % (agg["total_tokens"], agg["total_cost_usd"],
-             agg["unpriced_model_calls"]))
-    for event_type in sorted(agg["by_type"]):
-        print("  %s: %d" % (event_type, agg["by_type"][event_type]))
-    for tool in sorted(agg["by_tool"]):
-        print("  tool %s: %d calls" % (tool, agg["by_tool"][tool]))
-    for model in sorted(agg["by_model"]):
-        entry = agg["by_model"][model]
-        cost = entry["cost_usd"]
-        cost_text = "$%.6f" % cost if cost is not None else "unpriced"
-        print("  model %s: %d calls, %d in / %d out / %d tokens -> %s"
-              % (model, entry["calls"], entry["input_tokens"],
-                 entry["output_tokens"], entry["tokens"], cost_text))
-    if agg["errors"]:
-        print("errors: %d (seqs %s)"
-              % (agg["errors"], ", ".join(str(s) for s in agg["error_seqs"])))
-    if agg["slowest_step"] is not None:
-        slowest = agg["slowest_step"]
-        print("slowest step: seq %d (%s), %.3fs until the next step"
-              % (slowest["seq"], slowest["type"],
-                 slowest["latency_seconds"]))
-    if agg["compacted_count"]:
-        print("compacted away earlier: %d records (not in these totals)"
-              % agg["compacted_count"])
-    if agg["sampled_out"]:
-        print("sampled out: %d steps (not in these totals)"
-              % agg["sampled_out"])
+    print(format_aggregates(agg))
     return agg

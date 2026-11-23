@@ -11,7 +11,7 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
-It also exposes the session as two resources, and seven prompts:
+It also exposes the session as two resources, and eight prompts:
 
     blackbox://session        the session as a readable transcript
     blackbox://session.json   the session's records as JSON
@@ -46,6 +46,13 @@ It also exposes the session as two resources, and seven prompts:
                               is still in the log, and what the
                               default retention rules would remove
                               next
+    summarize_aggregates      a prompt template for summarising the
+                              session at a glance: step count and
+                              duration, per-type and per-tool counts,
+                              per-model tokens and cost, error
+                              steps, the slowest step, and how many
+                              records an earlier compaction removed
+                              or sampling dropped
 
 Start it from the CLI:
 
@@ -71,6 +78,7 @@ import re
 import sys
 from datetime import datetime, timezone
 
+from .aggregates import format_aggregates, session_aggregates
 from .compact import _parse_ts, compact_log
 from .costs import cost_for
 from .recorder import Recorder
@@ -288,6 +296,16 @@ PROMPTS = [
             },
         ],
     },
+    {
+        "name": "summarize_aggregates",
+        "description": ("Summarise the recorded session at a glance: "
+                        "step count and duration, per-type and "
+                        "per-tool counts, per-model tokens and cost, "
+                        "error steps, the slowest step, and how many "
+                        "records an earlier compaction removed or "
+                        "sampling dropped."),
+        "arguments": [],
+    },
 ]
 
 PROMPT_FOCUS_LINES = {
@@ -409,6 +427,28 @@ SUMMARIZE_RETENTION_PROMPT = (
     "recommending a compaction, and whether the log looks safe "
     "to compact or worth keeping whole.\n\n"
     "Retention summary:\n{retention}\n\n"
+    "Session transcript:\n{transcript}"
+)
+
+SUMMARIZE_AGGREGATES_PROMPT = (
+    "Summarise this blackbox session at a glance: how many steps "
+    "it took, how long it ran, which tools it used and how often, "
+    "what each model cost in tokens and USD, which steps look "
+    "like errors, and which step was the slowest. The totals "
+    "below are the session aggregates from `blackbox aggregates` "
+    "— read-only, computed from the log, so asking for this "
+    "prompt changes nothing. The totals count steps only: the "
+    "summary record is bookkeeping and the checkpoint certifies "
+    "records an earlier compaction removed, so compacted-away "
+    "records and sampled-out steps are reported separately — "
+    "they are not in these totals, and the removed records are "
+    "gone and cannot be re-counted. Prices are the providers' "
+    "published list prices and are estimates, not a bill; calls "
+    "with no input/output token split, or a model with no "
+    "published price, are unpriced, never guessed. The slowest "
+    "step is the step with the longest time until the next step, "
+    "not necessarily the step that did the most work.\n\n"
+    "Session totals:\n{aggregates}\n\n"
     "Session transcript:\n{transcript}"
 )
 
@@ -1122,6 +1162,23 @@ class MCPServer:
             "which they existed — it cannot re-verify them.")
         return "\n".join(lines)
 
+    def _aggregates_lines(self):
+        """The session's totals at a glance, as readable lines.
+
+        The same report `blackbox aggregates` prints
+        (`format_aggregates` over `session_aggregates`): step count
+        and duration, per-type and per-tool counts, per-model
+        calls/tokens/cost, error steps, the slowest step, and how
+        many records an earlier compaction removed or sampling
+        dropped. Read-only — asking for the summary removes
+        nothing.
+        """
+        records = load_records(self.log_path)
+        agg = session_aggregates(records)
+        if not agg["steps"] and not agg["compacted_count"]:
+            return "No steps recorded yet."
+        return format_aggregates(agg)
+
     def _resources_read(self, msg_id, params):
         uri = params.get("uri")
         if uri == "blackbox://session":
@@ -1228,6 +1285,19 @@ class MCPServer:
             text = SUMMARIZE_RETENTION_PROMPT.format(
                 keep_days=keep_days, keep_n=keep_n,
                 retention=retention, transcript=self._transcript())
+            return _result(msg_id, {
+                "description": description,
+                "messages": [{"role": "user",
+                              "content": {"type": "text", "text": text}}],
+            })
+        if name == "summarize_aggregates":
+            try:
+                aggregates = self._aggregates_lines()
+            except (OSError, ValueError) as exc:
+                return _error(msg_id, INVALID_PARAMS,
+                              "cannot read session: %s" % exc)
+            text = SUMMARIZE_AGGREGATES_PROMPT.format(
+                aggregates=aggregates, transcript=self._transcript())
             return _result(msg_id, {
                 "description": description,
                 "messages": [{"role": "user",

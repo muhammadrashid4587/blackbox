@@ -241,6 +241,13 @@ summary record is never exported.
   background thread, `Recorder(otlp_endpoint=...)` exports live as
   it records, and `blackbox export --live` posts a whole log,
   done (v0.11.0).
+- OTLP metrics signals: per-model call counts, input/output token
+  totals, latency (time until the next step) and cost in USD where
+  the model has a known price, plus per-tool call counts, as OTLP
+  Sum metrics (`records_to_metrics`, `export_otlp_metrics`, and a
+  `blackbox metrics` CLI command), done (v0.12.0).
+- Tail-based sampling: keep all error/anomalous traces, sample the
+  rest, so a busy session still exports a useful subset.
 
 ## Layout
 
@@ -257,7 +264,9 @@ blackbox/
   sampling.py     MCP sampling client: Sampler, StdioTransport,
                   SamplingError / NotSupported / Declined
   otel.py         OpenTelemetry export: records to OTLP/JSON spans,
-                  trace/span ids from the hash chain, round-trip
+                  trace/span ids from the hash chain, round-trip, and
+                  OTLP Sum metrics (per-model calls, tokens, latency,
+                  cost; per-tool calls)
   live_export.py  live OTLP export: POST spans to a collector over
                   HTTP with retry/backoff, background batching
                   thread, Recorder integration, `export --live` CLI

@@ -27,12 +27,21 @@ not a step. Round-tripping is lossless for the steps: spans_to_records
 rebuilds each step's seq, timestamp, type, payload, tokens and hashes
 from the span attributes, so an exported trace can be checked back
 against the log it came from.
+
+Metrics (records_to_metrics / export_otlp_metrics) are the same
+session as OTLP Sum metrics: per-model call counts, input/output
+token totals, latency (time until the next step, in ms) and cost in
+USD where the model has a known price, plus per-tool call counts.
+A step with no next timestamp (last step, no summary) contributes
+no latency. Costs are estimates from costs.py, never guesses for
+unknown models: an unpriced model simply has no cost data point.
 """
 
 import json
 from datetime import datetime, timedelta, timezone
 
 from . import __version__
+from .costs import cost_for
 from .replay import load_records
 
 SERVICE_NAME = "blackbox"
@@ -140,6 +149,148 @@ def records_to_spans(records, service_name=SERVICE_NAME):
             end = None
         spans.append(record_to_span(record, trace_id, end=end))
     return spans
+
+
+def _sum_metric(name, points, unit=None, monotonic=True):
+    """One OTLP Sum metric from (attributes, value) points.
+
+    int values become asInt, float values asDouble. Cumulative
+    temporality: the numbers cover the whole recorded session.
+    """
+    data_points = []
+    for attrs, value in points:
+        point = {"attributes": [_attr(k, v) for k, v in attrs]}
+        if isinstance(value, float):
+            point["asDouble"] = value
+        else:
+            point["asInt"] = str(value)
+        data_points.append(point)
+    metric = {
+        "name": name,
+        "sum": {
+            "dataPoints": data_points,
+            "aggregationTemporality": 2,  # AGGREGATION_TEMPORALITY_CUMULATIVE
+            "isMonotonic": monotonic,
+        },
+    }
+    if unit:
+        metric["unit"] = unit
+    return metric
+
+
+def records_to_metrics(records, service_name=SERVICE_NAME):
+    """A list of records as OTLP Sum metric dicts (summary excluded).
+
+    One metric per signal, one data point per model or tool. An
+    empty session (no steps) yields no metrics.
+    """
+    steps = [r for r in records if r["type"] != "summary"]
+    if not steps:
+        return []
+    summary_ts = None
+    if records and records[-1]["type"] == "summary":
+        summary_ts = _parse_ts(records[-1]["ts"])
+
+    calls = {}
+    input_tokens = {}
+    output_tokens = {}
+    latency_ms = {}
+    cost_usd = {}
+    tool_calls = {}
+    for i, record in enumerate(steps):
+        payload = record.get("payload") or {}
+        if record["type"] == "model_call":
+            model = payload.get("model", "?")
+            calls[model] = calls.get(model, 0) + 1
+            tokens = record.get("tokens")
+            if isinstance(tokens, dict):
+                if isinstance(tokens.get("input"), int):
+                    input_tokens[model] = (input_tokens.get(model, 0)
+                                           + tokens["input"])
+                if isinstance(tokens.get("output"), int):
+                    output_tokens[model] = (output_tokens.get(model, 0)
+                                            + tokens["output"])
+                cost = cost_for(model, tokens.get("input"),
+                                tokens.get("output"))
+                if cost is not None:
+                    cost_usd[model] = round(
+                        cost_usd.get(model, 0.0) + cost, 6)
+            if i + 1 < len(steps):
+                end = _parse_ts(steps[i + 1]["ts"])
+            else:
+                end = summary_ts
+            if end is not None:
+                start = _parse_ts(record["ts"])
+                ms = (end - start).total_seconds() * 1000
+                latency_ms[model] = latency_ms.get(model, 0.0) + ms
+        elif record["type"] == "tool_call":
+            tool = payload.get("tool", "?")
+            tool_calls[tool] = tool_calls.get(tool, 0) + 1
+
+    metrics = []
+    if calls:
+        def model_attrs(m):
+            return [("gen_ai.request.model", m)]
+
+        metrics.append(_sum_metric(
+            "blackbox.model_calls",
+            [(model_attrs(m), n) for m, n in sorted(calls.items())],
+            unit="1"))
+        if input_tokens:
+            metrics.append(_sum_metric(
+                "blackbox.model_input_tokens",
+                [(model_attrs(m), n)
+                 for m, n in sorted(input_tokens.items())], unit="1"))
+        if output_tokens:
+            metrics.append(_sum_metric(
+                "blackbox.model_output_tokens",
+                [(model_attrs(m), n)
+                 for m, n in sorted(output_tokens.items())], unit="1"))
+        if cost_usd:
+            metrics.append(_sum_metric(
+                "blackbox.model_cost_usd",
+                [(model_attrs(m), c)
+                 for m, c in sorted(cost_usd.items())], unit="USD"))
+        if latency_ms:
+            metrics.append(_sum_metric(
+                "blackbox.model_latency_ms",
+                [(model_attrs(m), round(ms, 3))
+                 for m, ms in sorted(latency_ms.items())],
+                unit="ms", monotonic=False))
+    if tool_calls:
+        metrics.append(_sum_metric(
+            "blackbox.tool_calls",
+            [( [("tool.name", t)], n)
+             for t, n in sorted(tool_calls.items())], unit="1"))
+    return metrics
+
+
+def export_otlp_metrics(path, service_name=SERVICE_NAME):
+    """A log file as an OTLP/JSON metrics dict. Works on .jsonl and
+    .db logs. The shape is resourceMetrics / scopeMetrics / metrics,
+    so it can be posted to the same collector as the spans."""
+    records = load_records(path)
+    return {
+        "resourceMetrics": [{
+            "resource": {"attributes": [
+                _attr("service.name", service_name),
+            ]},
+            "scopeMetrics": [{
+                "scope": {"name": SCOPE_NAME, "version": __version__},
+                "metrics": records_to_metrics(records, service_name),
+            }],
+        }],
+    }
+
+
+def export_otlp_metrics_file(path, out_path, service_name=SERVICE_NAME):
+    """Write a log's OTLP/JSON metrics export to a file. Returns the
+    dict."""
+    data = export_otlp_metrics(path, service_name)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    return data
 
 
 def export_otlp(path, service_name=SERVICE_NAME):

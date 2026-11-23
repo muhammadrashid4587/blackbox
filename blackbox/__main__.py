@@ -5,6 +5,7 @@
     python -m blackbox diff data/run-a.jsonl data/run-b.jsonl
     python -m blackbox mcp data/run.jsonl   # MCP server on stdio
     python -m blackbox otel data/run.jsonl --out spans.json
+    python -m blackbox metrics data/run.jsonl --out metrics.json
     python -m blackbox export data/run.jsonl --live  # POST spans to a collector
 
 Any command takes a .jsonl log or a .db SQLite store.
@@ -16,7 +17,7 @@ import sys
 
 from .live_export import DEFAULT_OTLP_ENDPOINT, OtlpHttpExporter
 from .mcp_server import serve_stdio
-from .otel import export_otlp
+from .otel import export_otlp, export_otlp_metrics
 from .replay import diff, replay
 from .verify import verify_cli
 
@@ -47,6 +48,13 @@ def main(argv=None):
     p_otel.add_argument("--out", help="write JSON here (default: stdout)")
     p_otel.add_argument("--service-name", default="blackbox")
 
+    p_metrics = sub.add_parser(
+        "metrics", help="export a log as OTLP/JSON metrics (per-model "
+        "calls, tokens, latency, cost; per-tool calls)")
+    p_metrics.add_argument("logfile")
+    p_metrics.add_argument("--out", help="write JSON here (default: stdout)")
+    p_metrics.add_argument("--service-name", default="blackbox")
+
     p_export = sub.add_parser(
         "export", help="export a log as OTLP/JSON, to a file or live to a collector")
     p_export.add_argument("logfile")
@@ -73,6 +81,15 @@ def main(argv=None):
         return 0
     if args.command == "otel":
         data = export_otlp(args.logfile, args.service_name)
+        text = json.dumps(data, indent=2) + "\n"
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(text)
+        else:
+            sys.stdout.write(text)
+        return 0
+    if args.command == "metrics":
+        data = export_otlp_metrics(args.logfile, args.service_name)
         text = json.dumps(data, indent=2) + "\n"
         if args.out:
             with open(args.out, "w", encoding="utf-8") as f:

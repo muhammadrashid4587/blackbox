@@ -11,13 +11,16 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
-It also exposes the session as three resources, and eight prompts:
+It also exposes the session as four resources, and eight prompts:
 
     blackbox://session        the session as a readable transcript
     blackbox://session.json   the session's records as JSON
     blackbox://session/aggregates
                               the session's totals as JSON, the same
                               totals `blackbox aggregates` prints
+    blackbox://session/trace  the session's reconstructed causal
+                              trace as JSON, the same trace
+                              `blackbox trace` prints
     analyze_session           a prompt template for analysing the
                               session (optional focus argument)
     summarize_costs           a prompt template for summarising the
@@ -91,7 +94,8 @@ from .sampling import (Sampler, SamplingDeclinedError, SamplingError,
                        SamplingNotSupportedError, StdioTransport)
 from .tail_sampling import (_is_error, _span_durations_ms,
                             tail_sample_records)
-from .trace import _label, build_trace, link_parents
+from .trace import (_label, _tree_depth, build_trace, link_parents,
+                    session_trace)
 from .verify import verify
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -219,6 +223,16 @@ RESOURCES = [
                         "records an earlier compaction removed or "
                         "sampling dropped — the same totals "
                         "`blackbox aggregates` prints."),
+        "mimeType": "application/json",
+    },
+    {
+        "uri": "blackbox://session/trace",
+        "name": "session/trace",
+        "description": ("The recorded session's reconstructed causal "
+                        "trace as JSON: step count, span-type "
+                        "breakdown, the slowest steps, error steps, "
+                        "parent gaps, and the parent-child tree — "
+                        "the same trace `blackbox trace` prints."),
         "mimeType": "application/json",
     },
 ]
@@ -471,13 +485,6 @@ SUMMARIZE_AGGREGATES_PROMPT = (
 def _usd(cost):
     """A USD amount with no trailing zeros: 0.0049, not 0.004900."""
     return ("%.6f" % cost).rstrip("0").rstrip(".")
-
-
-def _tree_depth(node):
-    """Depth of a trace-tree node: 1 for a leaf, more below."""
-    if not node["children"]:
-        return 1
-    return 1 + max(_tree_depth(child) for child in node["children"])
 
 
 def _tree_lines(nodes, depth, lines):
@@ -1210,6 +1217,13 @@ class MCPServer:
             records = load_records(self.log_path)
             agg = session_aggregates(records)
             text = json.dumps(agg, indent=2, sort_keys=True)
+            return _result(msg_id, {"contents": [
+                {"uri": uri, "mimeType": "application/json",
+                 "text": text}]})
+        if uri == "blackbox://session/trace":
+            records = load_records(self.log_path)
+            trace = session_trace(records)
+            text = json.dumps(trace, indent=2, sort_keys=True)
             return _result(msg_id, {"contents": [
                 {"uri": uri, "mimeType": "application/json",
                  "text": text}]})

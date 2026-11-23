@@ -122,7 +122,8 @@ class MCPServerTest(unittest.TestCase):
         uris = [r["uri"] for r in response["result"]["resources"]]
         self.assertEqual(uris, ["blackbox://session",
                                 "blackbox://session.json",
-                                "blackbox://session/aggregates"])
+                                "blackbox://session/aggregates",
+                                "blackbox://session/trace"])
         for resource in response["result"]["resources"]:
             self.assertIn("mimeType", resource)
 
@@ -235,6 +236,96 @@ class MCPServerTest(unittest.TestCase):
         self.assertEqual(agg["total_tokens"], 0)
         self.assertEqual(agg["by_type"], {})
         self.assertIsNone(agg["slowest_step"])
+
+    def test_resources_read_session_trace(self):
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/trace"}))
+        content = response["result"]["contents"][0]
+        self.assertEqual(content["uri"],
+                         "blackbox://session/trace")
+        self.assertEqual(content["mimeType"], "application/json")
+        trace = json.loads(content["text"])
+        # The same trace `blackbox trace` prints for this session:
+        # 4 steps in one chain, model_call -> tool_call ->
+        # tool_result -> model_call.
+        self.assertEqual(trace["steps"], 4)
+        self.assertEqual(trace["roots"], 1)
+        self.assertEqual(trace["max_depth"], 4)
+        self.assertEqual(trace["by_type"],
+                         {"model_call": 2, "tool_call": 1,
+                          "tool_result": 1})
+        self.assertEqual(trace["errors"], 0)
+        self.assertEqual(trace["error_seqs"], [])
+        self.assertEqual(trace["error_steps"], [])
+        self.assertEqual(len(trace["slowest_steps"]), 3)
+        for step in trace["slowest_steps"]:
+            self.assertIn(step["seq"], (0, 1, 2))
+            self.assertGreaterEqual(step["latency_seconds"], 0)
+        self.assertIn(trace["tail_sample_decision"],
+                      ("kept_all", "sampled"))
+        self.assertIsInstance(trace["parent_gaps"], list)
+        tree = trace["tree"]
+        self.assertEqual(len(tree), 1)
+        self.assertEqual(tree[0]["seq"], 0)
+        self.assertEqual(tree[0]["label"], "model_call gpt-5")
+        self.assertEqual(tree[0]["children"][0]["seq"], 1)
+        self.assertEqual(tree[0]["children"][0]["label"],
+                         "tool_call search")
+        self.assertEqual(
+            tree[0]["children"][0]["children"][0]["seq"], 2)
+        self.assertEqual(
+            tree[0]["children"][0]["children"][0]["label"],
+            "tool_result search")
+        self.assertEqual(
+            tree[0]["children"][0]["children"][0]["children"][0]
+            ["seq"], 3)
+        self.assertEqual(
+            tree[0]["children"][0]["children"][0]["children"][0]
+            ["label"], "model_call gpt-5")
+
+    def test_resources_read_session_trace_with_error(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "search",
+                           "args": {"query": "mcp"}}})
+        _call(self.server, 3, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "search", "error": "timeout"}})
+        response = self.server.handle_message(
+            _request(4, "resources/read",
+                     {"uri": "blackbox://session/trace"}))
+        trace = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(trace["steps"], 2)
+        self.assertEqual(trace["errors"], 1)
+        self.assertEqual(trace["error_seqs"], [1])
+        self.assertEqual(trace["error_steps"],
+                         [{"seq": 1, "type": "tool_result",
+                           "label": "tool_result search",
+                           "error": "timeout"}])
+        self.assertEqual(trace["tree"][0]["seq"], 0)
+        self.assertEqual(trace["tree"][0]["children"][0]["seq"], 1)
+
+    def test_resources_read_session_trace_empty_session(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/trace"}))
+        trace = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(trace["steps"], 0)
+        self.assertEqual(trace["roots"], 0)
+        self.assertEqual(trace["max_depth"], 0)
+        self.assertEqual(trace["by_type"], {})
+        self.assertEqual(trace["slowest_steps"], [])
+        self.assertEqual(trace["errors"], 0)
+        self.assertEqual(trace["error_seqs"], [])
+        self.assertEqual(trace["parent_gaps"], [])
+        self.assertEqual(trace["tree"], [])
 
     def test_resources_read_unknown_uri_is_an_error(self):
         self._init()

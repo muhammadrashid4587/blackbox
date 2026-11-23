@@ -132,14 +132,18 @@ dependencies), so any MCP client can record through blackbox. It
 exposes three tools: `blackbox_record` (append one step — same
 redaction, hash chain and fsync as the library), `blackbox_verify`
 (check the chain) and `blackbox_replay` (read the transcript back).
-The session is also readable as three resources:
+The session is also readable as four resources:
 `blackbox://session` (the transcript), `blackbox://session.json`
-(the raw records, hash chain included), and
+(the raw records, hash chain included),
 `blackbox://session/aggregates` (the session totals as JSON —
 step count and duration, per-type and per-tool counts, per-model
 tokens and cost, error steps, the slowest step, and how many
 records an earlier compaction removed or sampling dropped, the
-same totals `blackbox aggregates` prints) — all read from the
+same totals `blackbox aggregates` prints), and
+`blackbox://session/trace` (the reconstructed causal trace as
+JSON — step count, span-type breakdown, the slowest steps, error
+steps, parent gaps, and the parent-child tree, the same trace
+`blackbox trace` prints) — all read from the
 same log the tools write to, so a client always sees the current
 session.
 One prompt template, `analyze_session`, hands the client a prompt
@@ -360,7 +364,7 @@ session summary instead of the whole transcript. It works on
 
 ## Measured
 
-- 267 tests, all passing (`make test`).
+- 270 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -487,8 +491,17 @@ session summary instead of the whole transcript. It works on
   counts — so any client can read the session at a glance
   without a prompt round-trip, reusing `session_aggregates`
   from `aggregates.py`, done (v0.26.0).
-  Next: a trace resource, `blackbox://session/trace`, exposing
-  the reconstructed causal trace as JSON.
+- Trace resource: `blackbox://session/trace` exposes the
+  reconstructed causal trace as JSON — step count, span-type
+  breakdown, the slowest steps, error steps, parent gaps, and
+  the parent-child tree — so any client can read the trace
+  shape without a prompt round-trip, reusing `build_trace`
+  and `link_parents` from `trace.py` through a shared
+  `session_trace` (step latencies and error steps use the
+  same helpers as the `summarize_trace` prompt, so the
+  resource and the prompt always agree), done (v0.27.0).
+  Next: an MCP resource for the diff, or a second trace
+  view — per-tool / per-model cost and token totals as JSON.
 
 ## Layout
 
@@ -520,7 +533,9 @@ blackbox/
                   time range; --json and --count output modes
   trace.py        causal trace reconstruction: parent-child tree
                   (tool_result -> tool_call, tool_call -> model_call),
-                  indented tree or nested JSON; `blackbox trace` CLI
+                  indented tree or nested JSON; `blackbox trace` CLI;
+                  `session_trace` for the blackbox://session/trace
+                  MCP resource
   compact.py      retention / compaction: drop old records, anchor
                   them with a hash-chain checkpoint record (head
                   hash, removed count, cutoff); `blackbox compact` CLI
@@ -545,5 +560,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            259 tests, all passing
+tests/            270 tests, all passing
 ```

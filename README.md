@@ -233,6 +233,22 @@ priced cost total, and how many matched model calls were unpriced.
 `query_records` / `query_log` in `query.py` are the same filter as a
 Python API, and both work on `.jsonl` logs and `.db` stores.
 
+**Causal trace reconstruction.** `python -m blackbox trace
+data/run.jsonl` prints the session as a parent-child tree instead
+of a flat list: a tool_result hangs off the tool_call it answers
+(matched first-in first-out per tool, so parallel calls to the same
+tool pair with their results in order), a tool_call hangs off the
+model_call that decided to call it, and a model_call hangs off the
+step before it — usually the tool_result it is reacting to. A rule
+that finds nothing falls back to the previous step, so an orphaned
+result from a resumed or truncated log still lands somewhere instead
+of being dropped. `--json` prints the nested tree as JSON.
+`link_parents` / `build_trace` in `trace.py` are the same
+reconstruction as a Python API, and both work on `.jsonl` logs and
+`.db` stores. The links are a reconstruction, not a claim about
+intent: the log records no parent pointers, so a result for a tool
+called twice in a row pairs with the earlier call by FIFO order.
+
 ## What it is not
 
 - Not a hosted platform. There is nothing to sign up for and nowhere
@@ -245,7 +261,7 @@ Python API, and both work on `.jsonl` logs and `.db` stores.
 
 ## Measured
 
-- 178 tests, all passing (`make test`).
+- 192 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -285,6 +301,12 @@ Python API, and both work on `.jsonl` logs and `.db` stores.
   time range (filters combine with AND, summary excluded unless
   asked for), with `--json` and `--count` output modes and a footer
   reporting matches, token total and priced cost, done (v0.14.0).
+- Causal trace reconstruction: `blackbox trace` rebuilds the
+  parent-child tree of a session — tool_results hang off their
+  tool_calls (FIFO per tool), tool_calls off the model_call that
+  decided them, model_calls off the previous step — as an indented
+  tree or nested JSON (`link_parents` / `build_trace` in `trace.py`),
+  done (v0.15.0).
 
 ## Layout
 
@@ -306,6 +328,9 @@ blackbox/
   query.py        query CLI: filter a session's steps by type,
                   model, tool, min tokens, min cost, errors only,
                   time range; --json and --count output modes
+  trace.py        causal trace reconstruction: parent-child tree
+                  (tool_result -> tool_call, tool_call -> model_call),
+                  indented tree or nested JSON; `blackbox trace` CLI
   otel.py         OpenTelemetry export: records to OTLP/JSON spans,
                   trace/span ids from the hash chain, round-trip, and
                   OTLP Sum metrics (per-model calls, tokens, latency,
@@ -317,9 +342,9 @@ blackbox/
   verify.py       replay the chain, find the first broken record
   replay.py       transcript printer + run diff
   __main__.py     CLI: verify | replay | diff | mcp | otel | export
-                  | metrics | tail-sample | query
+                  | metrics | tail-sample | query | trace
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            178 tests, all passing
+tests/            192 tests, all passing
 ```

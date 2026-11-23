@@ -1,4 +1,4 @@
-"""CLI: python -m blackbox verify|replay|diff|mcp|otel|metrics|tail-sample|export <logfile> ...
+"""CLI: python -m blackbox verify|replay|diff|mcp|otel|metrics|tail-sample|export|query|trace <logfile> ...
 
     python -m blackbox verify data/demo.jsonl
     python -m blackbox replay data/demo.jsonl
@@ -9,6 +9,7 @@
     python -m blackbox tail-sample data/run.jsonl --out spans.json
     python -m blackbox export data/run.jsonl --live  # POST spans to a collector
     python -m blackbox query data/run.jsonl --model gpt-5 --min-cost 0.01
+    python -m blackbox trace data/run.jsonl  # causal parent-child tree
 
 Any command takes a .jsonl log or a .db SQLite store.
 """
@@ -24,6 +25,7 @@ from .query import query_log
 from .replay import diff, replay
 from .tail_sampling import (DEFAULT_MAX_COST_USD, DEFAULT_SLOW_MS,
                             export_tail_sampled_otlp)
+from .trace import trace_log
 from .verify import verify_cli
 
 
@@ -120,6 +122,15 @@ def main(argv=None):
     p_query.add_argument("--count", action="store_true",
                          help="print only the number of matches")
 
+    p_trace = sub.add_parser(
+        "trace", help="print a log as a causal parent-child tree: "
+        "tool_results hang off their tool_calls, tool_calls off the "
+        "model_call that decided them")
+    p_trace.add_argument("logfile")
+    p_trace.add_argument("--json", action="store_true", dest="as_json",
+                         help="print the nested tree as JSON instead of "
+                         "an indented tree")
+
     args = parser.parse_args(argv)
     if args.command == "verify":
         return verify_cli(args.logfile)
@@ -199,6 +210,9 @@ def main(argv=None):
                   min_cost=args.min_cost, errors_only=args.errors_only,
                   since=args.since, until=args.until,
                   as_json=args.as_json, count_only=args.count)
+        return 0
+    if args.command == "trace":
+        trace_log(args.logfile, as_json=args.as_json)
         return 0
     return 2
 

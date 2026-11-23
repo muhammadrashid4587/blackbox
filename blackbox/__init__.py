@@ -7,7 +7,7 @@ append-only log you can verify and replay.
 Pure Python 3 standard library. No dependencies.
 """
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 from .costs import cost_for, price_for, register_pricing
 from .live_export import (DEFAULT_OTLP_ENDPOINT, LiveExporter,
@@ -26,6 +26,7 @@ from .tail_sampling import (DEFAULT_MAX_COST_USD, DEFAULT_SLOW_MS,
                             export_tail_sampled_otlp,
                             export_tail_sampled_otlp_file,
                             tail_sample_records)
+from .trace import build_trace, link_parents, trace_log
 from .verify import verify
 
 __all__ = ["DEFAULT_OTLP_ENDPOINT", "DEFAULT_MAX_COST_USD",
@@ -33,10 +34,12 @@ __all__ = ["DEFAULT_OTLP_ENDPOINT", "DEFAULT_MAX_COST_USD",
            "OtlpHttpExporter", "Recorder", "Sampler",
            "SamplingDeclinedError",
            "SamplingError", "SamplingNotSupportedError", "SamplingResult",
-           "StdioTransport", "cost_for", "diff", "export_otlp",
+           "StdioTransport", "build_trace", "cost_for", "diff", "export_otlp",
            "export_otlp_file", "export_otlp_metrics",
            "export_otlp_metrics_file", "export_tail_sampled_otlp",
-           "export_tail_sampled_otlp_file", "load_records", "price_for",
+           "export_tail_sampled_otlp_file", "link_parents", "load_records",
+           "price_for",
            "query_log", "query_records", "records_to_metrics",
            "records_to_spans", "register_pricing",
-           "replay", "spans_to_records", "tail_sample_records", "verify"]
+           "replay", "spans_to_records", "tail_sample_records", "trace_log",
+           "verify"]

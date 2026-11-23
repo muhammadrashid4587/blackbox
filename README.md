@@ -361,6 +361,19 @@ changes nothing — so a later MCP prompt can hand the client the
 session summary instead of the whole transcript. It works on
 `.jsonl` logs and `.db` stores.
 
+**Cost totals.** `python -m blackbox costs data/run.jsonl` breaks
+the session's cost down per model and per tool: per model reuses the
+shared `model_usage` from `replay.py`, so it agrees with the cost
+summary and the diff; per tool charges a model call to the tool it
+decided to invoke, using the same causal rule as the trace
+reconstruction — a tool_call hangs off the most recent model_call.
+A model call invoking several tools is counted in full under each
+of them, so per-tool totals can exceed the session total; a tool
+with no invoking model call is counted with no cost. `--json`
+prints the same breakdown as JSON. `cost_totals` in `aggregates.py`
+is the same computation as a pure function over a list of records,
+read-only.
+
 ## What it is not
 
 - Not a hosted platform. There is nothing to sign up for and nowhere
@@ -373,7 +386,7 @@ session summary instead of the whole transcript. It works on
 
 ## Measured
 
-- 280 tests, all passing (`make test`).
+- 292 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -523,9 +536,19 @@ session summary instead of the whole transcript. It works on
   `blackbox://session/diff?other_path=<path>` — and reading
   it without one, or with an unreadable log, is an error,
   done (v0.28.0).
-  Next: a second trace view — per-tool / per-model cost and
-  token totals as JSON, or an MCP resource template for the
-  diff so clients can discover the other_path parameter.
+- Cost totals: `cost_totals` in `aggregates.py` breaks the session's
+  cost down per model and per tool as JSON-able data — per model
+  reuses the shared `model_usage` from `replay.py` and `cost_for`,
+  so it agrees with the cost summary, the diff prompt and the diff
+  resource (a plain int token count is not priced, an unknown model
+  costs None, never a guessed number); per tool charges a model
+  call to the tool it decided to invoke, using the same causal rule
+  as `link_parents` in `trace.py`, in full under each tool it
+  invoked, with how many attributed calls were unpriced reported
+  alongside — with a `blackbox costs` CLI command (report or
+  `--json`), done (v0.29.0).
+  Next: an MCP resource template for the diff so clients can
+  discover the other_path parameter.
 
 ## Layout
 
@@ -565,8 +588,10 @@ blackbox/
                   hash, removed count, cutoff); `blackbox compact` CLI
   aggregates.py   session aggregates: per-session totals (steps,
                   duration, per-model tokens/cost, per-tool calls,
-                  errors, slowest step) as a pure function and a
-                  `blackbox aggregates` CLI command
+                  errors, slowest step) and cost totals (per-model
+                  and per-tool cost/token breakdowns) as pure
+                  functions, with `blackbox aggregates` and
+                  `blackbox costs` CLI commands
   otel.py         OpenTelemetry export: records to OTLP/JSON spans,
                   trace/span ids from the hash chain, round-trip, and
                   OTLP Sum metrics (per-model calls, tokens, latency,
@@ -581,9 +606,9 @@ blackbox/
                   `session_diff` as JSON, per-model token usage)
   __main__.py     CLI: verify | replay | diff | mcp | otel | export
                   | metrics | tail-sample | query | trace | compact
-                  | aggregates
+                  | aggregates | costs
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            280 tests, all passing
+tests/            292 tests, all passing
 ```

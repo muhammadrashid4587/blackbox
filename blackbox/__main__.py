@@ -12,6 +12,7 @@
     python -m blackbox trace data/run.jsonl  # causal parent-child tree
     python -m blackbox compact data/run.jsonl --keep-days 30  # retention
     python -m blackbox aggregates data/run.jsonl  # per-session totals
+    python -m blackbox costs data/run.jsonl  # per-model/per-tool cost totals
     python -m blackbox compact data/run.jsonl --keep-n 1000
 
 Any command takes a .jsonl log or a .db SQLite store.
@@ -21,7 +22,7 @@ import argparse
 import json
 import sys
 
-from .aggregates import aggregates_log
+from .aggregates import aggregates_log, cost_totals_log
 from .compact import compact_log
 from .live_export import DEFAULT_OTLP_ENDPOINT, OtlpHttpExporter
 from .mcp_server import serve_stdio
@@ -160,6 +161,15 @@ def main(argv=None):
                               help="print the aggregates as JSON instead "
                               "of a report")
 
+    p_costs = sub.add_parser(
+        "costs", help="print cost totals broken down per model and per "
+        "tool: the model spend that produced each tool call is charged "
+        "to that tool")
+    p_costs.add_argument("logfile")
+    p_costs.add_argument("--json", action="store_true", dest="as_json",
+                         help="print the cost totals as JSON instead "
+                         "of a report")
+
     p_compact = sub.add_parser(
         "compact", help="retention: drop old records and anchor them "
         "with a hash-chain checkpoint, so verify still passes on the "
@@ -269,6 +279,9 @@ def main(argv=None):
         return 0
     if args.command == "aggregates":
         aggregates_log(args.logfile, as_json=args.as_json)
+        return 0
+    if args.command == "costs":
+        cost_totals_log(args.logfile, as_json=args.as_json)
         return 0
     if args.command == "compact":
         try:

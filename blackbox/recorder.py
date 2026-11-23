@@ -21,11 +21,19 @@ Payloads are redacted before they are hashed or written, so a secret
 never reaches the log. Every record is flushed and fsynced (JSONL) or
 committed with synchronous=FULL (SQLite): a flight recorder that
 loses the last seconds of a crashed run is not much use.
+
+Sampling: pass sample_rate < 1.0 and each step is kept with that
+probability (a seeded RNG makes the choice reproducible). Dropped
+steps are never written and never enter the hash chain — the chain
+covers exactly what is in the log — but the summary records the rate
+and how many steps were dropped, so a sampled log is honest about
+what it is missing.
 """
 
 import hashlib
 import json
 import os
+import random
 from datetime import datetime, timezone
 
 from .costs import cost_for
@@ -60,12 +68,25 @@ class Recorder:
 
     If the log already exists, recording resumes after its last record,
     so a crashed run can be continued without breaking the chain.
+
+    sample_rate (0, 1]: probability of keeping each step. 1.0 keeps
+    everything (the default). Below 1.0, dropped steps are counted in
+    _sampled_out and reported in the summary, but never written and
+    never hashed — the chain covers exactly what is in the log.
+    sample_seed makes the keep/drop choice reproducible; without it
+    the choice is random per Recorder.
     """
 
-    def __init__(self, path, task=None, model=None):
+    def __init__(self, path, task=None, model=None, sample_rate=1.0,
+                 sample_seed=None):
+        if not 0 < sample_rate <= 1.0:
+            raise ValueError("sample_rate must be in (0, 1]")
         self.path = path
         self.task = task
         self.model = model
+        self.sample_rate = sample_rate
+        self._rng = random.Random(sample_seed)
+        self._sampled_out = 0
         self._seq = 0
         self._prev_hash = GENESIS_PREV_HASH
         self._count = 0
@@ -155,9 +176,17 @@ class Recorder:
         os.fsync(self._file.fileno())
 
     def record(self, event_type, payload, tokens=None):
-        """Append one step. Payload is redacted before hashing/writing."""
+        """Append one step. Payload is redacted before hashing/writing.
+
+        With sampling on, a step may be dropped instead: it is counted
+        in _sampled_out, never written, and record() returns None.
+        A kept step returns its seq, as before.
+        """
         if self._closed:
             raise RuntimeError("Recorder is closed")
+        if self._rng.random() >= self.sample_rate:
+            self._sampled_out += 1
+            return None
         record = {
             "seq": self._seq,
             "ts": _now_iso(),
@@ -207,6 +236,11 @@ class Recorder:
             "task": self.task,
             "model": self.model,
         }
+        if self.sample_rate < 1.0:
+            # A sampled log says so, and how much it skipped: the
+            # summary describes the log as it is, not the run as it was.
+            summary["sample_rate"] = self.sample_rate
+            summary["sampled_out"] = self._sampled_out
         record = {
             "seq": self._seq,
             "ts": summary["ended"],

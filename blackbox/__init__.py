@@ -7,7 +7,7 @@ append-only log you can verify and replay.
 Pure Python 3 standard library. No dependencies.
 """
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 from .costs import cost_for, price_for, register_pricing
 from .mcp_server import MCPServer

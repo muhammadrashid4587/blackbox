@@ -167,6 +167,17 @@ instead of raising — over any transport with a `request()` method;
 `StdioTransport` is the stdio one, and `scripts/demo_sampling.py`
 shows the whole flow against a fake client, no real model needed.
 
+**Sampling.** `Recorder(path, sample_rate=0.5, sample_seed=7)` keeps
+each step with probability 0.5 — probabilistic head-based sampling
+for long runs where recording every step is too much. The choice is
+made by a seeded RNG, so the same seed keeps the same steps. A
+dropped step is never written and never enters the hash chain, so
+the chain covers exactly what is in the log and `verify` still
+passes; the summary records `sample_rate` and `sampled_out`, so a
+sampled log is honest about what it skipped. Tokens and cost in the
+summary count only kept steps. The default rate is 1.0: everything
+kept, no sampling fields in the summary.
+
 **OpenTelemetry export.** `python -m blackbox otel data/run.jsonl`
 writes the session as OTLP/JSON spans, one per step, in a single
 trace — no OpenTelemetry SDK needed, the exporter only builds dicts.
@@ -191,7 +202,7 @@ can be checked back against the log it came from.
 
 ## Measured
 
-- 119 tests, all passing (`make test`).
+- 126 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -205,12 +216,16 @@ can be checked back against the log it came from.
   (trace/span ids from the hash chain, span attributes for model/tool
   calls, `spans_to_records` round-trip) and an `otel` CLI command,
   done (v0.9.0).
+- Span sampling: probabilistic head-based sampling in the Recorder
+  (`sample_rate`, seeded RNG, dropped steps counted in the summary,
+  hash chain covers only what is kept), done (v0.10.0).
 
 ## Layout
 
 ```
 blackbox/
-  recorder.py     append-only hash-chained log, fsync per record
+  recorder.py     append-only hash-chained log, fsync per record,
+                  head-based span sampling (sample_rate, seeded RNG)
   sqlite_store.py SQLite store: same records, same chain, WAL + synchronous=FULL
   costs.py        per-model cost tracking: list prices, cost math
   mcp_server.py   MCP server on stdio: record / verify / replay tools,
@@ -228,5 +243,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            119 tests, all passing
+tests/            126 tests, all passing
 ```

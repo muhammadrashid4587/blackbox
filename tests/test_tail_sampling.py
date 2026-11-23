@@ -8,6 +8,7 @@ import unittest
 
 from blackbox import Recorder
 from blackbox.__main__ import main
+from blackbox.otel import export_otlp, spans_to_records
 from blackbox.tail_sampling import (export_tail_sampled_otlp,
                                     tail_sample_records)
 from blackbox.trace import link_parents
@@ -377,6 +378,151 @@ class CausalTailSampleExportTest(unittest.TestCase):
         for span in self._spans(data):
             if "parentSpanId" in span:
                 self.assertIn(span["parentSpanId"], span_ids)
+
+
+class ParentGapTest(unittest.TestCase):
+    """Plain sampling: a kept span whose parent was dropped is
+    marked, and the decision counts the gaps."""
+
+    def _attrs(self, span):
+        out = {}
+        for a in span["attributes"]:
+            v = a["value"]
+            if "intValue" in v:
+                out[a["key"]] = int(v["intValue"])
+            elif "boolValue" in v:
+                out[a["key"]] = v["boolValue"]
+            else:
+                out[a["key"]] = v.get("stringValue")
+        return out
+
+    def _spans(self, data):
+        return data["resourceSpans"][0]["scopeSpans"][0]["spans"]
+
+    def test_plain_sample_counts_parent_gaps(self):
+        records = _causal_session()
+        # Seed 17 keeps only seq 3, whose chain parent (seq 2) was
+        # dropped: exactly one gap.
+        _, decision = tail_sample_records(records, keep_rate=0.5,
+                                          seed=17)
+        self.assertEqual(decision["parent_gaps"], 1)
+        self.assertEqual(decision["kept_spans"], 1)
+
+    def test_kept_span_flags_dropped_parent(self):
+        # Build the export from a real log file, as the CLI does.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "run.jsonl")
+            with Recorder(path, task="t", model="m") as rec:
+                rec.record("model_call", {"model": "m", "prompt": "plan"},
+                           tokens={"input": 10, "output": 5})
+                rec.record("tool_call",
+                           {"tool": "search", "args": {"q": "a"}})
+                rec.record("tool_call",
+                           {"tool": "search", "args": {"q": "b"}})
+                rec.record("tool_result",
+                           {"tool": "search", "result": "ra"})
+                rec.record("tool_result",
+                           {"tool": "search", "result": "rb"})
+                rec.record("model_call",
+                           {"model": "m", "prompt": "summarise"},
+                           tokens={"input": 4, "output": 2})
+            data = export_tail_sampled_otlp(path, keep_rate=0.5,
+                                            seed=17)
+            spans = self._spans(data)
+            self.assertEqual(len(spans), 1)
+            self.assertEqual(data["tail_sampling"]["parent_gaps"], 1)
+            attrs = self._attrs(spans[0])
+            # The gap is flagged, and the parentSpanId still names
+            # the real dropped parent (seq 2's hash), not a rewrite.
+            self.assertIs(attrs.get("blackbox.parent_sampled_out"),
+                          True)
+            with open(path) as f:
+                log = [json.loads(line) for line in f]
+            dropped = [r for r in log
+                       if r["seq"] == 2][0]
+            self.assertEqual(spans[0]["parentSpanId"],
+                             dropped["hash"][:16])
+            # Round-tripping still works: the flag is metadata, not
+            # record data.
+            back = spans_to_records(spans)
+            self.assertEqual(back[0]["seq"], 3)
+
+    def test_causal_sample_has_no_parent_gaps(self):
+        records = _causal_session()
+        _, decision = tail_sample_records(records, keep_rate=0.5,
+                                          seed=17, causal=True)
+        self.assertEqual(decision["parent_gaps"], 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "run.jsonl")
+            with Recorder(path, task="t", model="m") as rec:
+                rec.record("model_call", {"model": "m", "prompt": "plan"},
+                           tokens={"input": 10, "output": 5})
+                rec.record("tool_call",
+                           {"tool": "search", "args": {"q": "a"}})
+                rec.record("tool_call",
+                           {"tool": "search", "args": {"q": "b"}})
+                rec.record("tool_result",
+                           {"tool": "search", "result": "ra"})
+                rec.record("tool_result",
+                           {"tool": "search", "result": "rb"})
+                rec.record("model_call",
+                           {"model": "m", "prompt": "summarise"},
+                           tokens={"input": 4, "output": 2})
+            data = export_tail_sampled_otlp(path, keep_rate=0.5,
+                                            seed=17, causal=True)
+            self.assertEqual(data["tail_sampling"]["parent_gaps"], 0)
+            spans = self._spans(data)
+        for span in spans:
+            self.assertNotIn("blackbox.parent_sampled_out",
+                             self._attrs(span))
+
+    def test_kept_all_has_no_parent_gaps(self):
+        records = _steps(4) + [_summary()]
+        records[2] = _record(2, records[2]["ts"], "tool_result",
+                             {"tool": "search", "error": "timeout"})
+        _, decision = tail_sample_records(records, keep_rate=0.5)
+        self.assertEqual(decision["decision"], "kept_all")
+        self.assertEqual(decision["parent_gaps"], 0)
+
+    def test_full_export_has_no_gap_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "run.jsonl")
+            with Recorder(path, task="t", model="m") as rec:
+                rec.record("model_call", {"model": "m", "prompt": "hi"},
+                           tokens=10)
+                rec.record("tool_call",
+                           {"tool": "search", "args": {"q": "x"}})
+                rec.record("tool_result",
+                           {"tool": "search", "result": "ok"})
+            data = export_otlp(path)
+        for span in self._spans(data):
+            self.assertNotIn("blackbox.parent_sampled_out",
+                             self._attrs(span))
+
+    def test_cli_reports_parent_gaps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "run.jsonl")
+            with Recorder(path, task="t", model="m") as rec:
+                rec.record("model_call", {"model": "m", "prompt": "plan"},
+                           tokens={"input": 10, "output": 5})
+                rec.record("tool_call",
+                           {"tool": "search", "args": {"q": "a"}})
+                rec.record("tool_call",
+                           {"tool": "search", "args": {"q": "b"}})
+                rec.record("tool_result",
+                           {"tool": "search", "result": "ra"})
+                rec.record("tool_result",
+                           {"tool": "search", "result": "rb"})
+                rec.record("model_call",
+                           {"model": "m", "prompt": "summarise"},
+                           tokens={"input": 4, "output": 2})
+            out = os.path.join(tmp, "spans.json")
+            rc = main(["tail-sample", path, "--out", out,
+                       "--keep-rate", "0.5", "--seed", "17"])
+            self.assertEqual(rc, 0)
+            with open(out) as f:
+                data = json.load(f)
+            self.assertEqual(data["tail_sampling"]["parent_gaps"], 1)
 
 
 if __name__ == "__main__":

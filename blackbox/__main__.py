@@ -213,6 +213,10 @@ def main(argv=None):
             if decision["causal_ancestors_kept"]:
                 extra = (", +%d causal ancestors"
                          % decision["causal_ancestors_kept"])
+            if decision["parent_gaps"]:
+                extra += (", %d parent gap%s"
+                          % (decision["parent_gaps"],
+                             "s" if decision["parent_gaps"] != 1 else ""))
             print("tail-sample: %s (%s) — kept %d of %d spans%s"
                   % (decision["decision"], reasons,
                      decision["kept_spans"], decision["total_spans"],

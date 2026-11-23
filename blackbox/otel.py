@@ -43,6 +43,13 @@ tool_result for a tool called twice in a row pairs with the earlier
 call by FIFO order, and an orphaned result falls back to the
 previous step.
 
+Parent gaps: when spans are exported from a subset of the log (a
+tail-sampled export), a kept span whose parent was dropped carries
+a `blackbox.parent_sampled_out` attribute, so the gap is visible
+instead of a silent dangle — its parentSpanId still names the real
+dropped parent. A full log has no gaps, so a full export is
+unchanged.
+
 Metrics (records_to_metrics / export_otlp_metrics) are the same
 session as OTLP Sum metrics: per-model call counts, input/output
 token totals, latency (time until the next step, in ms) and cost in
@@ -102,14 +109,18 @@ def _tokens_total(tokens):
 
 
 def record_to_span(record, trace_id, end=None, parent_span_id=_CHAIN_PARENT,
-                   causal=False):
+                   causal=False, parent_sampled_out=False):
     """One record as an OTLP span dict. `end` is the span end time.
 
     `parent_span_id` overrides the chain parent: a span id string
     for an explicit parent, None for a root (no parentSpanId). Left
     at the default, the parent is the previous record's hash, as
     before. `causal` marks the span as carrying a reconstructed
-    parent (see records_to_spans).
+    parent (see records_to_spans). `parent_sampled_out` marks a span
+    whose parent was dropped by sampling: its parentSpanId still
+    names the dropped parent (the id is real, the span is just not
+    in this export), and a `blackbox.parent_sampled_out` attribute
+    says so, so the gap is visible instead of a silent dangle.
     """
     payload = record.get("payload") or {}
     event_type = record["type"]
@@ -147,6 +158,8 @@ def record_to_span(record, trace_id, end=None, parent_span_id=_CHAIN_PARENT,
         attributes.append(_attr("tool.name", payload["tool"]))
     if causal:
         attributes.append(_attr("blackbox.causal_parent", True))
+    if parent_sampled_out:
+        attributes.append(_attr("blackbox.parent_sampled_out", True))
 
     span = {
         "traceId": trace_id,
@@ -181,6 +194,13 @@ def records_to_spans(records, service_name=SERVICE_NAME, causal=False,
     recomputing parents from the records given, so a kept span's
     parent is the parent the full trace assigns it. A parent seq
     absent from `records` still yields a root span, as before.
+
+    A kept span whose parent is not in `records` — dropped by
+    sampling, in either mode — is marked with a
+    `blackbox.parent_sampled_out` attribute, so the export is
+    honest about the gap: the parentSpanId still names the real
+    (absent) parent instead of silently dangling. A full log has
+    no gaps, so a full export is unchanged.
     """
     steps = [r for r in records if r["type"] != "summary"]
     if not steps:
@@ -189,6 +209,7 @@ def records_to_spans(records, service_name=SERVICE_NAME, causal=False,
     if causal and parents is None:
         parents = link_parents(records)
     by_seq = {r["seq"]: r for r in steps} if causal else None
+    kept_ids = {r["hash"][:16] for r in steps}
     spans = []
     for i, record in enumerate(steps):
         if i + 1 < len(steps):
@@ -202,11 +223,16 @@ def records_to_spans(records, service_name=SERVICE_NAME, causal=False,
             parent_span_id = (by_seq[parent_seq]["hash"][:16]
                               if parent_seq is not None
                               and parent_seq in by_seq else None)
-            spans.append(record_to_span(record, trace_id, end=end,
-                                        parent_span_id=parent_span_id,
-                                        causal=True))
+            spans.append(record_to_span(
+                record, trace_id, end=end,
+                parent_span_id=parent_span_id, causal=True,
+                parent_sampled_out=(parent_seq is not None
+                                    and parent_seq not in by_seq)))
         else:
-            spans.append(record_to_span(record, trace_id, end=end))
+            gap = (record["prev_hash"] != "0" * 64
+                   and record["prev_hash"][:16] not in kept_ids)
+            spans.append(record_to_span(record, trace_id, end=end,
+                                        parent_sampled_out=gap))
     return spans
 
 

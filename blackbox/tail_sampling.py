@@ -34,6 +34,14 @@ decision (`causal_ancestors_kept`): the export stays honest about
 which spans the RNG chose and which were added to keep the tree
 connected. Kept-all traces need no closure — everything is kept
 already — and the default (non-causal) export is unchanged.
+
+Parent gaps (plain mode): a kept span whose chain parent was
+dropped keeps its parentSpanId naming the real (absent) parent
+and is marked with a `blackbox.parent_sampled_out` attribute (see
+otel.records_to_spans), so the gap is visible instead of a silent
+dangle. The decision counts them as `parent_gaps`: 0 for kept-all
+traces and for causal sampling, where closure guarantees every
+kept span's parent is in the export.
 """
 
 import json
@@ -119,12 +127,20 @@ def tail_sample_records(records, keep_rate=0.5, seed=None,
         causal: whether causal ancestor closure was on
         causal_ancestors_kept: spans added by that closure (0 when
             causal is off, or when the trace was kept whole)
+        parent_gaps: kept spans whose parent was sampled out (0
+            when the trace was kept whole, or when causal closure
+            kept every kept span's parent)
 
     With causal=True and a sampled trace, a span the RNG keeps
     pulls in its causal ancestors (trace.link_parents on the full
     log), so the kept spans form a connected tree instead of a set
     of orphans. The RNG choice itself is unchanged: the causal kept
     set is a superset of the plain kept set for the same seed.
+    Without causal, a kept span whose chain parent was dropped is
+    counted in parent_gaps and marked in the export with a
+    blackbox.parent_sampled_out attribute (see records_to_spans),
+    so the sampled trace never pretends to be connected when it
+    is not.
     """
     if not 0 < keep_rate <= 1.0:
         raise ValueError("keep_rate must be in (0, 1]")
@@ -143,6 +159,7 @@ def tail_sample_records(records, keep_rate=0.5, seed=None,
         reasons.append("high_cost")
 
     ancestors_kept = 0
+    parent_gaps = 0
     if reasons:
         kept = list(steps)
         decision = "kept_all"
@@ -166,6 +183,15 @@ def tail_sample_records(records, keep_rate=0.5, seed=None,
             if added:
                 kept = sorted(kept + added,
                               key=lambda r: order[r["seq"]])
+        else:
+            # Chain parent is the previous step: a kept span whose
+            # predecessor was dropped is a parent gap. The first
+            # step is a root and has no parent to lose.
+            kept_seqs = {r["seq"] for r in kept}
+            for i, record in enumerate(steps):
+                if (i > 0 and record["seq"] in kept_seqs
+                        and steps[i - 1]["seq"] not in kept_seqs):
+                    parent_gaps += 1
 
     return kept, {
         "decision": decision,
@@ -178,6 +204,7 @@ def tail_sample_records(records, keep_rate=0.5, seed=None,
         "total_cost_usd": total_cost,
         "causal": causal,
         "causal_ancestors_kept": ancestors_kept,
+        "parent_gaps": parent_gaps,
     }
 
 
@@ -198,7 +225,10 @@ def export_tail_sampled_otlp(path, keep_rate=0.5, seed=None,
     span's parent is a span in the export. The parents are taken
     from the full log on purpose: recomputing them from the sampled
     subset could pair a result with a different call than the full
-    trace does. Without causal, spans keep chain parents as before.
+    trace does. Without causal, spans keep chain parents as before,
+    and a kept span whose chain parent was dropped is marked with
+    a blackbox.parent_sampled_out attribute and counted as
+    parent_gaps in the decision, so the gap is honest.
     """
     records = load_records(path)
     kept, decision = tail_sample_records(

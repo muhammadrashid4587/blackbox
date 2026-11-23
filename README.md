@@ -367,6 +367,14 @@ gone. Compaction works on `.jsonl` logs and `.db` stores.
   from the causal tree of the full log, so every non-root kept
   span's parent is a span in the export; the plain (non-causal)
   export is unchanged, done (v0.18.0).
+- Parent gaps in tail sampling: in a plain (non-causal) sampled
+  export a kept span whose chain parent was dropped keeps its
+  parentSpanId naming the real dropped parent and is marked with a
+  `blackbox.parent_sampled_out` attribute, and the decision counts
+  them as `parent_gaps` (0 for kept-all traces and for `--causal`
+  sampling, where closure guarantees every kept span's parent is
+  in the export); a full export has no gaps and is unchanged, done
+  (v0.19.0).
 
 ## Layout
 
@@ -387,7 +395,10 @@ blackbox/
                   the export summary, `blackbox tail-sample` CLI;
                   --causal closes a sampled trace under its causal
                   ancestors and takes span parents from the causal
-                  tree of the full log
+                  tree of the full log; plain sampling marks kept
+                  spans whose parent was dropped with
+                  blackbox.parent_sampled_out and counts them as
+                  parent_gaps in the decision
   query.py        query CLI: filter a session's steps by type,
                   model, tool, min tokens, min cost, errors only,
                   time range; --json and --count output modes
@@ -413,5 +424,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            223 tests, all passing
+tests/            229 tests, all passing
 ```

@@ -11,7 +11,7 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
-It also exposes the session as two resources, and six prompts:
+It also exposes the session as two resources, and seven prompts:
 
     blackbox://session        the session as a readable transcript
     blackbox://session.json   the session's records as JSON
@@ -40,6 +40,12 @@ It also exposes the session as two resources, and six prompts:
                               run: changed, added and removed steps,
                               per-model token and cost deltas, and
                               new vs fixed errors
+    summarize_retention       a prompt template for summarising the
+                              session's retention state: what earlier
+                              compactions removed, how much history
+                              is still in the log, and what the
+                              default retention rules would remove
+                              next
 
 Start it from the CLI:
 
@@ -63,7 +69,9 @@ same request over stdio, usable without the tool.
 import json
 import re
 import sys
+from datetime import datetime, timezone
 
+from .compact import _parse_ts, compact_log
 from .costs import cost_for
 from .recorder import Recorder
 from .redact import REDACTED
@@ -258,6 +266,28 @@ PROMPTS = [
             },
         ],
     },
+    {
+        "name": "summarize_retention",
+        "description": ("Summarise the recorded session's retention "
+                        "state: what earlier compactions removed, "
+                        "how much history is still in the log, and "
+                        "what the default retention rules would "
+                        "remove next."),
+        "arguments": [
+            {
+                "name": "keep_days",
+                "description": ("Days of history to keep in the "
+                                "--keep-days projection (default 30)."),
+                "required": False,
+            },
+            {
+                "name": "keep_n",
+                "description": ("Newest records to keep in the "
+                                "--keep-n projection (default 1000)."),
+                "required": False,
+            },
+        ],
+    },
 ]
 
 PROMPT_FOCUS_LINES = {
@@ -362,6 +392,24 @@ SUMMARIZE_DIFF_PROMPT = (
     "Diff:\n{diff}\n\n"
     "Run A transcript (this session):\n{transcript_a}\n\n"
     "Run B transcript (other run):\n{transcript_b}"
+)
+
+SUMMARIZE_RETENTION_PROMPT = (
+    "Summarise the retention state of this blackbox session: how "
+    "much history is still in the log, what earlier compactions "
+    "already removed (and what the checkpoint certifies about "
+    "them), and what the default retention rules would remove "
+    "next. The projections below are dry runs of `blackbox "
+    "compact --keep-days {keep_days}` and `blackbox compact "
+    "--keep-n {keep_n}` — nothing has been removed by asking "
+    "for this prompt. A checkpoint certifies only how many "
+    "records were removed and the head hash up to which they "
+    "existed; the removed records themselves are gone and "
+    "cannot be re-verified, so say what would be lost before "
+    "recommending a compaction, and whether the log looks safe "
+    "to compact or worth keeping whole.\n\n"
+    "Retention summary:\n{retention}\n\n"
+    "Session transcript:\n{transcript}"
 )
 
 
@@ -997,6 +1045,83 @@ class MCPServer:
                 lines.append("Error steps: same in both runs.")
         return "\n".join(lines)
 
+    def _retention_lines(self, keep_days=30, keep_n=1000):
+        """The session's retention / compaction state, as readable
+        lines.
+
+        Whether an earlier compaction already removed records
+        (and what its checkpoint certifies), how much history is
+        still in the log and how old it is, and what the default
+        retention rules would remove next — as dry runs of
+        `compact_log`, so asking for the summary removes nothing.
+        The checkpoint and the summary record are bookkeeping, not
+        steps; the projections count steps only.
+        """
+        records = load_records(self.log_path)
+        checkpoint = (records[0]
+                      if records and records[0].get("type") == "checkpoint"
+                      else None)
+        steps = [r for r in records
+                 if r["type"] not in ("summary", "checkpoint")]
+        if not steps and checkpoint is None:
+            return "No steps recorded yet."
+        lines = []
+        if checkpoint is not None:
+            payload = checkpoint.get("payload") or {}
+            head = payload.get("head_hash") or "?"
+            lines.append(
+                "Already compacted: %d record(s) were removed by "
+                "earlier compaction(s), certified by a checkpoint "
+                "(head hash %s..., cutoff %s, %s kept at the time)"
+                % (payload.get("compacted_count", 0), head[:16],
+                   payload.get("cutoff_ts") or "no date cutoff",
+                   payload.get("kept_count", "?")))
+            if payload.get("original_events") is not None:
+                lines.append(
+                    "  The checkpoint carries the dropped run's "
+                    "totals: %s events, %s tokens"
+                    % (payload["original_events"],
+                       payload.get("original_total_tokens", "?")))
+        else:
+            lines.append(
+                "Never compacted: no checkpoint record — the full "
+                "history is still in the log.")
+        if steps:
+            oldest = _parse_ts(steps[0]["ts"], steps[0]["seq"])
+            newest = _parse_ts(steps[-1]["ts"], steps[-1]["seq"])
+            now = datetime.now(timezone.utc)
+            lines.append(
+                "Log now: %d step(s), oldest %s (%.1f days ago), "
+                "newest %s, spanning %.1f day(s)"
+                % (len(steps), steps[0]["ts"],
+                   (now - oldest).total_seconds() / 86400,
+                   steps[-1]["ts"],
+                   (newest - oldest).total_seconds() / 86400))
+        else:
+            lines.append("Log now: no steps left — only the "
+                         "checkpoint.")
+        lines.append("Retention projections (dry run — nothing is "
+                     "removed):")
+        for label, kwargs in (
+                ("--keep-days %d" % keep_days,
+                 {"keep_days": keep_days}),
+                ("--keep-n %d" % keep_n, {"keep_n": keep_n})):
+            result = compact_log(self.log_path, dry_run=True, **kwargs)
+            if not result["changed"]:
+                lines.append("  %s: would remove nothing (%d step(s) "
+                             "kept)" % (label, result["kept"]))
+            else:
+                lines.append(
+                    "  %s: would remove %d record(s), keep %d; the "
+                    "new checkpoint would certify head hash %s..."
+                    % (label, result["compacted"], result["kept"],
+                       (result["head_hash"] or "")[:16]))
+        lines.append(
+            "Removed records are gone: the checkpoint certifies "
+            "only how many were removed and the head hash up to "
+            "which they existed — it cannot re-verify them.")
+        return "\n".join(lines)
+
     def _resources_read(self, msg_id, params):
         uri = params.get("uri")
         if uri == "blackbox://session":
@@ -1079,6 +1204,30 @@ class MCPServer:
                 diff=diff_text,
                 transcript_a=self._transcript(),
                 transcript_b=other_transcript)
+            return _result(msg_id, {
+                "description": description,
+                "messages": [{"role": "user",
+                              "content": {"type": "text", "text": text}}],
+            })
+        if name == "summarize_retention":
+            keep_days = arguments.get("keep_days", 30)
+            keep_n = arguments.get("keep_n", 1000)
+            for label, value in (("keep_days", keep_days),
+                                 ("keep_n", keep_n)):
+                if (not isinstance(value, int) or isinstance(value, bool)
+                        or value < 0):
+                    return _error(
+                        msg_id, INVALID_PARAMS,
+                        "%s must be a non-negative integer" % label)
+            try:
+                retention = self._retention_lines(
+                    keep_days=keep_days, keep_n=keep_n)
+            except (OSError, ValueError) as exc:
+                return _error(msg_id, INVALID_PARAMS,
+                              "cannot read session: %s" % exc)
+            text = SUMMARIZE_RETENTION_PROMPT.format(
+                keep_days=keep_days, keep_n=keep_n,
+                retention=retention, transcript=self._transcript())
             return _result(msg_id, {
                 "description": description,
                 "messages": [{"role": "user",

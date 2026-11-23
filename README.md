@@ -171,6 +171,15 @@ position, like `blackbox diff`), per-model token and cost deltas,
 and new vs fixed errors, with both transcripts included so the
 client can see the change in context. It takes the other run's
 log path as its `other_path` argument (.jsonl or .db).
+A seventh prompt, `summarize_retention`, hands the client a
+prompt for the session's retention state: what earlier
+compactions already removed (and what the checkpoint certifies
+about them — the removed count and the head hash, never the
+removed records themselves), how much history is still in the
+log and how old it is, and what `blackbox compact --keep-days`
+and `--keep-n` would remove next, as dry runs — asking for the
+prompt removes nothing. It takes optional `keep_days` (default
+30) and `keep_n` (default 1000) arguments for the projections.
 Point a client at that command as a stdio server. Closing the server
 (EOF / Ctrl-C) writes the summary record, like closing a Recorder.
 
@@ -322,7 +331,7 @@ gone. Compaction works on `.jsonl` logs and `.db` stores.
 
 ## Measured
 
-- 241 tests, all passing (`make test`).
+- 246 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -418,6 +427,16 @@ gone. Compaction works on `.jsonl` logs and `.db` stores.
   other run's log path as its `other_path` argument, and
   `diff_records` in `replay.py` is the same comparison as a
   pure function with no printing, done (v0.22.0).
+- Seventh MCP prompt: `summarize_retention` hands the client a
+  prompt for the session's retention state — what earlier
+  compactions removed (certified by the checkpoint: removed
+  count, head hash, cutoff, kept count, and the dropped run's
+  event/token totals), how much history is still in the log and
+  how old it is, and what `blackbox compact --keep-days` and
+  `--keep-n` would remove next, computed as dry runs of
+  `compact_log` so asking for the prompt removes nothing; it
+  takes optional `keep_days` (default 30) and `keep_n`
+  (default 1000) arguments, done (v0.23.0).
 
 ## Layout
 
@@ -430,8 +449,8 @@ blackbox/
   mcp_server.py   MCP server on stdio: record / verify / replay tools,
                   session resources, analyze_session,
                   summarize_costs, summarize_anomalies,
-                  summarize_sampling, summarize_trace and
-                  summarize_diff prompts,
+                  summarize_sampling, summarize_trace,
+                  summarize_diff and summarize_retention prompts,
                   blackbox_sample tool (MCP sampling)
   sampling.py     MCP sampling client: Sampler, StdioTransport,
                   SamplingError / NotSupported / Declined
@@ -469,5 +488,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            241 tests, all passing
+tests/            246 tests, all passing
 ```

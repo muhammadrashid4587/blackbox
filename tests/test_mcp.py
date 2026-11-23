@@ -168,7 +168,8 @@ class MCPServerTest(unittest.TestCase):
         self.assertEqual([p["name"] for p in prompts],
                          ["analyze_session", "summarize_costs",
                           "summarize_anomalies", "summarize_sampling",
-                          "summarize_trace", "summarize_diff"])
+                          "summarize_trace", "summarize_diff",
+                          "summarize_retention"])
         self.assertEqual(prompts[0]["arguments"][0]["name"], "focus")
         self.assertFalse(prompts[0]["arguments"][0]["required"])
         self.assertEqual(prompts[1]["arguments"], [])
@@ -178,6 +179,11 @@ class MCPServerTest(unittest.TestCase):
         self.assertEqual(prompts[5]["arguments"][0]["name"],
                          "other_path")
         self.assertTrue(prompts[5]["arguments"][0]["required"])
+        self.assertEqual(
+            [a["name"] for a in prompts[6]["arguments"]],
+            ["keep_days", "keep_n"])
+        self.assertFalse(prompts[6]["arguments"][0]["required"])
+        self.assertFalse(prompts[6]["arguments"][1]["required"])
 
     def test_prompts_get_includes_transcript_and_verification(self):
         self._init()
@@ -615,6 +621,81 @@ class MCPServerTest(unittest.TestCase):
                       "arguments": {"other_path": os.path.join(
                           self.tmp.name, "nope.jsonl")}}))
         self.assertEqual(response["error"]["code"], -32602)
+
+    def test_prompts_get_summarize_retention(self):
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "prompts/get",
+                     {"name": "summarize_retention"}))
+        message = response["result"]["messages"][0]
+        self.assertEqual(message["role"], "user")
+        text = message["content"]["text"]
+        self.assertIn("Never compacted", text)
+        self.assertIn("Log now: 4 step(s)", text)
+        self.assertIn("spanning 0.0 day(s)", text)
+        self.assertIn("--keep-days 30: would remove nothing "
+                      "(4 step(s) kept)", text)
+        self.assertIn("--keep-n 1000: would remove nothing "
+                      "(4 step(s) kept)", text)
+        self.assertIn("Removed records are gone", text)
+        self.assertIn("dry runs", text)
+        self.assertIn("search", text)  # transcript included too
+
+    def test_prompts_get_summarize_retention_keep_n_argument(self):
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "prompts/get",
+                     {"name": "summarize_retention",
+                      "arguments": {"keep_n": 2}}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("--keep-days 30: would remove nothing "
+                      "(4 step(s) kept)", text)
+        self.assertIn("--keep-n 2: would remove 2 record(s), keep 2",
+                      text)
+        self.assertIn("new checkpoint would certify head hash", text)
+
+    def test_prompts_get_summarize_retention_compacted(self):
+        self._init()
+        self._record_session()
+        self.server.close()
+        from blackbox.compact import compact_log
+        result = compact_log(self.path, keep_n=2)
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["compacted"], 2)
+        self.server = MCPServer(self.path, task="mcp test")
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "prompts/get",
+                     {"name": "summarize_retention"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Already compacted: 2 record(s) were removed",
+                      text)
+        self.assertIn("certified by a checkpoint", text)
+        self.assertIn("The checkpoint carries the dropped run's "
+                      "totals: 4 events, 1690 tokens", text)
+        self.assertIn("Log now: 2 step(s)", text)
+        self.assertIn("--keep-n 1000: would remove nothing "
+                      "(2 step(s) kept)", text)
+
+    def test_prompts_get_summarize_retention_empty_session(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "prompts/get",
+                     {"name": "summarize_retention"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("No steps recorded yet.", text)
+
+    def test_prompts_get_summarize_retention_bad_arguments(self):
+        self._init()
+        for arguments in ({"keep_days": -1}, {"keep_n": -5},
+                          {"keep_days": "30"}, {"keep_n": 2.5}):
+            response = self.server.handle_message(
+                _request(2, "prompts/get",
+                         {"name": "summarize_retention",
+                          "arguments": arguments}))
+            self.assertEqual(response["error"]["code"], -32602)
 
     def test_resources_read_before_initialize_is_rejected(self):
         response = self.server.handle_message(

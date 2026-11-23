@@ -11,6 +11,7 @@
     python -m blackbox query data/run.jsonl --model gpt-5 --min-cost 0.01
     python -m blackbox trace data/run.jsonl  # causal parent-child tree
     python -m blackbox compact data/run.jsonl --keep-days 30  # retention
+    python -m blackbox aggregates data/run.jsonl  # per-session totals
     python -m blackbox compact data/run.jsonl --keep-n 1000
 
 Any command takes a .jsonl log or a .db SQLite store.
@@ -20,6 +21,7 @@ import argparse
 import json
 import sys
 
+from .aggregates import aggregates_log
 from .compact import compact_log
 from .live_export import DEFAULT_OTLP_ENDPOINT, OtlpHttpExporter
 from .mcp_server import serve_stdio
@@ -150,6 +152,14 @@ def main(argv=None):
                          help="print the nested tree as JSON instead of "
                          "an indented tree")
 
+    p_aggregates = sub.add_parser(
+        "aggregates", help="print per-session totals: steps, duration, "
+        "per-model tokens and cost, per-tool calls, errors, slowest step")
+    p_aggregates.add_argument("logfile")
+    p_aggregates.add_argument("--json", action="store_true", dest="as_json",
+                              help="print the aggregates as JSON instead "
+                              "of a report")
+
     p_compact = sub.add_parser(
         "compact", help="retention: drop old records and anchor them "
         "with a hash-chain checkpoint, so verify still passes on the "
@@ -256,6 +266,9 @@ def main(argv=None):
         return 0
     if args.command == "trace":
         trace_log(args.logfile, as_json=args.as_json)
+        return 0
+    if args.command == "aggregates":
+        aggregates_log(args.logfile, as_json=args.as_json)
         return 0
     if args.command == "compact":
         try:

@@ -319,6 +319,19 @@ records existed up to a given head hash and were removed — it does
 not let anyone re-verify the removed records themselves; they are
 gone. Compaction works on `.jsonl` logs and `.db` stores.
 
+**Session aggregates.** `python -m blackbox aggregates data/run.jsonl`
+prints the session at a glance: step count, start/end and duration,
+per-type and per-tool counts, per-model calls, tokens and cost (cost
+`None` for a model with no known price or no input/output split,
+never a guessed number), total tokens and priced cost, error steps,
+the slowest step (time until the next step), and how many records an
+earlier compaction removed. `--json` prints the same totals as JSON.
+`session_aggregates` in `aggregates.py` is the same computation as a
+pure function over a list of records, read-only — it removes or
+changes nothing — so a later MCP prompt can hand the client the
+session summary instead of the whole transcript. It works on
+`.jsonl` logs and `.db` stores.
+
 ## What it is not
 
 - Not a hosted platform. There is nothing to sign up for and nowhere
@@ -331,7 +344,7 @@ gone. Compaction works on `.jsonl` logs and `.db` stores.
 
 ## Measured
 
-- 246 tests, all passing (`make test`).
+- 259 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -437,6 +450,14 @@ gone. Compaction works on `.jsonl` logs and `.db` stores.
   `compact_log` so asking for the prompt removes nothing; it
   takes optional `keep_days` (default 30) and `keep_n`
   (default 1000) arguments, done (v0.23.0).
+- Session aggregates: `session_aggregates` in `aggregates.py`
+  computes per-session totals from the records — step count,
+  duration, per-type and per-tool counts, per-model calls, tokens
+  and cost, error steps, the slowest step, and how many records an
+  earlier compaction removed — read-only, with a `blackbox
+  aggregates` CLI command (report or `--json`), done (v0.24.0).
+  Next: an eighth MCP prompt, `summarize_aggregates`, over these
+  totals.
 
 ## Layout
 
@@ -472,6 +493,10 @@ blackbox/
   compact.py      retention / compaction: drop old records, anchor
                   them with a hash-chain checkpoint record (head
                   hash, removed count, cutoff); `blackbox compact` CLI
+  aggregates.py   session aggregates: per-session totals (steps,
+                  duration, per-model tokens/cost, per-tool calls,
+                  errors, slowest step) as a pure function and a
+                  `blackbox aggregates` CLI command
   otel.py         OpenTelemetry export: records to OTLP/JSON spans,
                   trace/span ids from the hash chain, round-trip, and
                   OTLP Sum metrics (per-model calls, tokens, latency,
@@ -485,8 +510,9 @@ blackbox/
   replay.py       transcript printer + run diff
   __main__.py     CLI: verify | replay | diff | mcp | otel | export
                   | metrics | tail-sample | query | trace | compact
+                  | aggregates
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            246 tests, all passing
+tests/            259 tests, all passing
 ```

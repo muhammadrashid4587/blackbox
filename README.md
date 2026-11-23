@@ -199,7 +199,21 @@ carry the seq, type, hashes, tokens, model/tool names and the full
 payload, and each span runs from its step's timestamp to the next
 step's. The summary record is not a span. `spans_to_records` in
 `otel.py` rebuilds the steps from the spans, so an exported trace
-can be checked back against the log it came from.
+can be checked back against the log it came from. With `--causal`
+(`blackbox otel --causal`, `blackbox export --causal`, also for
+`--live`), each span's parent comes from the causal trace
+reconstruction instead of the hash chain, so the exported trace
+reconstructs the same parent-child tree as `blackbox trace` —
+tool_results hang off their tool_calls, tool_calls off the
+model_call that decided them — and each span carries a
+`blackbox.causal_parent` attribute marking the parent as
+reconstructed. The default export is unchanged. The limits are the
+trace reconstruction's: the links are inferred from step order, not
+recorded, so a result for a tool called twice in a row pairs with
+the earlier call by FIFO order, and an orphaned result falls back
+to the previous step. Note the background `LiveExporter` (spans
+sent as they are recorded) still uses chain parents: a causal
+parent needs the full trace, which is only known after the run.
 
 **Live OTLP export.** `python -m blackbox export data/run.jsonl
 --live` POSTs the same spans to an OTLP/HTTP collector instead of
@@ -277,7 +291,7 @@ gone. Compaction works on `.jsonl` logs and `.db` stores.
 
 ## Measured
 
-- 203 tests, all passing (`make test`).
+- 214 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -329,6 +343,13 @@ gone. Compaction works on `.jsonl` logs and `.db` stores.
   count, cutoff) that becomes the new genesis of the hash chain, so
   `verify` still passes and tampering after compaction is still
   caught; `--dry-run` reports without writing, done (v0.16.0).
+- Causal parents in the OTLP export: `blackbox otel --causal` /
+  `blackbox export --causal` sets each span's parentSpanId from the
+  causal trace reconstruction (`link_parents`) instead of the hash
+  chain, so the exported trace is the same parent-child tree
+  `blackbox trace` prints, with a `blackbox.causal_parent`
+  attribute on each span marking the parent as reconstructed; the
+  default export is unchanged, done (v0.17.0).
 
 ## Layout
 
@@ -359,7 +380,8 @@ blackbox/
   otel.py         OpenTelemetry export: records to OTLP/JSON spans,
                   trace/span ids from the hash chain, round-trip, and
                   OTLP Sum metrics (per-model calls, tokens, latency,
-                  cost; per-tool calls)
+                  cost; per-tool calls); --causal parents from the
+                  causal trace reconstruction
   live_export.py  live OTLP export: POST spans to a collector over
                   HTTP with retry/backoff, background batching
                   thread, Recorder integration, `export --live` CLI
@@ -371,5 +393,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            203 tests, all passing
+tests/            214 tests, all passing
 ```

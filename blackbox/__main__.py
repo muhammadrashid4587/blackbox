@@ -57,6 +57,11 @@ def main(argv=None):
     p_otel.add_argument("logfile")
     p_otel.add_argument("--out", help="write JSON here (default: stdout)")
     p_otel.add_argument("--service-name", default="blackbox")
+    p_otel.add_argument("--causal", action="store_true",
+                        help="parent spans from the causal trace "
+                        "(tool_result -> tool_call, tool_call -> "
+                        "model_call) instead of the hash chain; "
+                        "same tree as `blackbox trace`")
 
     p_metrics = sub.add_parser(
         "metrics", help="export a log as OTLP/JSON metrics (per-model "
@@ -91,6 +96,11 @@ def main(argv=None):
     p_export.add_argument("logfile")
     p_export.add_argument("--out", help="write JSON here (default: stdout)")
     p_export.add_argument("--service-name", default="blackbox")
+    p_export.add_argument("--causal", action="store_true",
+                          help="parent spans from the causal trace "
+                          "instead of the hash chain (same tree as "
+                          "`blackbox trace`); applies to the file "
+                          "export and to --live")
     p_export.add_argument("--live", action="store_true",
                           help="POST the spans to an OTLP/HTTP collector")
     p_export.add_argument("--otlp-endpoint", default=DEFAULT_OTLP_ENDPOINT,
@@ -160,7 +170,8 @@ def main(argv=None):
         serve_stdio(args.logfile, task=args.task, model=args.model)
         return 0
     if args.command == "otel":
-        data = export_otlp(args.logfile, args.service_name)
+        data = export_otlp(args.logfile, args.service_name,
+                           causal=args.causal)
         text = json.dumps(data, indent=2) + "\n"
         if args.out:
             with open(args.out, "w", encoding="utf-8") as f:
@@ -204,7 +215,7 @@ def main(argv=None):
                 args.otlp_endpoint, timeout=args.timeout,
                 max_retries=args.max_retries,
                 service_name=args.service_name)
-            ok = exporter.export_log(args.logfile)
+            ok = exporter.export_log(args.logfile, causal=args.causal)
             if ok:
                 print("exported %d spans to %s"
                       % (exporter.exported_spans, args.otlp_endpoint))
@@ -212,7 +223,8 @@ def main(argv=None):
             print("export failed: %s" % exporter.last_error,
                   file=sys.stderr)
             return 1
-        data = export_otlp(args.logfile, args.service_name)
+        data = export_otlp(args.logfile, args.service_name,
+                           causal=args.causal)
         text = json.dumps(data, indent=2) + "\n"
         if args.out:
             with open(args.out, "w", encoding="utf-8") as f:

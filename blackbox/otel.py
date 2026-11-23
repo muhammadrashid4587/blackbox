@@ -28,6 +28,21 @@ rebuilds each step's seq, timestamp, type, payload, tokens and hashes
 from the span attributes, so an exported trace can be checked back
 against the log it came from.
 
+Causal parents: `records_to_spans(..., causal=True)` (or
+`blackbox otel --causal` / `blackbox export --causal`) sets each
+span's parentSpanId from `trace.link_parents` instead of the hash
+chain, so the exported trace reconstructs the same parent-child
+tree as `blackbox trace`: a tool_result hangs off the tool_call it
+answers, a tool_call off the model_call that decided it, a
+model_call off the previous step. Spans in a causal export carry a
+`blackbox.causal_parent` attribute, so the reconstruction is visible
+in the export itself. The default export is unchanged (chain
+parents). The limits are the same as the trace reconstruction's:
+the links are inferred from step order, not recorded, so a
+tool_result for a tool called twice in a row pairs with the earlier
+call by FIFO order, and an orphaned result falls back to the
+previous step.
+
 Metrics (records_to_metrics / export_otlp_metrics) are the same
 session as OTLP Sum metrics: per-model call counts, input/output
 token totals, latency (time until the next step, in ms) and cost in
@@ -43,10 +58,15 @@ from datetime import datetime, timedelta, timezone
 from . import __version__
 from .costs import cost_for
 from .replay import load_records
+from .trace import link_parents
 
 SERVICE_NAME = "blackbox"
 SCOPE_NAME = "blackbox"
 _MIN_SPAN = timedelta(milliseconds=1)
+
+# Sentinel for record_to_span: parent from the hash chain (the
+# default), as opposed to an explicit span id or None (a root).
+_CHAIN_PARENT = object()
 
 
 def _parse_ts(ts):
@@ -81,8 +101,16 @@ def _tokens_total(tokens):
     return None
 
 
-def record_to_span(record, trace_id, end=None):
-    """One record as an OTLP span dict. `end` is the span end time."""
+def record_to_span(record, trace_id, end=None, parent_span_id=_CHAIN_PARENT,
+                   causal=False):
+    """One record as an OTLP span dict. `end` is the span end time.
+
+    `parent_span_id` overrides the chain parent: a span id string
+    for an explicit parent, None for a root (no parentSpanId). Left
+    at the default, the parent is the previous record's hash, as
+    before. `causal` marks the span as carrying a reconstructed
+    parent (see records_to_spans).
+    """
     payload = record.get("payload") or {}
     event_type = record["type"]
     start = _parse_ts(record["ts"])
@@ -117,6 +145,8 @@ def record_to_span(record, trace_id, end=None):
         attributes.append(_attr("gen_ai.request.model", payload["model"]))
     if event_type in ("tool_call", "tool_result") and payload.get("tool"):
         attributes.append(_attr("tool.name", payload["tool"]))
+    if causal:
+        attributes.append(_attr("blackbox.causal_parent", True))
 
     span = {
         "traceId": trace_id,
@@ -128,17 +158,28 @@ def record_to_span(record, trace_id, end=None):
         "attributes": attributes,
         "status": {},
     }
-    if record["prev_hash"] != "0" * 64:
-        span["parentSpanId"] = record["prev_hash"][:16]
+    if parent_span_id is _CHAIN_PARENT:
+        if record["prev_hash"] != "0" * 64:
+            span["parentSpanId"] = record["prev_hash"][:16]
+    elif parent_span_id is not None:
+        span["parentSpanId"] = parent_span_id
     return span
 
 
-def records_to_spans(records, service_name=SERVICE_NAME):
-    """A list of records as OTLP span dicts (summary excluded)."""
+def records_to_spans(records, service_name=SERVICE_NAME, causal=False):
+    """A list of records as OTLP span dicts (summary excluded).
+
+    With causal=True, each span's parent comes from
+    trace.link_parents — the same parent-child tree `blackbox trace`
+    prints — instead of the previous record in the hash chain. The
+    default (causal=False) keeps the chain parents.
+    """
     steps = [r for r in records if r["type"] != "summary"]
     if not steps:
         return []
     trace_id = steps[0]["hash"][:32]
+    parents = link_parents(records) if causal else None
+    by_seq = {r["seq"]: r for r in steps} if causal else None
     spans = []
     for i, record in enumerate(steps):
         if i + 1 < len(steps):
@@ -147,7 +188,16 @@ def records_to_spans(records, service_name=SERVICE_NAME):
             end = _parse_ts(records[-1]["ts"])
         else:
             end = None
-        spans.append(record_to_span(record, trace_id, end=end))
+        if causal:
+            parent_seq = parents.get(record["seq"])
+            parent_span_id = (by_seq[parent_seq]["hash"][:16]
+                              if parent_seq is not None
+                              and parent_seq in by_seq else None)
+            spans.append(record_to_span(record, trace_id, end=end,
+                                        parent_span_id=parent_span_id,
+                                        causal=True))
+        else:
+            spans.append(record_to_span(record, trace_id, end=end))
     return spans
 
 
@@ -293,8 +343,12 @@ def export_otlp_metrics_file(path, out_path, service_name=SERVICE_NAME):
     return data
 
 
-def export_otlp(path, service_name=SERVICE_NAME):
-    """A log file as an OTLP/JSON dict. Works on .jsonl and .db logs."""
+def export_otlp(path, service_name=SERVICE_NAME, causal=False):
+    """A log file as an OTLP/JSON dict. Works on .jsonl and .db logs.
+
+    With causal=True, span parents come from the causal trace
+    reconstruction instead of the hash chain (see records_to_spans).
+    """
     records = load_records(path)
     return {
         "resourceSpans": [{
@@ -303,15 +357,17 @@ def export_otlp(path, service_name=SERVICE_NAME):
             ]},
             "scopeSpans": [{
                 "scope": {"name": SCOPE_NAME, "version": __version__},
-                "spans": records_to_spans(records, service_name),
+                "spans": records_to_spans(records, service_name,
+                                          causal=causal),
             }],
         }],
     }
 
 
-def export_otlp_file(path, out_path, service_name=SERVICE_NAME):
+def export_otlp_file(path, out_path, service_name=SERVICE_NAME,
+                     causal=False):
     """Write a log's OTLP/JSON export to a file. Returns the dict."""
-    data = export_otlp(path, service_name)
+    data = export_otlp(path, service_name, causal=causal)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")

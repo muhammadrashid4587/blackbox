@@ -131,12 +131,14 @@ class OtlpHttpExporter:
         """POST spans built from records. True on a 2xx response."""
         return self.export_spans(records_to_spans(records))
 
-    def export_log(self, path):
+    def export_log(self, path, causal=False):
         """POST a whole log's spans (summary excluded, as in otel.py).
 
-        Returns True only when the collector answered 2xx.
+        With causal=True, span parents come from the causal trace
+        reconstruction instead of the hash chain. Returns True only
+        when the collector answered 2xx.
         """
-        data = export_otlp(path, self.service_name)
+        data = export_otlp(path, self.service_name, causal=causal)
         spans = data["resourceSpans"][0]["scopeSpans"][0]["spans"]
         return self.post_payload(data, span_count=len(spans))
 

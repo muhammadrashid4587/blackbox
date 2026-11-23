@@ -11,7 +11,7 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
-It also exposes the session as two resources, and five prompts:
+It also exposes the session as two resources, and six prompts:
 
     blackbox://session        the session as a readable transcript
     blackbox://session.json   the session's records as JSON
@@ -35,6 +35,11 @@ It also exposes the session as two resources, and five prompts:
                               slowest steps, error steps, parent gaps,
                               and per-tool / per-model cost and token
                               totals
+    summarize_diff            a prompt template for summarising what
+                              changed between this session and another
+                              run: changed, added and removed steps,
+                              per-model token and cost deltas, and
+                              new vs fixed errors
 
 Start it from the CLI:
 
@@ -62,7 +67,7 @@ import sys
 from .costs import cost_for
 from .recorder import Recorder
 from .redact import REDACTED
-from .replay import _short, format_record, load_records
+from .replay import (_short, diff_records, format_record, load_records)
 from .sampling import (Sampler, SamplingDeclinedError, SamplingError,
                        SamplingNotSupportedError, StdioTransport)
 from .tail_sampling import (_is_error, _span_durations_ms,
@@ -237,6 +242,22 @@ PROMPTS = [
                         "totals."),
         "arguments": [],
     },
+    {
+        "name": "summarize_diff",
+        "description": ("Summarise what changed between the recorded "
+                        "session and another run: changed, added and "
+                        "removed steps, per-model token and cost "
+                        "deltas, and new vs fixed errors."),
+        "arguments": [
+            {
+                "name": "other_path",
+                "description": ("Path to the second run's log "
+                                "(.jsonl or .db) to compare this "
+                                "session against."),
+                "required": True,
+            },
+        ],
+    },
 ]
 
 PROMPT_FOCUS_LINES = {
@@ -323,6 +344,30 @@ SUMMARIZE_TRACE_PROMPT = (
     "Trace summary:\n{trace}\n\n"
     "Session transcript:\n{transcript}"
 )
+
+SUMMARIZE_DIFF_PROMPT = (
+    "Summarise what changed between two blackbox runs of the same "
+    "task: run A is this session, run B is the other run. The diff "
+    "below is position-by-position, like `blackbox diff`: a step "
+    "at the same position with a different payload is changed, "
+    "extra steps in run B are added, steps missing from run B "
+    "are removed. Say what the agent did differently in run B, "
+    "whether the change looks like progress or a regression, and "
+    "what drove the token and cost deltas. Prices are the "
+    "providers' published list prices and are estimates, not a "
+    "bill; calls with no input/output token split, or a model "
+    "with no published price, are unpriced, never guessed. "
+    "Error steps are compared by position: a new error is one "
+    "run B has where run A had none, a fixed error the reverse.\n\n"
+    "Diff:\n{diff}\n\n"
+    "Run A transcript (this session):\n{transcript_a}\n\n"
+    "Run B transcript (other run):\n{transcript_b}"
+)
+
+
+def _usd(cost):
+    """A USD amount with no trailing zeros: 0.0049, not 0.004900."""
+    return ("%.6f" % cost).rstrip("0").rstrip(".")
 
 
 def _tree_depth(node):
@@ -516,20 +561,21 @@ class MCPServer:
         records = load_records(self.log_path)
         return "\n".join(format_record(r) for r in records)
 
-    def _cost_lines(self):
-        """Per-model token usage and USD cost, as readable lines.
+    def _model_usage(self, records, default_model=None):
+        """Per-model token usage for a list of records.
 
-        Computed from the recorded model_call records, with the same
-        rules as the Recorder's summary: a plain int token count has
-        no input/output split and is not priced, and an unknown model
-        costs None, never a guessed number.
+        Same rules as the Recorder's summary: a plain int token
+        count has no input/output split and is not priced, and an
+        unknown model costs None, never a guessed number. A
+        model_call with no model in its payload falls back to
+        `default_model` (the session's model, when there is one).
         """
         usage = {}
-        for record in load_records(self.log_path):
+        for record in records:
             if record.get("type") != "model_call":
                 continue
             model = ((record.get("payload") or {}).get("model")
-                     or self.recorder.model)
+                     or default_model)
             if not model:
                 continue
             entry = usage.setdefault(
@@ -543,6 +589,18 @@ class MCPServer:
                     entry["output_tokens"] += tokens["output"]
             elif isinstance(tokens, int):
                 entry["tokens"] += tokens
+        return usage
+
+    def _cost_lines(self):
+        """Per-model token usage and USD cost, as readable lines.
+
+        Computed from the recorded model_call records, with the same
+        rules as the Recorder's summary: a plain int token count has
+        no input/output split and is not priced, and an unknown model
+        costs None, never a guessed number.
+        """
+        usage = self._model_usage(load_records(self.log_path),
+                                  default_model=self.recorder.model)
         if not usage:
             return "No model calls recorded yet."
         lines = []
@@ -562,8 +620,7 @@ class MCPServer:
                 cost = cost_for(model, entry["input_tokens"],
                                 entry["output_tokens"])
             if cost is not None:
-                parts.append("$%s" % ("%.6f" % cost).rstrip("0")
-                             .rstrip("."))
+                parts.append("$%s" % _usd(cost))
                 total += cost
                 priced_any = True
             elif entry["input_tokens"] or entry["output_tokens"]:
@@ -573,8 +630,7 @@ class MCPServer:
                 parts.append("not priced: no input/output split")
             lines.append("%s: %s" % (model, ", ".join(parts)))
         if priced_any:
-            lines.append("Total priced cost: $%s"
-                         % ("%.6f" % total).rstrip("0").rstrip("."))
+            lines.append("Total priced cost: $%s" % _usd(total))
         return "\n".join(lines)
 
     def _anomaly_lines(self):
@@ -820,6 +876,127 @@ class MCPServer:
         _tree_lines(roots, 0, lines)
         return "\n".join(lines)
 
+    def _diff_lines(self, other_path):
+        """What changed between this session (run A) and another
+        run (run B), as readable lines.
+
+        Position-by-position, like `blackbox diff` (and using the
+        same `diff_records`): a step at the same position with a
+        different payload is changed, extra steps in run B are
+        added, steps missing from run B are removed. Token and
+        cost deltas are per model, with the same pricing rules as
+        the cost summary — a plain int token count has no
+        input/output split and is not priced, an unknown model
+        costs None, never a guessed number. Error steps are
+        compared by position too: an error run B has where run A
+        had none is new, one run A had that run B does not is
+        fixed. The summary record is skipped in both runs — it is
+        bookkeeping, not a step.
+        """
+        records_a = load_records(self.log_path)
+        records_b = load_records(other_path)
+        steps_a = [r for r in records_a if r["type"] != "summary"]
+        steps_b = [r for r in records_b if r["type"] != "summary"]
+        if not steps_a and not steps_b:
+            return "No steps in either run."
+        findings = diff_records(records_a, records_b)
+        lines = []
+        lines.append(
+            "Run A (this session): %d steps, %d tokens; run B "
+            "(other run): %d steps, %d tokens (token diff %+d)"
+            % (len(steps_a), findings["tokens_a"],
+               len(steps_b), findings["tokens_b"],
+               findings["tokens_b"] - findings["tokens_a"]))
+        if (not findings["changed"] and not findings["added"]
+                and not findings["removed"]):
+            lines.append("IDENTICAL: %d steps match" % len(steps_a))
+        for i in findings["changed"]:
+            lines.append("CHANGED step %d:" % i)
+            lines.append("  A: %s" % format_record(steps_a[i])
+                         .replace("\n", "\n  "))
+            lines.append("  B: %s" % format_record(steps_b[i])
+                         .replace("\n", "\n  "))
+        for i in findings["added"]:
+            lines.append("ADDED step %d (only in run B): %s"
+                         % (i, format_record(steps_b[i])
+                            .replace("\n", " ")))
+        for i in findings["removed"]:
+            lines.append("REMOVED step %d (only in run A): %s"
+                         % (i, format_record(steps_a[i])
+                            .replace("\n", " ")))
+        usage_a = self._model_usage(
+            records_a, default_model=self.recorder.model)
+        usage_b = self._model_usage(records_b)
+        models = sorted(set(usage_a) | set(usage_b))
+        if models:
+            lines.append("Cost and token deltas (per model):")
+            empty = {"input_tokens": 0, "output_tokens": 0,
+                     "tokens": 0}
+            for model in models:
+                entry_a = usage_a.get(model, empty)
+                entry_b = usage_b.get(model, empty)
+                tokens_a = (entry_a["input_tokens"]
+                            + entry_a["output_tokens"]
+                            + entry_a["tokens"])
+                tokens_b = (entry_b["input_tokens"]
+                            + entry_b["output_tokens"]
+                            + entry_b["tokens"])
+                cost_a = (cost_for(model, entry_a["input_tokens"],
+                                   entry_a["output_tokens"])
+                          if entry_a["input_tokens"]
+                          or entry_a["output_tokens"] else None)
+                cost_b = (cost_for(model, entry_b["input_tokens"],
+                                   entry_b["output_tokens"])
+                          if entry_b["input_tokens"]
+                          or entry_b["output_tokens"] else None)
+                cost_text_a = ("$%s" % _usd(cost_a)
+                               if cost_a is not None else "unpriced")
+                cost_text_b = ("$%s" % _usd(cost_b)
+                               if cost_b is not None else "unpriced")
+                if cost_a is not None and cost_b is not None:
+                    delta = cost_b - cost_a
+                    if delta >= 0:
+                        delta_text = "+$%s" % _usd(delta)
+                    else:
+                        delta_text = "-$%s" % _usd(-delta)
+                    cost_text = "%s -> %s (%s)" % (
+                        cost_text_a, cost_text_b, delta_text)
+                else:
+                    cost_text = "%s -> %s (cost delta unknown: " \
+                        "unpriced in one run)" % (cost_text_a,
+                                                  cost_text_b)
+                lines.append(
+                    "  %s: %d tokens -> %d tokens (%+d), %s"
+                    % (model, tokens_a, tokens_b, tokens_b - tokens_a,
+                       cost_text))
+        new_errors = []
+        fixed_errors = []
+        for i in range(max(len(steps_a), len(steps_b))):
+            error_a = i < len(steps_a) and _is_error(steps_a[i])
+            error_b = i < len(steps_b) and _is_error(steps_b[i])
+            if error_b and not error_a:
+                new_errors.append(steps_b[i])
+            elif error_a and not error_b:
+                fixed_errors.append(steps_a[i])
+        errors_a = [r for r in steps_a if _is_error(r)]
+        errors_b = [r for r in steps_b if _is_error(r)]
+        if not errors_a and not errors_b:
+            lines.append("Error steps: none in either run.")
+        else:
+            if new_errors:
+                lines.append("New errors (in run B, not run A):")
+                for record in new_errors:
+                    lines.append("  step %d: %s"
+                                 % (record["seq"], _label(record)))
+            if fixed_errors:
+                lines.append("Errors fixed (in run A, not run B):")
+                for record in fixed_errors:
+                    lines.append("  step %d: %s"
+                                 % (record["seq"], _label(record)))
+            if not new_errors and not fixed_errors:
+                lines.append("Error steps: same in both runs.")
+        return "\n".join(lines)
+
     def _resources_read(self, msg_id, params):
         uri = params.get("uri")
         if uri == "blackbox://session":
@@ -877,6 +1054,31 @@ class MCPServer:
             text = SUMMARIZE_TRACE_PROMPT.format(
                 trace=self._trace_lines(),
                 transcript=self._transcript())
+            return _result(msg_id, {
+                "description": description,
+                "messages": [{"role": "user",
+                              "content": {"type": "text", "text": text}}],
+            })
+        if name == "summarize_diff":
+            other_path = arguments.get("other_path")
+            if (not isinstance(other_path, str) or not other_path):
+                return _error(
+                    msg_id, INVALID_PARAMS,
+                    "summarize_diff needs an 'other_path' argument: "
+                    "the path of the second run's log")
+            try:
+                diff_text = self._diff_lines(other_path)
+                other_transcript = "\n".join(
+                    format_record(r)
+                    for r in load_records(other_path))
+            except (OSError, ValueError) as exc:
+                return _error(
+                    msg_id, INVALID_PARAMS,
+                    "cannot read run B (%s): %s" % (other_path, exc))
+            text = SUMMARIZE_DIFF_PROMPT.format(
+                diff=diff_text,
+                transcript_a=self._transcript(),
+                transcript_b=other_transcript)
             return _result(msg_id, {
                 "description": description,
                 "messages": [{"role": "user",

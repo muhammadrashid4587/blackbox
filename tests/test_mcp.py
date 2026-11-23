@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 
+from blackbox import Recorder
 from blackbox.mcp_server import MCPServer
 from blackbox.replay import load_records
 from blackbox.verify import verify
@@ -167,13 +168,16 @@ class MCPServerTest(unittest.TestCase):
         self.assertEqual([p["name"] for p in prompts],
                          ["analyze_session", "summarize_costs",
                           "summarize_anomalies", "summarize_sampling",
-                          "summarize_trace"])
+                          "summarize_trace", "summarize_diff"])
         self.assertEqual(prompts[0]["arguments"][0]["name"], "focus")
         self.assertFalse(prompts[0]["arguments"][0]["required"])
         self.assertEqual(prompts[1]["arguments"], [])
         self.assertEqual(prompts[2]["arguments"], [])
         self.assertEqual(prompts[3]["arguments"], [])
         self.assertEqual(prompts[4]["arguments"], [])
+        self.assertEqual(prompts[5]["arguments"][0]["name"],
+                         "other_path")
+        self.assertTrue(prompts[5]["arguments"][0]["required"])
 
     def test_prompts_get_includes_transcript_and_verification(self):
         self._init()
@@ -485,6 +489,132 @@ class MCPServerTest(unittest.TestCase):
                      {"name": "summarize_trace"}))
         text = response["result"]["messages"][0]["content"]["text"]
         self.assertIn("No steps recorded yet.", text)
+
+    def _write_other_run(self, path, query="mcp", result="3 results",
+                         extra=False, error_result=False):
+        # Run B: same shape as the session below, with a different
+        # search query, a different result, and optionally one extra
+        # step at the end. With error_result, the search result
+        # carries an error field instead of a result string.
+        with Recorder(path) as rec:
+            rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                       tokens={"input": 1200, "output": 340})
+            rec.record("tool_call", {"tool": "search",
+                                     "args": {"query": query}})
+            if error_result:
+                rec.record("tool_result", {"tool": "search",
+                                           "error": "timed out"})
+            else:
+                rec.record("tool_result", {"tool": "search",
+                                           "result": result})
+            rec.record("model_call", {"model": "gpt-5",
+                                      "prompt": "again"},
+                       tokens={"input": 100, "output": 50})
+            if extra:
+                rec.record("tool_call", {"tool": "fetch",
+                                         "args": {"url":
+                                                  "https://example.com"}})
+
+    def _record_session(self):
+        _call(self.server, 2, "blackbox_record",
+              {"type": "model_call",
+               "payload": {"model": "gpt-5", "prompt": "hi"},
+               "tokens": {"input": 1200, "output": 340}})
+        _call(self.server, 3, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "search",
+                           "args": {"query": "mcp"}}})
+        _call(self.server, 4, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "search", "result": "3 results"}})
+        _call(self.server, 5, "blackbox_record",
+              {"type": "model_call",
+               "payload": {"model": "gpt-5", "prompt": "again"},
+               "tokens": {"input": 100, "output": 50}})
+
+    def test_prompts_get_summarize_diff(self):
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        self._write_other_run(other, query="other",
+                              extra=True, error_result=True)
+        response = self.server.handle_message(
+            _request(6, "prompts/get",
+                     {"name": "summarize_diff",
+                      "arguments": {"other_path": other}}))
+        message = response["result"]["messages"][0]
+        self.assertEqual(message["role"], "user")
+        text = message["content"]["text"]
+        self.assertIn("Run A (this session): 4 steps, 1690 tokens; "
+                      "run B (other run): 5 steps, 1690 tokens "
+                      "(token diff +0)", text)
+        self.assertIn("CHANGED step 1:", text)
+        self.assertIn("CHANGED step 2:", text)
+        self.assertIn("ADDED step 4 (only in run B):", text)
+        self.assertIn("fetch", text)
+        # gpt-5 in both runs: 1300 in + 390 out = $0.005525 each.
+        self.assertIn("gpt-5: 1690 tokens -> 1690 tokens (+0), "
+                      "$0.005525 -> $0.005525 (+$0)", text)
+        self.assertIn("New errors (in run B, not run A):", text)
+        self.assertIn("step 2: tool_result search", text)
+        self.assertIn("position-by-position", text)
+        self.assertIn("Run A transcript (this session):", text)
+        self.assertIn("Run B transcript (other run):", text)
+
+    def test_prompts_get_summarize_diff_identical(self):
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        self._write_other_run(other)
+        response = self.server.handle_message(
+            _request(6, "prompts/get",
+                     {"name": "summarize_diff",
+                      "arguments": {"other_path": other}}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("IDENTICAL: 4 steps match", text)
+        self.assertIn("token diff +0", text)
+        self.assertIn("Error steps: none in either run.", text)
+
+    def test_prompts_get_summarize_diff_fixed_error(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "search",
+                           "args": {"query": "mcp"}}})
+        _call(self.server, 3, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "search",
+                           "error": "upstream 500"}})
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        with Recorder(other) as rec:
+            rec.record("tool_call", {"tool": "search",
+                                     "args": {"query": "mcp"}})
+            rec.record("tool_result", {"tool": "search",
+                                       "result": "3 results"})
+        response = self.server.handle_message(
+            _request(4, "prompts/get",
+                     {"name": "summarize_diff",
+                      "arguments": {"other_path": other}}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("CHANGED step 1:", text)
+        self.assertIn("Errors fixed (in run A, not run B):", text)
+        self.assertIn("step 1: tool_result search", text)
+
+    def test_prompts_get_summarize_diff_needs_other_path(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "prompts/get",
+                     {"name": "summarize_diff"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_prompts_get_summarize_diff_missing_file_is_an_error(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "prompts/get",
+                     {"name": "summarize_diff",
+                      "arguments": {"other_path": os.path.join(
+                          self.tmp.name, "nope.jsonl")}}))
+        self.assertEqual(response["error"]["code"], -32602)
 
     def test_resources_read_before_initialize_is_rejected(self):
         response = self.server.handle_message(

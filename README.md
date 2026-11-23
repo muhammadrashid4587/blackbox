@@ -164,7 +164,13 @@ breakdown, slowest steps, error steps, parent gaps, and per-tool
 printed so the parent-child shape is visible, not just the
 counts. A parent gap here is a kept span whose causal parent
 would be sampled out by the tail-sample defaults, so a sampled
-export would leave it dangling.
+export would leave it dangling. A sixth prompt, `summarize_diff`,
+hands the client a prompt for what changed between this session
+and another run: changed, added and removed steps (position by
+position, like `blackbox diff`), per-model token and cost deltas,
+and new vs fixed errors, with both transcripts included so the
+client can see the change in context. It takes the other run's
+log path as its `other_path` argument (.jsonl or .db).
 Point a client at that command as a stdio server. Closing the server
 (EOF / Ctrl-C) writes the summary record, like closing a Recorder.
 
@@ -316,7 +322,7 @@ gone. Compaction works on `.jsonl` logs and `.db` stores.
 
 ## Measured
 
-- 235 tests, all passing (`make test`).
+- 241 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -404,6 +410,14 @@ gone. Compaction works on `.jsonl` logs and `.db` stores.
   tail-sample defaults), and per-tool / per-model cost and token
   totals, with the trace tree printed so the shape is visible —
   done (v0.21.0).
+- Sixth MCP prompt: `summarize_diff` hands the client a prompt
+  for what changed between this session and another run —
+  changed, added and removed steps (position by position, like
+  `blackbox diff`), per-model token and cost deltas, and new vs
+  fixed errors — with both transcripts included; it takes the
+  other run's log path as its `other_path` argument, and
+  `diff_records` in `replay.py` is the same comparison as a
+  pure function with no printing, done (v0.22.0).
 
 ## Layout
 
@@ -416,7 +430,8 @@ blackbox/
   mcp_server.py   MCP server on stdio: record / verify / replay tools,
                   session resources, analyze_session,
                   summarize_costs, summarize_anomalies,
-                  summarize_sampling and summarize_trace prompts,
+                  summarize_sampling, summarize_trace and
+                  summarize_diff prompts,
                   blackbox_sample tool (MCP sampling)
   sampling.py     MCP sampling client: Sampler, StdioTransport,
                   SamplingError / NotSupported / Declined
@@ -454,5 +469,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            235 tests, all passing
+tests/            241 tests, all passing
 ```

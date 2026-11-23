@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 from blackbox import Recorder
-from blackbox.replay import diff, replay
+from blackbox.replay import diff, diff_records, load_records, replay
 
 
 def _write_run(path, tool="search", query="first", tokens=100):
@@ -95,6 +95,26 @@ class ReplayTest(unittest.TestCase):
         result = diff(path_a, path_b)
         self.assertEqual(result["added"], [4])
         self.assertEqual(result["changed"], [])
+
+    def test_diff_records_finds_without_printing(self):
+        # The pure computation behind diff(): same findings, no
+        # output, so the MCP prompt can format them itself instead
+        # of printing onto the stdio channel.
+        path_a = os.path.join(self.tmp.name, "a.jsonl")
+        path_b = os.path.join(self.tmp.name, "b.jsonl")
+        _write_run(path_a, tool="search", query="first")
+        _write_run(path_b, tool="fetch", query="first")
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            result = diff_records(load_records(path_a),
+                                  load_records(path_b))
+        self.assertEqual(buf.getvalue(), "")
+        self.assertEqual(result["changed"], [1, 2])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["tokens_a"], result["tokens_b"])
 
 
 if __name__ == "__main__":

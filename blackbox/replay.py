@@ -112,39 +112,60 @@ def _step_signature(record):
             json.dumps(record.get("tokens"), sort_keys=True))
 
 
-def diff(path_a, path_b):
-    """Compare two runs. Returns a dict of findings, and prints a report."""
-    records_a = [r for r in load_records(path_a) if r["type"] != "summary"]
-    records_b = [r for r in load_records(path_b) if r["type"] != "summary"]
+def diff_records(records_a, records_b):
+    """Compare two lists of records, position by position.
+
+    The summary record is bookkeeping, not a step, so it is skipped
+    in both runs. Returns the findings: the changed/added/removed
+    step positions and the token totals of both runs. No printing:
+    `diff()` prints the same findings, and the MCP summarize_diff
+    prompt formats them into a prompt instead.
+    """
+    steps_a = [r for r in records_a if r["type"] != "summary"]
+    steps_b = [r for r in records_b if r["type"] != "summary"]
     changed = []
     added = []
     removed = []
-    for i in range(min(len(records_a), len(records_b))):
-        sig_a = _step_signature(records_a[i])
-        sig_b = _step_signature(records_b[i])
+    for i in range(min(len(steps_a), len(steps_b))):
+        sig_a = _step_signature(steps_a[i])
+        sig_b = _step_signature(steps_b[i])
         if sig_a != sig_b:
             changed.append(i)
-    if len(records_b) > len(records_a):
-        added = list(range(len(records_a), len(records_b)))
-    if len(records_a) > len(records_b):
-        removed = list(range(len(records_b), len(records_a)))
+    if len(steps_b) > len(steps_a):
+        added = list(range(len(steps_a), len(steps_b)))
+    if len(steps_a) > len(steps_b):
+        removed = list(range(len(steps_b), len(steps_a)))
 
     def _total(records):
         return sum(_tokens_total(r.get("tokens")) for r in records)
 
-    tokens_a = _total(records_a)
-    tokens_b = _total(records_b)
+    return {"changed": changed, "added": added, "removed": removed,
+            "tokens_a": _total(steps_a), "tokens_b": _total(steps_b)}
+
+
+def diff(path_a, path_b):
+    """Compare two runs. Returns a dict of findings, and prints a report."""
+    records_a = load_records(path_a)
+    records_b = load_records(path_b)
+    findings = diff_records(records_a, records_b)
+    steps_a = [r for r in records_a if r["type"] != "summary"]
+    steps_b = [r for r in records_b if r["type"] != "summary"]
+    changed = findings["changed"]
+    added = findings["added"]
+    removed = findings["removed"]
+    tokens_a = findings["tokens_a"]
+    tokens_b = findings["tokens_b"]
 
     for i in changed:
         print("CHANGED step %d:" % i)
-        print("  A: %s" % format_record(records_a[i]).replace("\n", "\n  "))
-        print("  B: %s" % format_record(records_b[i]).replace("\n", "\n  "))
+        print("  A: %s" % format_record(steps_a[i]).replace("\n", "\n  "))
+        print("  B: %s" % format_record(steps_b[i]).replace("\n", "\n  "))
     for i in added:
-        print("ADDED step %d: %s" % (i, format_record(records_b[i]).replace("\n", " ")))
+        print("ADDED step %d: %s" % (i, format_record(steps_b[i]).replace("\n", " ")))
     for i in removed:
-        print("REMOVED step %d: %s" % (i, format_record(records_a[i]).replace("\n", " ")))
+        print("REMOVED step %d: %s" % (i, format_record(steps_a[i]).replace("\n", " ")))
     if not changed and not added and not removed:
-        print("IDENTICAL: %d steps match" % len(records_a))
+        print("IDENTICAL: %d steps match" % len(steps_a))
     print("tokens: A=%d  B=%d  (diff %+d)" % (tokens_a, tokens_b, tokens_b - tokens_a))
 
     return {"changed": changed, "added": added, "removed": removed,

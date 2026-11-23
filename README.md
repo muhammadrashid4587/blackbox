@@ -187,7 +187,17 @@ span; a boring trace keeps each span with probability `--keep-rate`
 is recorded in the export summary: `kept_all` or `sampled`, which
 triggers fired, the rate, and how many spans were kept and dropped.
 Kept spans keep their original ids, so they still point at the
-records they came from.
+records they came from. With `--causal`, a sampled span pulls in
+its causal ancestors from the trace reconstruction, so the sampled
+trace stays connected — a tool_result keeps its tool_call, a
+tool_call keeps the model_call that decided it — and the spans'
+parents come from that same causal tree instead of the hash chain,
+so every non-root kept span's parent is a span in the export. The
+ancestors pulled in are counted separately in the decision
+(`causal_ancestors_kept`), so the export stays honest about which
+spans the RNG chose and which were added to keep the tree
+connected. Without `--causal` a kept span's chain parent may name a
+dropped record, as before.
 
 **OpenTelemetry export.** `python -m blackbox otel data/run.jsonl`
 writes the session as OTLP/JSON spans, one per step, in a single
@@ -291,7 +301,7 @@ gone. Compaction works on `.jsonl` logs and `.db` stores.
 
 ## Measured
 
-- 214 tests, all passing (`make test`).
+- 223 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -350,6 +360,13 @@ gone. Compaction works on `.jsonl` logs and `.db` stores.
   `blackbox trace` prints, with a `blackbox.causal_parent`
   attribute on each span marking the parent as reconstructed; the
   default export is unchanged, done (v0.17.0).
+- Causal tail sampling: `blackbox tail-sample --causal` closes a
+  sampled trace under its causal ancestors — a kept span pulls in
+  the tool_call / model_call above it, counted separately as
+  `causal_ancestors_kept` in the decision — and takes span parents
+  from the causal tree of the full log, so every non-root kept
+  span's parent is a span in the export; the plain (non-causal)
+  export is unchanged, done (v0.18.0).
 
 ## Layout
 
@@ -367,7 +384,10 @@ blackbox/
                   SamplingError / NotSupported / Declined
   tail_sampling.py  tail-based sampling: keep whole error/slow/
                   expensive traces, sample the rest, decision in
-                  the export summary, `blackbox tail-sample` CLI
+                  the export summary, `blackbox tail-sample` CLI;
+                  --causal closes a sampled trace under its causal
+                  ancestors and takes span parents from the causal
+                  tree of the full log
   query.py        query CLI: filter a session's steps by type,
                   model, tool, min tokens, min cost, errors only,
                   time range; --json and --count output modes
@@ -393,5 +413,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            214 tests, all passing
+tests/            223 tests, all passing
 ```

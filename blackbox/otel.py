@@ -166,19 +166,28 @@ def record_to_span(record, trace_id, end=None, parent_span_id=_CHAIN_PARENT,
     return span
 
 
-def records_to_spans(records, service_name=SERVICE_NAME, causal=False):
+def records_to_spans(records, service_name=SERVICE_NAME, causal=False,
+                     parents=None):
     """A list of records as OTLP span dicts (summary excluded).
 
     With causal=True, each span's parent comes from
     trace.link_parents — the same parent-child tree `blackbox trace`
     prints — instead of the previous record in the hash chain. The
     default (causal=False) keeps the chain parents.
+
+    `parents` is an optional seq -> parent-seq map computed from a
+    fuller log than `records` (a tail-sampled export passes the
+    full log's map): with causal=True it is used as-is instead of
+    recomputing parents from the records given, so a kept span's
+    parent is the parent the full trace assigns it. A parent seq
+    absent from `records` still yields a root span, as before.
     """
     steps = [r for r in records if r["type"] != "summary"]
     if not steps:
         return []
     trace_id = steps[0]["hash"][:32]
-    parents = link_parents(records) if causal else None
+    if causal and parents is None:
+        parents = link_parents(records)
     by_seq = {r["seq"]: r for r in steps} if causal else None
     spans = []
     for i, record in enumerate(steps):

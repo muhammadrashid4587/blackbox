@@ -90,6 +90,12 @@ def main(argv=None):
                         default=DEFAULT_MAX_COST_USD,
                         help="a trace costing more than this keeps the "
                         "whole trace (default: $%(default)s)")
+    p_tail.add_argument("--causal", action="store_true",
+                        help="keep a sampled span's causal ancestors "
+                        "too, and take span parents from the causal "
+                        "trace instead of the hash chain, so the "
+                        "sampled trace stays connected (same tree as "
+                        "`blackbox trace`)")
 
     p_export = sub.add_parser(
         "export", help="export a log as OTLP/JSON, to a file or live to a collector")
@@ -193,7 +199,7 @@ def main(argv=None):
             data = export_tail_sampled_otlp(
                 args.logfile, keep_rate=args.keep_rate, seed=args.seed,
                 slow_ms=args.slow_ms, max_cost_usd=args.max_cost_usd,
-                service_name=args.service_name)
+                service_name=args.service_name, causal=args.causal)
         except ValueError as exc:
             print("tail-sample: %s" % exc, file=sys.stderr)
             return 2
@@ -203,9 +209,14 @@ def main(argv=None):
                 f.write(text)
             decision = data["tail_sampling"]
             reasons = ", ".join(decision["reasons"]) or "no trigger fired"
-            print("tail-sample: %s (%s) — kept %d of %d spans"
+            extra = ""
+            if decision["causal_ancestors_kept"]:
+                extra = (", +%d causal ancestors"
+                         % decision["causal_ancestors_kept"])
+            print("tail-sample: %s (%s) — kept %d of %d spans%s"
                   % (decision["decision"], reasons,
-                     decision["kept_spans"], decision["total_spans"]))
+                     decision["kept_spans"], decision["total_spans"],
+                     extra))
         else:
             sys.stdout.write(text)
         return 0

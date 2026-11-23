@@ -10,6 +10,28 @@ from blackbox import Recorder
 from blackbox.__main__ import main
 from blackbox.tail_sampling import (export_tail_sampled_otlp,
                                     tail_sample_records)
+from blackbox.trace import link_parents
+
+
+def _causal_session():
+    """model -> two parallel search calls -> their results in order
+    -> model. Causal parents differ from chain parents at seq 2, 3
+    and 4, so closure and parent ids are distinguishable."""
+    return [
+        _record(0, "2026-11-22T00:00:00Z", "model_call",
+                {"model": "m"}),
+        _record(1, "2026-11-22T00:00:01Z", "tool_call",
+                {"tool": "search", "args": {"q": "a"}}),
+        _record(2, "2026-11-22T00:00:02Z", "tool_call",
+                {"tool": "search", "args": {"q": "b"}}),
+        _record(3, "2026-11-22T00:00:03Z", "tool_result",
+                {"tool": "search", "result": "ra"}),
+        _record(4, "2026-11-22T00:00:04Z", "tool_result",
+                {"tool": "search", "result": "rb"}),
+        _record(5, "2026-11-22T00:00:05Z", "model_call",
+                {"model": "m"}),
+        _summary("2026-11-22T00:00:06Z"),
+    ]
 
 
 def _record(seq, ts, type_, payload=None, tokens=None):
@@ -189,6 +211,172 @@ class TailSampleExportTest(unittest.TestCase):
         rc = main(["tail-sample", self.path, "--out", out,
                    "--keep-rate", "0"])
         self.assertEqual(rc, 2)
+
+
+class CausalTailSampleTest(unittest.TestCase):
+    """--causal: a sampled span pulls in its causal ancestors, so
+    the kept spans form a connected tree."""
+
+    def test_causal_keeps_ancestors_of_sampled_spans(self):
+        records = _causal_session()
+        # Seed 17 keeps only seq 3 (the first tool_result) on its own.
+        plain, _ = tail_sample_records(records, keep_rate=0.5, seed=17)
+        self.assertEqual([r["seq"] for r in plain], [3])
+        kept, decision = tail_sample_records(records, keep_rate=0.5,
+                                             seed=17, causal=True)
+        # seq 3's causal ancestors: seq 1 (its tool_call) and seq 0
+        # (the model_call that decided it).
+        self.assertEqual([r["seq"] for r in kept], [0, 1, 3])
+        self.assertTrue(decision["causal"])
+        self.assertEqual(decision["causal_ancestors_kept"], 2)
+        self.assertEqual(decision["kept_spans"], 3)
+        self.assertEqual(decision["dropped_spans"], 3)
+
+    def test_causal_kept_is_superset_of_plain_for_same_seed(self):
+        records = _causal_session()
+        for seed in range(10):
+            plain, _ = tail_sample_records(records, keep_rate=0.5,
+                                           seed=seed)
+            kept, _ = tail_sample_records(records, keep_rate=0.5,
+                                          seed=seed, causal=True)
+            self.assertTrue({r["seq"] for r in plain}
+                            <= {r["seq"] for r in kept})
+
+    def test_causal_kept_spans_are_closed_under_ancestors(self):
+        records = _causal_session()
+        parents = link_parents(records)
+        for seed in range(10):
+            kept, decision = tail_sample_records(
+                records, keep_rate=0.5, seed=seed, causal=True)
+            kept_seqs = {r["seq"] for r in kept}
+            for record in kept:
+                seq = parents.get(record["seq"])
+                while seq is not None:
+                    self.assertIn(seq, kept_seqs)
+                    seq = parents.get(seq)
+            # The decision counts exactly the spans the RNG did not
+            # choose but closure added.
+            plain, _ = tail_sample_records(records, keep_rate=0.5,
+                                           seed=seed)
+            self.assertEqual(decision["causal_ancestors_kept"],
+                             len(kept_seqs) - len(plain))
+
+    def test_causal_off_records_no_ancestors(self):
+        records = _causal_session()
+        _, decision = tail_sample_records(records, keep_rate=0.5,
+                                          seed=17)
+        self.assertFalse(decision["causal"])
+        self.assertEqual(decision["causal_ancestors_kept"], 0)
+
+    def test_causal_kept_all_adds_no_ancestors(self):
+        records = _causal_session()
+        records[3] = _record(3, records[3]["ts"], "tool_result",
+                             {"tool": "search", "error": "timeout"})
+        kept, decision = tail_sample_records(records, keep_rate=0.5,
+                                             seed=17, causal=True)
+        self.assertEqual(decision["decision"], "kept_all")
+        self.assertEqual(len(kept), 6)
+        self.assertEqual(decision["causal_ancestors_kept"], 0)
+
+
+class CausalTailSampleExportTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "run.jsonl")
+        with Recorder(self.path, task="t", model="m") as rec:
+            rec.record("model_call", {"model": "m", "prompt": "plan"},
+                       tokens={"input": 10, "output": 5})
+            rec.record("tool_call", {"tool": "search", "args": {"q": "a"}})
+            rec.record("tool_call", {"tool": "search", "args": {"q": "b"}})
+            rec.record("tool_result", {"tool": "search", "result": "ra"})
+            rec.record("tool_result", {"tool": "search", "result": "rb"})
+            rec.record("model_call", {"model": "m", "prompt": "summarise"},
+                       tokens={"input": 4, "output": 2})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _spans(self, data):
+        return data["resourceSpans"][0]["scopeSpans"][0]["spans"]
+
+    def _attrs(self, span):
+        out = {}
+        for a in span["attributes"]:
+            v = a["value"]
+            if "intValue" in v:
+                out[a["key"]] = int(v["intValue"])
+            elif "boolValue" in v:
+                out[a["key"]] = v["boolValue"]
+            else:
+                out[a["key"]] = v.get("stringValue")
+        return out
+
+    def test_causal_export_spans_are_connected(self):
+        data = export_tail_sampled_otlp(self.path, keep_rate=0.5,
+                                        seed=17, causal=True)
+        spans = self._spans(data)
+        self.assertEqual(len(spans),
+                         data["tail_sampling"]["kept_spans"])
+        self.assertEqual(data["tail_sampling"]["causal_ancestors_kept"],
+                         2)
+        span_ids = {s["spanId"] for s in spans}
+        for span in spans:
+            # Every non-root kept span's parent is a span in the
+            # export: the sampled trace stays connected.
+            if "parentSpanId" in span:
+                self.assertIn(span["parentSpanId"], span_ids)
+            self.assertIs(self._attrs(span).get("blackbox.causal_parent"),
+                          True)
+
+    def test_causal_export_parents_match_full_log_tree(self):
+        data = export_tail_sampled_otlp(self.path, keep_rate=0.5,
+                                        seed=17, causal=True)
+        spans = self._spans(data)
+        with open(self.path) as f:
+            records = [json.loads(line) for line in f]
+        parents = link_parents(records)
+        by_seq = {r["seq"]: r for r in records
+                  if r["type"] != "summary"}
+        for span in spans:
+            seq = self._attrs(span)["blackbox.seq"]
+            parent_seq = parents[seq]
+            if parent_seq is None:
+                self.assertNotIn("parentSpanId", span)
+            else:
+                self.assertEqual(
+                    span["parentSpanId"],
+                    by_seq[parent_seq]["hash"][:16])
+
+    def test_plain_export_can_dangle_but_causal_does_not(self):
+        # Same seed, no --causal: only seq 3 is kept, and its chain
+        # parent (seq 2's hash) is a span that is not in the export.
+        plain = export_tail_sampled_otlp(self.path, keep_rate=0.5,
+                                         seed=17)
+        plain_spans = self._spans(plain)
+        self.assertEqual(len(plain_spans), 1)
+        plain_ids = {s["spanId"] for s in plain_spans}
+        self.assertNotIn(plain_spans[0]["parentSpanId"], plain_ids)
+        causal = export_tail_sampled_otlp(self.path, keep_rate=0.5,
+                                          seed=17, causal=True)
+        causal_ids = {s["spanId"] for s in self._spans(causal)}
+        for span in self._spans(causal):
+            if "parentSpanId" in span:
+                self.assertIn(span["parentSpanId"], causal_ids)
+
+    def test_cli_causal_flag(self):
+        out = os.path.join(self.tmp.name, "spans.json")
+        rc = main(["tail-sample", self.path, "--causal", "--out", out,
+                   "--keep-rate", "0.5", "--seed", "17"])
+        self.assertEqual(rc, 0)
+        with open(out) as f:
+            data = json.load(f)
+        self.assertTrue(data["tail_sampling"]["causal"])
+        self.assertEqual(data["tail_sampling"]["causal_ancestors_kept"],
+                         2)
+        span_ids = {s["spanId"] for s in self._spans(data)}
+        for span in self._spans(data):
+            if "parentSpanId" in span:
+                self.assertIn(span["parentSpanId"], span_ids)
 
 
 if __name__ == "__main__":

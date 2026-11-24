@@ -398,6 +398,19 @@ RESOURCE_TEMPLATES = [
                         "blackbox://session/record/2."),
         "mimeType": "application/json",
     },
+    {
+        "uriTemplate": "blackbox://session/transcript/{seq}",
+        "name": "session/transcript/{seq}",
+        "description": ("One step's formatted transcript line as "
+                        "text: the line the blackbox://session "
+                        "resource carries for step seq — the same "
+                        "line `blackbox replay` prints for that "
+                        "step — so a client can read one step "
+                        "without the whole transcript. Read it by "
+                        "expanding the template with a step number, "
+                        "e.g. blackbox://session/transcript/2."),
+        "mimeType": "text/plain",
+    },
 ]
 
 PROMPTS = [
@@ -1464,6 +1477,34 @@ class MCPServer:
             {"uri": uri, "mimeType": "application/json",
              "text": text}]})
 
+    def _read_transcript_step(self, msg_id, uri, seq_text):
+        """One step's formatted transcript line, as a resource read.
+
+        One implementation for the
+        blackbox://session/transcript/{seq} template: the
+        `format_record` line for step seq — the same line the
+        blackbox://session resource carries for that step — so
+        the template and the resource always agree. A step number
+        that is not an integer, or a step the session does not
+        have, is an error.
+        """
+        try:
+            seq = int(unquote(seq_text))
+        except ValueError:
+            return _error(
+                msg_id, INVALID_PARAMS,
+                "blackbox://session/transcript/{seq} needs a step "
+                "number, e.g. blackbox://session/transcript/2")
+        records = load_records(self.log_path)
+        record = next((r for r in records if r["seq"] == seq), None)
+        if record is None:
+            return _error(msg_id, INVALID_PARAMS,
+                          "no step %d in this session" % seq)
+        text = format_record(record)
+        return _result(msg_id, {"contents": [
+            {"uri": uri, "mimeType": "text/plain",
+             "text": text}]})
+
     def _resources_read(self, msg_id, params):
         uri = params.get("uri")
         if uri == "blackbox://session":
@@ -1523,6 +1564,19 @@ class MCPServer:
                     "blackbox://session/record/{seq} needs a step "
                     "number, e.g. blackbox://session/record/2")
             return self._read_record(msg_id, uri, seq_text)
+        if uri.startswith("blackbox://session/transcript/"):
+            # The resource template
+            # blackbox://session/transcript/{seq}: one step's
+            # formatted transcript line, the same line the
+            # blackbox://session resource carries for that step.
+            seq_text = uri[len("blackbox://session/transcript/"):]
+            if not seq_text:
+                return _error(
+                    msg_id, INVALID_PARAMS,
+                    "blackbox://session/transcript/{seq} needs a "
+                    "step number, e.g. "
+                    "blackbox://session/transcript/2")
+            return self._read_transcript_step(msg_id, uri, seq_text)
         if uri.startswith("blackbox://session/trace/"):
             # The resource template blackbox://session/trace/{seq}:
             # the subtree rooted at step seq, the same node the

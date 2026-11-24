@@ -133,27 +133,31 @@ class MCPServerTest(unittest.TestCase):
         response = self.server.handle_message(
             _request(2, "resources/templates/list"))
         templates = response["result"]["resourceTemplates"]
-        self.assertEqual(len(templates), 5)
+        self.assertEqual(len(templates), 6)
         self.assertEqual(
             [t["uriTemplate"] for t in templates],
             ["blackbox://session/diff/{other_path}",
              "blackbox://session/trace/{seq}",
              "blackbox://session/aggregates/model/{model}",
              "blackbox://session/aggregates/tool/{tool}",
-             "blackbox://session/record/{seq}"])
+             "blackbox://session/record/{seq}",
+             "blackbox://session/transcript/{seq}"])
         self.assertEqual(
             [t["name"] for t in templates],
             ["session/diff/{other_path}", "session/trace/{seq}",
              "session/aggregates/model/{model}",
              "session/aggregates/tool/{tool}",
-             "session/record/{seq}"])
-        for template in templates:
-            self.assertEqual(template["mimeType"], "application/json")
+             "session/record/{seq}",
+             "session/transcript/{seq}"])
+        self.assertEqual(
+            [t["mimeType"] for t in templates],
+            ["application/json"] * 5 + ["text/plain"])
         self.assertIn("other run", templates[0]["description"])
         self.assertIn("step", templates[1]["description"])
         self.assertIn("model", templates[2]["description"])
         self.assertIn("tool", templates[3]["description"])
         self.assertIn("record", templates[4]["description"])
+        self.assertIn("transcript", templates[5]["description"])
 
     def test_resources_read_session_transcript(self):
         self._init()
@@ -729,6 +733,61 @@ class MCPServerTest(unittest.TestCase):
         response = self.server.handle_message(
             _request(2, "resources/read",
                      {"uri": "blackbox://session/record/"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_transcript_template(self):
+        # The same formatted line the blackbox://session resource
+        # carries for step 1: the tool_call, one line.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/transcript/1"}))
+        content = response["result"]["contents"][0]
+        self.assertEqual(content["uri"],
+                         "blackbox://session/transcript/1")
+        self.assertEqual(content["mimeType"], "text/plain")
+        self.assertIn("tool_call", content["text"])
+        self.assertIn("search(query=mcp)", content["text"])
+
+    def test_resources_read_session_transcript_template_matches_transcript(self):
+        # The template and the blackbox://session resource always
+        # agree: the template text is the transcript's line(s) for
+        # that step, including the prompt line of a model_call.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session"}))
+        transcript = response["result"]["contents"][0]["text"]
+        response = self.server.handle_message(
+            _request(7, "resources/read",
+                     {"uri": "blackbox://session/transcript/0"}))
+        text = response["result"]["contents"][0]["text"]
+        self.assertIn(text, transcript)
+        self.assertIn("model_call", text)
+        self.assertIn("prompt: hi", text)
+
+    def test_resources_read_session_transcript_template_unknown_seq(self):
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/transcript/99"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_transcript_template_bad_seq(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/transcript/abc"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_transcript_template_needs_seq(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/transcript/"}))
         self.assertEqual(response["error"]["code"], -32602)
 
     def test_resources_read_unknown_uri_is_an_error(self):

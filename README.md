@@ -400,7 +400,7 @@ read-only.
 
 ## Measured
 
-- 319 tests, all passing (`make test`).
+- 324 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -605,9 +605,19 @@ read-only.
   so the template and the resource always agree; a step number
   that is not an integer, or a step the session does not have,
   is an error, done (v0.33.0).
-  Next: a resource template for the transcript (one step's
-  formatted line), so a client can discover the whole session
-  surface from `resources/templates/list`.
+- MCP resource template for one step's transcript line:
+  `blackbox://session/transcript/{seq}`, listed by
+  `resources/templates/list`, so a client can read one step's
+  formatted line — the same line the `blackbox://session`
+  resource carries for that step, including the prompt line of
+  a model_call — without the whole transcript. It reuses the
+  same `format_record` from `replay.py` as the transcript
+  resource, so the template and the resource always agree; a
+  step number that is not an integer, or a step the session
+  does not have, is an error, done (v0.34.0).
+  Next: a resource template for one step's OTLP span
+  (`blackbox://session/span/{seq}`), so a client can read one
+  step as a span without exporting the whole trace.
 
 ## Layout
 
@@ -619,8 +629,8 @@ blackbox/
   costs.py        per-model cost tracking: list prices, cost math
   mcp_server.py   MCP server on stdio: record / verify / replay tools,
                   session resources, resource templates for the
-                  diff, a trace subtree, aggregates slices and one
-                  step's raw record, analyze_session,
+                  diff, a trace subtree, aggregates slices, one
+                  step's raw record and one step's transcript line, analyze_session,
                   summarize_costs, summarize_anomalies,
                   summarize_sampling, summarize_trace,
                   summarize_diff and summarize_retention prompts,
@@ -672,5 +682,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            307 tests, all passing
+tests/            324 tests, all passing
 ```

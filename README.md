@@ -510,10 +510,19 @@ the same window as `blackbox query`, parsed the way `blackbox
 record --ts` parses a timestamp — ISO 8601 with a timezone,
 normalised to UTC, and a value that does not parse or carries no
 timezone is an error, exit code 2 — so a live tail can be narrowed
-to a time window like `blackbox query` can. The summary is kept only when
+to a time window like `blackbox query` can. `--last 10m` keeps
+only steps from the last 10 minutes (30s, 2h, 1d, 1h30m — a
+duration, not a timestamp), as a lower bound of now minus that
+duration, fixed when watching starts, so a live tail can be
+narrowed to the recent past without computing an absolute
+timestamp; a step that lands later is stamped later than the bound
+and always passes, so --last only narrows the --from-start replay
+of what is already in the log. --last cannot be combined with
+--since or --until, because it sets the lower bound itself, and a
+value that is not a duration is an error, exit code 2. The summary is kept only when
 `--type summary` is given, and never under `--errors-only`,
-`--model`, `--tool`, `--min-tokens`, `--min-cost`, `--since` or
-`--until`. Filters combine with AND, a filtered step is still
+`--model`, `--tool`, `--min-tokens`, `--min-cost`, `--since`,
+`--until` or `--last`. Filters combine with AND, a filtered step is still
 marked seen (so a re-read after a shrink does not re-check it),
 and `max_records` counts printed steps, not skipped ones.
 
@@ -529,7 +538,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 438 tests, all passing (`make test`).
+- 449 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -877,9 +886,24 @@ and `max_records` counts printed steps, not skipped ones.
   filtered step is still marked seen, and `max_records` counts
   printed steps, not skipped ones. Works on `.jsonl` logs and
   `.db` stores, done (v0.44.0).
-  Next: a `--last` relative window for watch (e.g. `--last 10m`),
-  so a live tail can be narrowed to the recent past without
-  computing an absolute timestamp.
+- Watch relative window: `blackbox watch --last 10m` keeps only
+  steps from the last 10 minutes — a duration (30s, 2h, 1d,
+  1h30m), not a timestamp — as a lower bound of now minus that
+  duration, fixed when watching starts, so a live tail can be
+  narrowed to the recent past without computing an absolute
+  timestamp; a step that lands later is stamped later than the
+  bound and always passes, so --last only narrows the --from-start
+  replay of what is already in the log. --last cannot be combined
+  with --since or --until, because it sets the lower bound itself,
+  and a value that is not a duration is an error, exit code 2. The
+  summary is kept only when `--type summary` is given, and never
+  under --last, the same rule as `blackbox query`; filters combine
+  with AND, a filtered step is still marked seen, and
+  `max_records` counts printed steps, not skipped ones. Works on
+  `.jsonl` logs and `.db` stores, done (v0.45.0).
+  Next: a `--last` relative window for `blackbox query`, so a
+  finished session can be narrowed to the recent past the same way
+  a live tail can.
 
 ## Layout
 

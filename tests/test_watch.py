@@ -8,8 +8,12 @@ model and --tool keeps only tool_call / tool_result steps for one
 tool (the same match rules as `blackbox query`), and --since /
 --until keep only steps whose timestamp falls in the closed window
 [since, until] (the same window as `blackbox query`, parsed the way
-`blackbox record --ts` parses a timestamp). A malformed appended
-line is reported, not a crash; a log that shrinks while watched (a
+`blackbox record --ts` parses a timestamp). --last keeps only steps
+from the last N seconds/minutes/hours/days, e.g. --last 10m, as a
+lower bound of now minus that duration — it cannot be combined
+with --since or --until, and a value that is not a duration is an
+error, exit code 2. A malformed appended line is reported, not a
+crash; a log that shrinks while watched (a
 Recorder resuming drops the trailing summary) is re-read without
 reprinting what was already printed; Ctrl-C stops cleanly with exit
 code 0."""
@@ -25,12 +29,13 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from blackbox import Recorder
 from blackbox.__main__ import main
 from blackbox.replay import format_record, load_records
-from blackbox.watch import watch_log
+from blackbox.watch import _parse_duration, watch_log
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -53,7 +58,7 @@ class WatchTest(unittest.TestCase):
     def _run_watch(self, path=None, from_start=False, stop_after=5.0,
                    max_records=None, types=None, errors_only=False,
                    model=None, tool=None, min_tokens=None, min_cost=None,
-                   since=None, until=None):
+                   since=None, until=None, last=None):
         """Start watch_log in a thread; returns (thread, result, out, err)."""
         out, err = io.StringIO(), io.StringIO()
         result = {}
@@ -65,7 +70,7 @@ class WatchTest(unittest.TestCase):
                 stop_after=stop_after, max_records=max_records,
                 types=types, errors_only=errors_only,
                 model=model, tool=tool, min_tokens=min_tokens,
-                min_cost=min_cost, since=since, until=until)
+                min_cost=min_cost, since=since, until=until, last=last)
 
         thread = threading.Thread(target=target)
         thread.start()
@@ -97,6 +102,29 @@ class WatchTest(unittest.TestCase):
             rec.record("tool_result", {"tool": "search",
                                        "result": "3 results"},
                        ts="2026-11-24T12:00:00Z")
+        return path
+
+    def _recent_log(self, path=None):
+        """A log with steps stamped relative to now: model_call 20
+        minutes ago, tool_call 5 minutes ago, tool_result just now,
+        plus the summary the Recorder writes on close (stamped with
+        the real now). Returns the path."""
+        path = path or os.path.join(self.tmp.name, "recent.jsonl")
+        now = datetime.now(timezone.utc)
+
+        def _ts(minutes_ago):
+            return (now - timedelta(minutes=minutes_ago)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+
+        with Recorder(path, task="t", model="gpt-5") as rec:
+            rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                       tokens={"input": 10, "output": 2}, ts=_ts(20))
+            rec.record("tool_call", {"tool": "search",
+                                     "args": {"query": "mcp"}},
+                       ts=_ts(5))
+            rec.record("tool_result", {"tool": "search",
+                                       "result": "3 results"},
+                       ts=_ts(0))
         return path
 
     def test_watch_prints_appended_steps(self):
@@ -724,6 +752,162 @@ class WatchTest(unittest.TestCase):
         self.assertNotIn("[1]", lines)
         self.assertNotIn("events:", lines)
 
+    def test_parse_duration_units(self):
+        self.assertEqual(_parse_duration("30s"), timedelta(seconds=30))
+        self.assertEqual(_parse_duration("10m"), timedelta(minutes=10))
+        self.assertEqual(_parse_duration("2h"), timedelta(hours=2))
+        self.assertEqual(_parse_duration("1d"), timedelta(days=1))
+        self.assertEqual(_parse_duration("1h30m"),
+                         timedelta(hours=1, minutes=30))
+        self.assertEqual(_parse_duration("1d2h3m4s"),
+                         timedelta(days=1, hours=2, minutes=3,
+                                   seconds=4))
+
+    def test_parse_duration_rejects_garbage(self):
+        for bad in ("10", "10x", "m", "", "0m", "0s", "-5m", "1.5h",
+                    "10 m", "1h30x", "1m1h"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    _parse_duration(bad)
+
+    def test_watch_last_keeps_only_recent_steps(self):
+        # Steps 20 minutes ago, 5 minutes ago and just now, plus
+        # the summary. --last 10m keeps the 5-minute and just-now
+        # steps and drops the 20-minute step and the summary.
+        path = self._recent_log()
+        thread, result, out, err = self._run_watch(
+            path=path, from_start=True, last="10m", max_records=2)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[1]", lines)
+        self.assertIn("tool_call", lines)
+        self.assertIn("[2]", lines)
+        self.assertIn("tool_result", lines)
+        self.assertNotIn("[0]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_last_sqlite_backend(self):
+        path = self._recent_log(os.path.join(self.tmp.name, "recent.db"))
+        thread, result, out, err = self._run_watch(
+            path=path, from_start=True, last="10m", max_records=2)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[1]", lines)
+        self.assertIn("[2]", lines)
+        self.assertNotIn("[0]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_last_and_type_combine_with_and(self):
+        # --last 10m --type tool_result keeps only the just-now
+        # tool_result: the 5-minute tool_call is recent but the
+        # wrong type.
+        path = self._recent_log()
+        thread, result, out, err = self._run_watch(
+            path=path, from_start=True, last="10m",
+            types=["tool_result"], max_records=1)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[2]", lines)
+        self.assertIn("tool_result", lines)
+        self.assertNotIn("[1]", lines)
+        self.assertNotIn("[0]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_last_live_steps_always_pass(self):
+        # A step that lands while watching is stamped at now, later
+        # than the bound fixed when watching started, so it passes
+        # --last even with a short window. The summary is dropped
+        # under a filter, like in `blackbox query`.
+        thread, result, out, err = self._run_watch(
+            last="1m", max_records=1)
+        time.sleep(0.3)
+        with Recorder(self.path, task="t", model="gpt-5") as rec:
+            rec.record("tool_call", {"tool": "fetch"})
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        lines = out.getvalue()
+        self.assertIn("[3]", lines)
+        self.assertIn("fetch", lines)
+        self.assertNotIn("events:", lines)
+        self._assert_no_bad_line_report(err)
+
+    def test_watch_last_filtered_step_not_reprinted_after_shrink(self):
+        # A live step stamped 20 minutes ago is filtered out by
+        # --last and marked seen: when the Recorder resumes
+        # (dropping the summary, so the log shrinks and is re-read)
+        # it must not print, while the fresh step that lands with
+        # it does.
+        path = self._recent_log()
+        thread, result, out, err = self._run_watch(
+            path=path, last="10m", stop_after=2.5)
+        time.sleep(0.3)
+        now = datetime.now(timezone.utc)
+
+        def _ts(minutes_ago):
+            return (now - timedelta(minutes=minutes_ago)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+
+        with Recorder(path, task="t", model="gpt-5") as rec:
+            rec.record("tool_call", {"tool": "fetch"}, ts=_ts(20))
+            rec.record("tool_result", {"tool": "search",
+                                       "result": "ok"}, ts=_ts(0))
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        lines = out.getvalue()
+        self.assertIn("[4]", lines)  # the fresh step
+        self.assertIn("tool_result", lines)
+        self.assertIn("search", lines)
+        self.assertNotIn("fetch", lines)  # filtered out, not reprinted
+        self.assertNotIn("[0]", lines)
+        self.assertNotIn("[1]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_cli_passes_last_flag(self):
+        with mock.patch("blackbox.__main__.watch_log") as patched:
+            code = main(["watch", self.path, "--last", "10m"])
+        self.assertEqual(code, 0)
+        patched.assert_called_once_with(
+            self.path, from_start=False, poll_interval=0.2,
+            types=None, errors_only=False,
+            model=None, tool=None, min_tokens=None, min_cost=None,
+            since=None, until=None, last="10m")
+
+    def test_watch_cli_bad_last_exits_two(self):
+        for bad in ("10", "10x"):
+            with self.subTest(bad=bad):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    code = main(["watch", self.path, "--last", bad])
+                self.assertEqual(code, 2)
+                self.assertIn("--last", err.getvalue())
+
+    def test_watch_cli_last_with_since_exits_two(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["watch", self.path, "--last", "10m",
+                         "--since", "2026-11-24T11:00:00Z"])
+        self.assertEqual(code, 2)
+        self.assertIn("--last", err.getvalue())
+
+    def test_watch_cli_last_with_until_exits_two(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["watch", self.path, "--last", "10m",
+                         "--until", "2026-11-24T12:00:00Z"])
+        self.assertEqual(code, 2)
+        self.assertIn("--last", err.getvalue())
+
     def test_watch_cli_passes_since_and_until_flags(self):
         with mock.patch("blackbox.__main__.watch_log") as patched:
             code = main(["watch", self.path,
@@ -735,7 +919,7 @@ class WatchTest(unittest.TestCase):
             types=None, errors_only=False,
             model=None, tool=None, min_tokens=None, min_cost=None,
             since="2026-11-24T11:00:00Z",
-            until="2026-11-24T12:00:00Z")
+            until="2026-11-24T12:00:00Z", last=None)
 
     def test_watch_cli_bad_since_exits_two(self):
         out, err = io.StringIO(), io.StringIO()
@@ -779,7 +963,7 @@ class WatchTest(unittest.TestCase):
             self.path, from_start=False, poll_interval=0.2,
             types=["tool_call", "tool_result"], errors_only=True,
             model=None, tool=None, min_tokens=None, min_cost=None,
-            since=None, until=None)
+            since=None, until=None, last=None)
 
     def test_watch_cli_passes_model_and_tool_flags(self):
         with mock.patch("blackbox.__main__.watch_log") as patched:
@@ -790,7 +974,7 @@ class WatchTest(unittest.TestCase):
             self.path, from_start=False, poll_interval=0.2,
             types=None, errors_only=False,
             model="gpt-5", tool="search", min_tokens=None,
-            min_cost=None, since=None, until=None)
+            min_cost=None, since=None, until=None, last=None)
 
     def test_watch_cli_passes_min_tokens_and_min_cost_flags(self):
         with mock.patch("blackbox.__main__.watch_log") as patched:
@@ -801,7 +985,7 @@ class WatchTest(unittest.TestCase):
             self.path, from_start=False, poll_interval=0.2,
             types=None, errors_only=False,
             model=None, tool=None, min_tokens=100, min_cost=0.01,
-            since=None, until=None)
+            since=None, until=None, last=None)
 
     def test_watch_cli_ctrl_c_returns_zero(self):
         with mock.patch("blackbox.__main__.watch_log",

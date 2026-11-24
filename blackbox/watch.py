@@ -21,11 +21,19 @@ closed window [since, until] — the same window as `blackbox query`
 — parsed the way `blackbox record --ts` parses a timestamp: ISO
 8601 with a timezone, normalised to UTC, and a value that does not
 parse or carries no timezone is an error, exit code 2, never a
-silent assumption of UTC.
+silent assumption of UTC. --last keeps only steps from the last
+N seconds/minutes/hours/days, e.g. --last 10m: the lower bound is
+now minus that duration, fixed when watching starts, so a step
+that lands later is stamped later than the bound and always
+passes — --last only narrows the --from-start replay of what is
+already in the log. --last cannot be combined with --since or
+--until, because it sets the lower bound itself; that is an error,
+exit code 2, as is a value that is not a duration.
 The summary record is printed by default, but under a filter it
 follows the same rule as `blackbox query`: it is kept only when
 --type summary is given explicitly, and never under --errors-only,
---model, --tool, --min-tokens, --min-cost, --since or --until.
+--model, --tool, --min-tokens, --min-cost, --since, --until or
+--last.
 
 Both backends work: a .jsonl log is tailed by byte offset, a .db
 store by polling for rows past the last printed seq. A log that
@@ -51,10 +59,11 @@ not fire.
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 from .query import _is_error, _record_cost
@@ -80,6 +89,30 @@ def _parse_bound(value, flag):
                          "timezone, e.g. 2026-11-24T01:00:00Z"
                          % flag) from None
     return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+
+
+def _parse_duration(value):
+    """Parse a --last value into a timedelta: a whole number of
+    seconds, minutes, hours or days, e.g. 30s, 10m, 2h, 1d, or a
+    combination in that order, e.g. 1h30m. Returns the timedelta.
+    Raises ValueError naming --last on anything else — a bare
+    number has no unit, a decimal has no honest meaning at this
+    granularity, and a zero or empty duration keeps nothing, so
+    all three are errors, exit code 2, never a guessed window."""
+    match = re.fullmatch(r"(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?"
+                         r"(?:(\d+)s)?", value.strip())
+    if match is None or not any(match.groups()):
+        raise ValueError("--last must be a duration like 10m, "
+                         "e.g. 30s, 10m, 2h, 1d, 1h30m")
+    days, hours, minutes, seconds = (
+        int(group) if group is not None else 0
+        for group in match.groups())
+    duration = timedelta(days=days, hours=hours, minutes=minutes,
+                         seconds=seconds)
+    if duration <= timedelta(0):
+        raise ValueError("--last must be a positive duration, "
+                         "e.g. 10m")
+    return duration
 
 
 def _parse_record_ts(ts):
@@ -144,9 +177,10 @@ def _matches_filter(record, types, errors_only, model=None, tool=None,
     falls in the closed window [since, until], the same window as
     `blackbox query`, compared as datetimes — so a record stamped
     with fractional seconds compares correctly against a whole-second
-    bound, which a plain string comparison would get wrong. A record
-    whose timestamp does not parse, or carries no timezone, never
-    matches a time filter. The summary is a roll-up, not a step, so
+    bound, which a plain string comparison would get wrong. --last
+    is the same check with the lower bound computed from now, so it
+    needs no separate branch here. A record whose timestamp does not
+    parse, or carries no timezone, never matches a time filter. The summary is a roll-up, not a step, so
     under any filter it is kept only when --type summary is given —
     the same rule as `blackbox query` — and with no filter at all it
     is printed, like an unfiltered watch. Filters combine with AND,
@@ -513,7 +547,7 @@ def watch_log(path, from_start=False,
               output=None, error_output=None, stop_after=None,
               max_records=None, types=None, errors_only=False,
               model=None, tool=None, min_tokens=None, min_cost=None,
-              since=None, until=None):
+              since=None, until=None, last=None):
     """Follow a log, printing each new step's transcript line as it
     lands, in the same format `blackbox replay` prints.
 
@@ -540,9 +574,17 @@ def watch_log(path, from_start=False,
     same window as `blackbox query` — parsed the way `blackbox
     record --ts` parses one, so a value that does not parse or
     carries no timezone raises ValueError, and --since after --until
-    raises ValueError too. The summary is a roll-up, not a step, so
-    under any filter it is kept only when --type summary is given,
-    the same rule as `blackbox query`. Filters combine with AND, and
+    raises ValueError too. `last` is a relative window, e.g. "10m":
+    it keeps only records from the last that long, as a lower bound
+    of now minus the duration, fixed when watching starts — a step
+    that lands later is stamped later than the bound, so live steps
+    always pass and --last only narrows the --from-start replay of
+    what is already in the log. `last` cannot be combined with
+    `since` or `until`, because it sets the lower bound itself, so
+    combining them raises ValueError, as does a value that is not a
+    duration like 30s, 10m, 2h, 1d or 1h30m. The summary is a
+    roll-up, not a step, so under any filter it is kept only when
+    --type summary is given, the same rule as `blackbox query`. Filters combine with AND, and
     a filtered step is still marked seen, so it is not re-checked
     on a re-read. `max_records` counts printed steps, not skipped
     ones.
@@ -554,8 +596,16 @@ def watch_log(path, from_start=False,
     """
     if poll_interval <= 0:
         raise ValueError("poll_interval must be positive")
+    if last is not None and (since is not None or until is not None):
+        raise ValueError("--last cannot be combined with --since or "
+                         "--until — it sets the lower bound itself")
     since_dt = _parse_bound(since, "--since") if since is not None else None
     until_dt = _parse_bound(until, "--until") if until is not None else None
+    if last is not None:
+        # Fixed when watching starts: a step that lands later is
+        # stamped later than the bound, so live steps always pass
+        # and --last only narrows the --from-start replay.
+        since_dt = datetime.now(timezone.utc) - _parse_duration(last)
     if (since_dt is not None and until_dt is not None
             and since_dt > until_dt):
         raise ValueError("--since must be at or before --until")

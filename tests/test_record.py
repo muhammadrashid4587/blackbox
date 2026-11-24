@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+from unittest import mock
 
 from blackbox import Recorder
 from blackbox.__main__ import main
@@ -284,6 +285,159 @@ class RecordCliTest(unittest.TestCase):
                          "--payload", "{not json"])
         self.assertEqual(code, 2)
         self.assertFalse(os.path.exists(path))
+
+
+class RecordStdinTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "run.jsonl")
+        with Recorder(self.path, task="t", model="gpt-5") as rec:
+            rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                       tokens={"input": 1200, "output": 340})
+            rec.record("tool_call", {"tool": "search",
+                                     "args": {"query": "mcp"}})
+            rec.record("tool_result", {"tool": "search",
+                                       "result": "3 results"})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, stdin_text, path=None, extra=()):
+        out, err = io.StringIO(), io.StringIO()
+        with (mock.patch("sys.stdin", io.StringIO(stdin_text)),
+              redirect_stdout(out), redirect_stderr(err)):
+            code = main(["record", path or self.path, "--stdin"]
+                        + list(extra))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_stdin_jsonl_appends_steps_and_keeps_chain(self):
+        stdin = (
+            '{"type": "tool_call", "payload": {"tool": "fetch", '
+            '"args": {"url": "https://example.com"}}}\n'
+            '\n'
+            '{"type": "tool_result", "payload": {"tool": "fetch", '
+            '"result": "ok"}}\n'
+            '{"type": "model_call", "payload": {"model": "gpt-5", '
+            '"prompt": "next"}, "tokens": {"input": 100, '
+            '"output": 20}, "ts": "2026-11-24T02:00:00Z"}\n')
+        code, out, err = self._run(stdin)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(out, "recorded 3 steps (seqs 3-5)\n")
+        records = load_records(self.path)
+        self.assertEqual(len(records), 7)  # 6 steps + summary
+        self.assertEqual([r["seq"] for r in records[:6]],
+                         [0, 1, 2, 3, 4, 5])
+        for i in range(1, 6):
+            self.assertEqual(records[i]["prev_hash"],
+                             records[i - 1]["hash"])
+        self.assertEqual(records[3]["type"], "tool_call")
+        self.assertEqual(records[5]["ts"], "2026-11-24T02:00:00Z")
+        self.assertEqual(records[5]["tokens"],
+                         {"input": 100, "output": 20})
+        self.assertEqual(records[6]["type"], "summary")
+        self.assertEqual(records[6]["payload"]["events"], 6)
+        self.assertEqual(records[6]["payload"]["task"], "t")
+        self.assertTrue(verify(self.path)["ok"])
+
+    def test_stdin_json_array_form(self):
+        path = os.path.join(self.tmp.name, "fresh.jsonl")
+        steps = json.dumps([
+            {"type": "tool_call", "payload": {"tool": "search"}},
+            {"type": "tool_result",
+             "payload": {"tool": "search", "result": "ok"}},
+        ])
+        code, out, err = self._run(steps, path=path)
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "recorded 2 steps (seqs 0-1)\n")
+        records = load_records(path)
+        self.assertEqual(len(records), 3)  # 2 steps + summary
+        self.assertEqual(records[0]["type"], "tool_call")
+        self.assertEqual(records[1]["type"], "tool_result")
+        self.assertTrue(verify(path)["ok"])
+
+    def test_stdin_single_step_reports_like_record(self):
+        code, out, err = self._run(
+            '{"type": "tool_call", "payload": {"tool": "search"}}\n')
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "recorded step 3 (tool_call)\n")
+        self.assertTrue(verify(self.path)["ok"])
+
+    def test_stdin_redacts_secrets(self):
+        code, out, err = self._run(
+            '{"type": "tool_call", "payload": {"tool": "search", '
+            '"api_key": "sk-live-123"}}\n')
+        self.assertEqual(code, 0)
+        records = load_records(self.path)
+        self.assertEqual(records[3]["payload"]["api_key"], "[REDACTED]")
+        with open(self.path, encoding="utf-8") as f:
+            self.assertNotIn("sk-live-123", f.read())
+
+    def test_stdin_sqlite_backend(self):
+        path = os.path.join(self.tmp.name, "run.db")
+        code, out, err = self._run(
+            '{"type": "tool_call", "payload": {"tool": "search"}}\n'
+            '{"type": "tool_result", "payload": {"tool": "search", '
+            '"result": "ok"}}\n',
+            path=path, extra=["--task", "t", "--model", "gpt-5"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "recorded 2 steps (seqs 0-1)\n")
+        self.assertTrue(verify(path)["ok"])
+        self.assertEqual(load_records(path)[-1]["payload"]["events"], 2)
+
+    def test_stdin_bad_line_leaves_log_untouched(self):
+        before = load_records(self.path)
+        code, out, err = self._run(
+            '{"type": "tool_call", "payload": {"tool": "search"}}\n'
+            '{not json\n')
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("stdin", err)
+        self.assertEqual(load_records(self.path), before)
+
+    def test_stdin_bad_step_leaves_log_untouched(self):
+        before = load_records(self.path)
+        bad_steps = [
+            # no type
+            '{"payload": {"tool": "search"}}',
+            # reserved type
+            '{"type": "summary", "payload": {}}',
+            # payload not an object
+            '{"type": "tool_call", "payload": ["search"]}',
+            # bad tokens
+            '{"type": "tool_call", "payload": {}, "tokens": -5}',
+            # bad ts (no timezone)
+            '{"type": "tool_call", "payload": {}, '
+            '"ts": "2026-11-24T01:00:00"}',
+            # not an object at all
+            '["tool_call"]',
+        ]
+        for bad in bad_steps:
+            code, out, err = self._run(bad + "\n")
+            self.assertEqual(code, 2, bad)
+            self.assertEqual(out, "", bad)
+            self.assertIn("stdin", err, bad)
+            self.assertEqual(load_records(self.path), before, bad)
+
+    def test_stdin_empty_is_an_error_and_creates_nothing(self):
+        path = os.path.join(self.tmp.name, "never.jsonl")
+        for text in ("", "  \n\n"):
+            code, out, err = self._run(text, path=path)
+            self.assertEqual(code, 2, repr(text))
+            self.assertEqual(out, "")
+            self.assertIn("stdin", err)
+            self.assertFalse(os.path.exists(path))
+
+    def test_stdin_cannot_combine_with_single_step_flags(self):
+        for extra in (["--type", "tool_call"],
+                      ["--payload", '{"tool": "search"}'],
+                      ["--tokens", "120"],
+                      ["--ts", "2026-11-24T01:00:00Z"]):
+            code, out, err = self._run(
+                '{"type": "tool_call", "payload": {}}\n', extra=extra)
+            self.assertEqual(code, 2, extra)
+            self.assertEqual(out, "")
+            self.assertIn("--stdin", err)
 
 
 class RecorderTsTest(unittest.TestCase):

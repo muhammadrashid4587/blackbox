@@ -29,6 +29,12 @@ make demo
 python -m blackbox record data/run.jsonl --type tool_call \
     --payload '{"tool": "search", "args": {"query": "mcp"}}'
 
+# Record a whole run from a pipeline, one JSON step per line
+printf '%s\n' \
+    '{"type": "model_call", "payload": {"model": "gpt-5"}, "tokens": {"input": 100, "output": 20}}' \
+    '{"type": "tool_call", "payload": {"tool": "search"}}' \
+    | python -m blackbox record data/run.jsonl --stdin
+
 # Check the log: OK, or the exact seq of the first broken record
 python -m blackbox verify data/demo.jsonl
 # OK: 9 records, hash chain intact
@@ -75,6 +81,31 @@ instead of a guessed time. `--tokens` takes a plain int or an
 input/output split as JSON; `--task` / `--model` name the session,
 defaulting to the log's existing values. Bad input exits non-zero
 and leaves the log untouched.
+
+Record steps in bulk from a pipeline:
+
+```bash
+printf '%s\n' \
+    '{"type": "model_call", "payload": {"model": "gpt-5"}, "tokens": {"input": 100, "output": 20}}' \
+    '{"type": "tool_call", "payload": {"tool": "search"}}' \
+    | python -m blackbox record data/run.jsonl --stdin
+# recorded 2 steps (seqs 0-1)
+```
+
+`--stdin` reads one JSON object per line (blank lines are skipped),
+or a single JSON array of step objects — each step carries its own
+`type`, and optionally `payload` (a JSON object, default `{}`),
+`tokens` (a plain int or an input/output split) and `ts` (ISO 8601
+with a timezone, default now). Every step goes through the same
+Recorder path as `blackbox record` — redacted, hash-chained and
+fsynced — and the log is closed once with a fresh summary covering
+all of them, so a shell pipeline can log a whole run without one
+process per step. All steps are validated before the log is opened,
+so a bad line, a reserved type (`summary` / `checkpoint`), bad
+tokens or a bad timestamp exits non-zero and leaves the log
+untouched; `--stdin` cannot be combined with `--type`, `--payload`,
+`--tokens` or `--ts`. It works on `.jsonl` logs and `.db` stores,
+and `--task` / `--model` still name the session.
 
 SQLite backend: pass a `.db` path instead of `.jsonl` and records go
 to a SQLite table instead of a text log. Same API, same records, same
@@ -437,7 +468,7 @@ read-only.
 
 ## Measured
 
-- 373 tests, all passing (`make test`).
+- 382 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -693,6 +724,20 @@ read-only.
   Next: record steps in bulk from stdin — pipe JSONL steps into
   `blackbox record --stdin` so a shell pipeline can log a whole
   run without one process per step.
+- `blackbox record --stdin`: reads steps from stdin — one JSON
+  object per line (blank lines skipped) or a single JSON array of
+  step objects, each step carrying its own type, payload, tokens
+  and ts — and appends them through the same Recorder path as
+  `blackbox record` (redacted, hash-chained, fsynced, one fresh
+  summary for the whole batch), so a shell pipeline can log a
+  whole run without one process per step; every step is validated
+  before the log is opened, so a bad line, a reserved type, bad
+  tokens or a bad timestamp exits non-zero and leaves the log
+  untouched, and it works on `.jsonl` logs and `.db` stores,
+  done (v0.38.0).
+  Next: record steps in bulk from a file — `blackbox record
+  --file steps.jsonl` reads the same step JSON as `--stdin`
+  from a file, for runs too big to pipe.
 
 ## Layout
 
@@ -762,5 +807,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            373 tests, all passing
+tests/            382 tests, all passing
 ```

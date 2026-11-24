@@ -6,6 +6,8 @@
     python -m blackbox mcp data/run.jsonl   # MCP server on stdio
     python -m blackbox record data/run.jsonl --type tool_call \
         --payload '{"tool": "search", "args": {"query": "mcp"}}'
+    printf '%s\n' '{"type": "tool_call", "payload": {"tool": "search"}}' \
+        | python -m blackbox record data/run.jsonl --stdin
     python -m blackbox span data/run.jsonl 0  # one step as an OTLP span
     python -m blackbox otel data/run.jsonl --out spans.json
     python -m blackbox metrics data/run.jsonl --out metrics.json
@@ -70,6 +72,87 @@ def _parse_record_tokens(text):
                      "e.g. 120 or '{\"input\": 1200, \"output\": 340}'")
 
 
+def _record_task_model(args):
+    """Keep the log's existing task/model in the summary the
+    Recorder writes on close, unless the flags override them."""
+    task, model = args.task, args.model
+    if (task is None or model is None) and os.path.exists(args.logfile):
+        try:
+            existing = load_records(args.logfile)
+        except (FileNotFoundError, ValueError, OSError):
+            existing = []
+        if existing and existing[-1].get("type") == "summary":
+            summary = existing[-1].get("payload") or {}
+            if task is None:
+                task = summary.get("task")
+            if model is None:
+                model = summary.get("model")
+    return task, model
+
+
+def _parse_stdin_steps(text):
+    """Parse piped steps for `blackbox record --stdin`: one JSON
+    object per line, or a single JSON array of step objects. Each
+    step is {"type": ..., "payload": {...}, "tokens": ..., "ts": ...};
+    payload, tokens and ts are optional. Raises ValueError with a
+    plain message on anything else — a bad step is never guessed at,
+    and the caller validates every step before opening the log, so
+    a bad batch leaves the log untouched.
+    """
+    stripped = text.strip()
+    if not stripped:
+        raise ValueError("--stdin: no steps on stdin")
+    if stripped.startswith("["):
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            raise ValueError("--stdin: stdin must be JSON steps, one "
+                             "per line or a JSON array") from None
+        if not isinstance(parsed, list):
+            raise ValueError("--stdin: stdin must be JSON steps, one "
+                             "per line or a JSON array")
+    else:
+        parsed = []
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                parsed.append(json.loads(line))
+            except json.JSONDecodeError:
+                raise ValueError("--stdin line %d: not a JSON object"
+                                 % lineno) from None
+    if not parsed:
+        raise ValueError("--stdin: no steps on stdin")
+    steps = []
+    for index, step in enumerate(parsed):
+        where = "--stdin step %d" % (index + 1)
+        if not isinstance(step, dict):
+            raise ValueError("%s: must be a JSON object" % where)
+        event_type = step.get("type")
+        if (not event_type or not isinstance(event_type, str)
+                or event_type in ("summary", "checkpoint")):
+            raise ValueError("%s: type must name a step type, not "
+                             "'summary' or 'checkpoint'" % where)
+        payload = step.get("payload", {})
+        if not isinstance(payload, dict):
+            raise ValueError("%s: payload must be a JSON object" % where)
+        tokens = step.get("tokens")
+        if tokens is not None:
+            try:
+                tokens = _parse_record_tokens(json.dumps(tokens))
+            except ValueError as exc:
+                raise ValueError("%s: %s" % (where, exc)) from None
+        ts = step.get("ts")
+        if ts is not None:
+            try:
+                _normalize_ts(ts)
+            except ValueError as exc:
+                raise ValueError("%s: %s" % (where, exc)) from None
+        steps.append({"type": event_type, "payload": payload,
+                      "tokens": tokens, "ts": ts})
+    return steps
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="blackbox",
@@ -97,12 +180,19 @@ def main(argv=None):
         "fsynced — so a step can be recorded without the MCP server "
         "or a Python script")
     p_record.add_argument("logfile")
-    p_record.add_argument("--type", required=True,
+    p_record.add_argument("--type",
                           help="step type, e.g. model_call, tool_call, "
-                          "tool_result")
-    p_record.add_argument("--payload", default="{}",
+                          "tool_result (required unless --stdin is given)")
+    p_record.add_argument("--payload", default=None,
                           help="step payload as a JSON object "
                           "(default: {})")
+    p_record.add_argument("--stdin", action="store_true",
+                          help="read steps from stdin instead of the "
+                          "flags: one JSON object per line, or a JSON "
+                          "array of step objects — each step carries "
+                          "its own type, payload, tokens and ts, so a "
+                          "shell pipeline can log a whole run without "
+                          "one process per step")
     p_record.add_argument("--tokens",
                           help="token count as a JSON int, or an "
                           "input/output split as a JSON object, e.g. "
@@ -268,6 +358,43 @@ def main(argv=None):
         serve_stdio(args.logfile, task=args.task, model=args.model)
         return 0
     if args.command == "record":
+        if args.stdin:
+            # --stdin carries its own type/payload/tokens/ts per step,
+            # so the single-step flags must not be mixed in.
+            if (args.type is not None or args.payload is not None
+                    or args.tokens is not None or args.ts is not None):
+                print("record: --stdin cannot be combined with --type, "
+                      "--payload, --tokens or --ts — each step carries "
+                      "its own", file=sys.stderr)
+                return 2
+            try:
+                steps = _parse_stdin_steps(sys.stdin.read())
+            except ValueError as exc:
+                print("record: %s" % exc, file=sys.stderr)
+                return 2
+            task, model = _record_task_model(args)
+            try:
+                with Recorder(args.logfile, task=task,
+                              model=model) as rec:
+                    seqs = [rec.record(step["type"], step["payload"],
+                                       tokens=step["tokens"],
+                                       ts=step["ts"])
+                            for step in steps]
+            except ValueError as exc:
+                print("record: %s" % exc, file=sys.stderr)
+                return 2
+            seqs = [s for s in seqs if s is not None]
+            if not seqs:
+                print("recorded 0 steps (all sampled out)")
+            elif len(seqs) == 1:
+                print("recorded step %d (%s)"
+                      % (seqs[0], steps[0]["type"]))
+            else:
+                print("recorded %d steps (seqs %d-%d)"
+                      % (len(seqs), seqs[0], seqs[-1]))
+            return 0
+        if args.type is None:
+            parser.error("--type is required unless --stdin is given")
         # Validate everything before opening the log: opening a
         # Recorder resumes it, which drops a trailing summary, so a
         # failed record must not get that far.
@@ -276,7 +403,8 @@ def main(argv=None):
                   "or 'checkpoint'", file=sys.stderr)
             return 2
         try:
-            payload = json.loads(args.payload)
+            payload = json.loads(args.payload
+                                 if args.payload is not None else "{}")
         except json.JSONDecodeError:
             print("record: --payload must be a JSON object",
                   file=sys.stderr)
@@ -293,20 +421,7 @@ def main(argv=None):
         except ValueError as exc:
             print("record: %s" % exc, file=sys.stderr)
             return 2
-        # Keep the log's existing task/model in the summary the
-        # Recorder writes on close, unless the flags override them.
-        task, model = args.task, args.model
-        if (task is None or model is None) and os.path.exists(args.logfile):
-            try:
-                existing = load_records(args.logfile)
-            except (FileNotFoundError, ValueError, OSError):
-                existing = []
-            if existing and existing[-1].get("type") == "summary":
-                summary = existing[-1].get("payload") or {}
-                if task is None:
-                    task = summary.get("task")
-                if model is None:
-                    model = summary.get("model")
+        task, model = _record_task_model(args)
         try:
             with Recorder(args.logfile, task=task, model=model) as rec:
                 seq = rec.record(args.type, payload, tokens=tokens,

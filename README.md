@@ -400,7 +400,7 @@ read-only.
 
 ## Measured
 
-- 307 tests, all passing (`make test`).
+- 319 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -596,10 +596,18 @@ read-only.
   template and the report always agree; a model or tool the
   session does not have, or an empty name, is an error, done
   (v0.32.0).
-  Next: resource templates for the remaining session
-  resources (the transcript / raw records), so a client can
-  discover the whole session surface from
-  `resources/templates/list`.
+- MCP resource template for one step's raw record:
+  `blackbox://session/record/{seq}`, listed by
+  `resources/templates/list`, so a client can read one step's
+  record — seq, timestamp, type, payload, tokens and the hash
+  chain — without the whole log. It reuses the same
+  `load_records` as the `blackbox://session.json` resource,
+  so the template and the resource always agree; a step number
+  that is not an integer, or a step the session does not have,
+  is an error, done (v0.33.0).
+  Next: a resource template for the transcript (one step's
+  formatted line), so a client can discover the whole session
+  surface from `resources/templates/list`.
 
 ## Layout
 
@@ -611,7 +619,8 @@ blackbox/
   costs.py        per-model cost tracking: list prices, cost math
   mcp_server.py   MCP server on stdio: record / verify / replay tools,
                   session resources, resource templates for the
-                  diff and a trace subtree, analyze_session,
+                  diff, a trace subtree, aggregates slices and one
+                  step's raw record, analyze_session,
                   summarize_costs, summarize_anomalies,
                   summarize_sampling, summarize_trace,
                   summarize_diff and summarize_retention prompts,

@@ -11,7 +11,7 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
-It also exposes the session as five resources, four resource
+It also exposes the session as five resources, five resource
 templates, and eight prompts:
 
     blackbox://session        the session as a readable transcript
@@ -59,6 +59,13 @@ templates, and eight prompts:
                               carries for that tool, so a client
                               can read one tool's cost without the
                               whole breakdown
+    blackbox://session/record/{seq}
+                              one step's raw record as a resource
+                              template: the record for step seq as
+                              JSON — the same record the
+                              blackbox://session.json resource
+                              carries for that step, so a client can
+                              read one step without the whole log
     analyze_session           a prompt template for analysing the
                               session (optional focus argument)
     summarize_costs           a prompt template for summarising the
@@ -293,9 +300,10 @@ RESOURCES = [
 ]
 
 # Resource templates: the diff against a named run, one branch of
-# the causal trace, and one model's or one tool's cost totals, so a
-# client can discover them from resources/templates/list and expand
-# the template instead of building a URI by hand. The diff template
+# the causal trace, one model's or one tool's cost totals, and one
+# step's raw record, so a client can discover them from
+# resources/templates/list and expand the template instead of
+# building a URI by hand. The diff template
 # parameter is the other run's log path, exactly the other_path the
 # prompt takes and the query-parameter resource takes — the template,
 # the prompt and the resource all read the same diff, so they always
@@ -374,6 +382,20 @@ RESOURCE_TEMPLATES = [
                         "Read it by expanding the template with a "
                         "tool name, e.g. blackbox://session/"
                         "aggregates/tool/search."),
+        "mimeType": "application/json",
+    },
+    {
+        "uriTemplate": "blackbox://session/record/{seq}",
+        "name": "session/record/{seq}",
+        "description": ("One step's raw record as JSON: the record "
+                        "for step seq — seq, timestamp, type, "
+                        "payload, tokens and the hash chain — the "
+                        "same record the blackbox://session.json "
+                        "resource carries for that step, so a "
+                        "client can read one step without the whole "
+                        "log. Read it by expanding the template "
+                        "with a step number, e.g. "
+                        "blackbox://session/record/2."),
         "mimeType": "application/json",
     },
 ]
@@ -1415,6 +1437,33 @@ class MCPServer:
             {"uri": uri, "mimeType": "application/json",
              "text": text}]})
 
+    def _read_record(self, msg_id, uri, seq_text):
+        """One step's raw record, as a resource read.
+
+        One implementation for the blackbox://session/record/{seq}
+        template: the record for step seq, from `load_records` —
+        the same record the blackbox://session.json resource
+        carries for that step — so the template and the resource
+        always agree. A step number that is not an integer, or a
+        step the session does not have, is an error.
+        """
+        try:
+            seq = int(unquote(seq_text))
+        except ValueError:
+            return _error(
+                msg_id, INVALID_PARAMS,
+                "blackbox://session/record/{seq} needs a step number, "
+                "e.g. blackbox://session/record/2")
+        records = load_records(self.log_path)
+        record = next((r for r in records if r["seq"] == seq), None)
+        if record is None:
+            return _error(msg_id, INVALID_PARAMS,
+                          "no step %d in this session" % seq)
+        text = json.dumps(record, indent=2, sort_keys=True)
+        return _result(msg_id, {"contents": [
+            {"uri": uri, "mimeType": "application/json",
+             "text": text}]})
+
     def _resources_read(self, msg_id, params):
         uri = params.get("uri")
         if uri == "blackbox://session":
@@ -1463,6 +1512,17 @@ class MCPServer:
             name_text = uri[len("blackbox://session/aggregates/tool/"):]
             return self._read_aggregates_slice(msg_id, uri, "tool",
                                                name_text)
+        if uri.startswith("blackbox://session/record/"):
+            # The resource template blackbox://session/record/{seq}:
+            # one step's raw record as JSON, the same record the
+            # blackbox://session.json resource carries for that step.
+            seq_text = uri[len("blackbox://session/record/"):]
+            if not seq_text:
+                return _error(
+                    msg_id, INVALID_PARAMS,
+                    "blackbox://session/record/{seq} needs a step "
+                    "number, e.g. blackbox://session/record/2")
+            return self._read_record(msg_id, uri, seq_text)
         if uri.startswith("blackbox://session/trace/"):
             # The resource template blackbox://session/trace/{seq}:
             # the subtree rooted at step seq, the same node the

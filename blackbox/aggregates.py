@@ -12,15 +12,19 @@ stores, and on compacted logs too: a checkpoint's compacted count
 is reported separately, since the removed records are gone and
 cannot be re-aggregated. --last keeps only steps from the last N
 seconds/minutes/hours/days (e.g. 10m), the same relative window as
-`blackbox query --last`, so a finished session's totals can be
-narrowed to the recent past the same way its steps can.
+`blackbox query --last`, and --since / --until keep only steps in
+an absolute window, the same window as `blackbox query
+--since` / `--until`, so a finished session's totals can be
+narrowed to the recent past or to an absolute window the same way
+its steps can.
 """
 
 import json
 from datetime import datetime
 
 from .costs import cost_for
-from .query import _is_error, _record_cost, query_records
+from .query import (_is_error, _parse_bound, _parse_record_ts,
+                    _record_cost, query_records)
 from .recorder import _tokens_total
 from .replay import load_records, model_usage
 from .trace import link_parents
@@ -36,25 +40,58 @@ def _parse_ts(ts):
         return None
 
 
-def _window_records(records, last=None, now=None):
-    """The records inside a --last relative window.
+def _window_records(records, last=None, since=None, until=None,
+                    now=None):
+    """The records inside a --last relative window or a --since /
+    --until absolute window.
 
-    Steps are filtered through the shared `query_records` filter, so
-    the duration parsing and the timestamp strictness are the same as
-    `blackbox query --last`: a value that is not a duration raises
-    ValueError, and a step whose timestamp does not parse, or carries
-    no timezone, never matches. The summary and checkpoint records
-    are kept untouched — they are bookkeeping about the whole log, so
-    `sampled_out` and `compacted_count` still describe the log, not
-    just the window — and the original order is preserved, so
-    started/ended are still the window's first and last steps. With
-    no --last the records come back unchanged.
+    Steps are filtered through the shared `query_records` filter for
+    --last, so the duration parsing and the timestamp strictness are
+    the same as `blackbox query --last`: a value that is not a
+    duration raises ValueError, and a step whose timestamp does not
+    parse, or carries no timezone, never matches. --since / --until
+    are parsed by the shared `_parse_bound`, the same way `blackbox
+    watch` parses them, and compared as datetimes through
+    `_parse_record_ts`, so a record stamped with fractional seconds
+    compares correctly against a whole-second bound and a step whose
+    timestamp does not parse, or carries no timezone, never matches.
+    --last cannot be combined with --since or --until, because it
+    sets the lower bound itself, and --since after --until raises
+    ValueError, the same conflict rules as `blackbox query --last`.
+    The summary and checkpoint records are kept untouched — they are
+    bookkeeping about the whole log, so `sampled_out` and
+    `compacted_count` still describe the log, not just the window —
+    and the original order is preserved, so started/ended are still
+    the window's first and last steps. With no window the records
+    come back unchanged.
     """
-    if last is None:
+    if last is not None and (since is not None or until is not None):
+        raise ValueError("--last cannot be combined with --since or "
+                         "--until — it sets the lower bound itself")
+    if last is None and since is None and until is None:
         return records
     steps = [r for r in records
              if r["type"] not in ("summary", "checkpoint")]
-    kept = query_records(steps, last=last, now=now)
+    if last is not None:
+        kept = query_records(steps, last=last, now=now)
+    else:
+        since_dt = (_parse_bound(since, "--since")
+                    if since is not None else None)
+        until_dt = (_parse_bound(until, "--until")
+                    if until is not None else None)
+        if (since_dt is not None and until_dt is not None
+                and since_dt > until_dt):
+            raise ValueError("--since must be at or before --until")
+        kept = []
+        for record in steps:
+            ts = _parse_record_ts(record.get("ts"))
+            if ts is None:
+                continue
+            if since_dt is not None and ts < since_dt:
+                continue
+            if until_dt is not None and ts > until_dt:
+                continue
+            kept.append(record)
     kept_ids = {id(record) for record in kept}
     return [r for r in records
             if r["type"] in ("summary", "checkpoint")
@@ -303,7 +340,8 @@ def format_cost_totals(totals):
     return "\n".join(lines)
 
 
-def cost_totals_log(path, as_json=False, last=None, now=None):
+def cost_totals_log(path, as_json=False, last=None, since=None,
+                    until=None, now=None):
     """Compute a log's cost totals and print them.
 
     --json prints the cost totals dict as JSON; otherwise a short
@@ -311,12 +349,18 @@ def cost_totals_log(path, as_json=False, last=None, now=None):
     string like "10m" or a timedelta — keeping only steps from the
     last that long, as a lower bound of now minus the duration (now
     defaults to the current UTC time, and is a parameter so tests can
-    fix it); a value that is not a duration raises ValueError. The
-    summary and checkpoint records are kept, so `sampled_out` and
-    `compacted_count` still describe the whole log. Returns the cost
-    totals dict."""
+    fix it); a value that is not a duration raises ValueError.
+    since / until are ISO 8601 timestamps with a timezone, keeping
+    only steps in the closed window [since, until], the same window
+    as `blackbox query --since` / `--until`; a value that does not
+    parse or carries no timezone raises ValueError, as does --since
+    after --until, and --last cannot be combined with --since or
+    --until. The summary and checkpoint records are kept, so
+    `sampled_out` and `compacted_count` still describe the whole log.
+    Returns the cost totals dict."""
     records = load_records(path)
-    records = _window_records(records, last=last, now=now)
+    records = _window_records(records, last=last, since=since,
+                              until=until, now=now)
     totals = cost_totals(records)
     if as_json:
         print(json.dumps(totals, indent=2, sort_keys=True))
@@ -373,7 +417,8 @@ def format_aggregates(agg):
     return "\n".join(lines)
 
 
-def aggregates_log(path, as_json=False, last=None, now=None):
+def aggregates_log(path, as_json=False, last=None, since=None,
+                   until=None, now=None):
     """Compute a log's session aggregates and print them.
 
     --json prints the aggregates dict as JSON; otherwise a short
@@ -381,12 +426,18 @@ def aggregates_log(path, as_json=False, last=None, now=None):
     string like "10m" or a timedelta — keeping only steps from the
     last that long, as a lower bound of now minus the duration (now
     defaults to the current UTC time, and is a parameter so tests can
-    fix it); a value that is not a duration raises ValueError. The
-    summary and checkpoint records are kept, so `sampled_out` and
-    `compacted_count` still describe the whole log. Returns the
-    aggregates dict."""
+    fix it); a value that is not a duration raises ValueError.
+    since / until are ISO 8601 timestamps with a timezone, keeping
+    only steps in the closed window [since, until], the same window
+    as `blackbox query --since` / `--until`; a value that does not
+    parse or carries no timezone raises ValueError, as does --since
+    after --until, and --last cannot be combined with --since or
+    --until. The summary and checkpoint records are kept, so
+    `sampled_out` and `compacted_count` still describe the whole log.
+    Returns the aggregates dict."""
     records = load_records(path)
-    records = _window_records(records, last=last, now=now)
+    records = _window_records(records, last=last, since=since,
+                              until=until, now=now)
     agg = session_aggregates(records)
     if as_json:
         print(json.dumps(agg, indent=2, sort_keys=True))

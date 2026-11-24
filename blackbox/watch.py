@@ -65,30 +65,14 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import quote
 
-from .query import (_is_error, _parse_duration, _parse_record_ts,
-                    _record_cost)
-from .recorder import _normalize_ts, _tokens_total
+from .query import (_is_error, _parse_bound, _parse_duration,
+                    _parse_record_ts, _record_cost)
+from .recorder import _tokens_total
 from .replay import format_record
 from .sqlite_store import _row_to_record, is_sqlite_path
 
 DEFAULT_POLL_INTERVAL = 0.2
 _READ_CHUNK = 65536
-
-
-def _parse_bound(value, flag):
-    """Parse a --since / --until value the way `blackbox record --ts`
-    parses one: ISO 8601 with a timezone, normalised to UTC.
-    Returns an aware datetime. Raises ValueError naming the flag on
-    a value that does not parse or carries no timezone — a naive
-    timestamp has no honest meaning, so it is an error, not a silent
-    assumption of UTC."""
-    try:
-        normalized = _normalize_ts(value)
-    except ValueError:
-        raise ValueError("%s must be an ISO 8601 timestamp with a "
-                         "timezone, e.g. 2026-11-24T01:00:00Z"
-                         % flag) from None
-    return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
 
 
 def _record_identity(record, line):

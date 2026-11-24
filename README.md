@@ -947,9 +947,28 @@ and `max_records` counts printed steps, not skipped ones.
   take the same filter as a Python API (a duration string or a
   timedelta, with `now` fixable for tests). Works on `.jsonl` logs
   and `.db` stores, done (v0.47.0).
+- Aggregates/costs time-range filters: `blackbox aggregates
+  --since 2026-11-22T10:01:00Z --until 2026-11-22T10:04:30Z` and
+  the same flags on `blackbox costs` narrow a finished session's
+  totals to an absolute window — ISO 8601 timestamps with a
+  timezone, the same closed window as `blackbox query --since` /
+  `--until`, compared as datetimes so a record stamped with
+  fractional seconds compares correctly against a whole-second
+  bound. The window reuses the shared bound parser (`_parse_bound`
+  moved from `watch.py` into `query.py`, where the other filter
+  helpers live) and `_parse_record_ts`, so a value that does not
+  parse or carries no timezone is an error, exit code 2, --since
+  after --until is an error, exit code 2, --last cannot be combined
+  with --since or --until, exit code 2, and a step whose timestamp
+  does not parse, or carries no timezone, never matches. The
+  summary and checkpoint records are kept untouched, so
+  `sampled_out` and `compacted_count` still describe the whole log,
+  not just the window. `aggregates_log` / `cost_totals_log` in
+  `aggregates.py` take the same filters as a Python API. Works on
+  `.jsonl` logs and `.db` stores, done (v0.48.0).
   Next: `--since` / `--until` time-range filters for `blackbox
-  aggregates` / `blackbox costs`, so a finished session's totals can
-  be narrowed to an absolute window the same way its steps can.
+  metrics`, so the OTLP metrics export can be narrowed to an
+  absolute window the same way aggregates can.
 
 ## Layout
 

@@ -174,6 +174,29 @@ class AggregatesLogTest(unittest.TestCase):
             self.assertEqual(
                 main(["aggregates", self.path, "--last", "10"]), 2)
 
+    def test_cli_aggregates_since_until(self):
+        # The log was just recorded, so a wide absolute window
+        # matches every step; a bad bound, a reversed window, and
+        # --last combined with --since are all errors, exit code 2.
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(
+                main(["aggregates", self.path, "--since",
+                      "2026-11-01T00:00:00Z", "--until",
+                      "2027-01-01T00:00:00Z"]), 0)
+        self.assertIn("session: 3 steps", out.getvalue())
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                main(["aggregates", self.path, "--since",
+                      "tomorrow"]), 2)
+            self.assertEqual(
+                main(["aggregates", self.path, "--since",
+                      "2027-01-01T00:00:00Z", "--until",
+                      "2026-01-01T00:00:00Z"]), 2)
+            self.assertEqual(
+                main(["aggregates", self.path, "--last", "1d",
+                      "--since", "2026-11-01T00:00:00Z"]), 2)
+
     def test_works_on_sqlite_store(self):
         db_path = os.path.join(self.tmp.name, "run.db")
         with Recorder(db_path, task="test") as rec:
@@ -377,6 +400,29 @@ class CostTotalsLogTest(unittest.TestCase):
             self.assertEqual(
                 main(["costs", self.path, "--last", "10"]), 2)
 
+    def test_cli_costs_since_until(self):
+        # The log was just recorded, so a wide absolute window
+        # matches every step; a bad bound, a reversed window, and
+        # --last combined with --until are all errors, exit code 2.
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(
+                main(["costs", self.path, "--since",
+                      "2026-11-01T00:00:00Z", "--until",
+                      "2027-01-01T00:00:00Z"]), 0)
+        self.assertIn("cost totals: $0.006250 priced", out.getvalue())
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                main(["costs", self.path, "--since",
+                      "2026-11-22T10:00:00"]), 2)
+            self.assertEqual(
+                main(["costs", self.path, "--since",
+                      "2027-01-01T00:00:00Z", "--until",
+                      "2026-01-01T00:00:00Z"]), 2)
+            self.assertEqual(
+                main(["costs", self.path, "--last", "1d",
+                      "--until", "2027-01-01T00:00:00Z"]), 2)
+
 
 NOW = datetime(2026, 11, 22, 10, 6, tzinfo=timezone.utc)
 
@@ -473,6 +519,170 @@ class AggregatesLastTest(unittest.TestCase):
         for bad in ("10", "1.5m", "0m", "", "next week"):
             with self.assertRaises(ValueError):
                 cost_totals_log(self.path, last=bad, now=NOW)
+
+
+class AggregatesSinceUntilTest(unittest.TestCase):
+    """--since / --until narrow aggregates and costs to an absolute
+    window.
+
+    Same fixture as AggregatesLastTest, plus a step stamped with a
+    naive timestamp (seq 8, no timezone) that never matches a window.
+    The closed window [10:01:00Z, 10:04:30Z] keeps seqs 1-4: the
+    priced gpt-5 call at 10:00 and the small gpt-5 call at 10:05
+    fall outside it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "run.jsonl")
+        records = [
+            _record(0, "model_call", {"model": "gpt-5", "prompt": "plan"},
+                    {"input": 1000, "output": 500},
+                    "2026-11-22T10:00:00Z"),
+            _record(1, "tool_call", {"tool": "search", "args": {"q": "x"}},
+                    None, "2026-11-22T10:01:00Z"),
+            _record(2, "tool_result", {"tool": "search", "result": "ok"},
+                    None, "2026-11-22T10:01:30Z"),
+            _record(3, "tool_result", {"tool": "fetch",
+                                       "result": "error: 404"},
+                    None, "2026-11-22T10:04:00Z"),
+            _record(4, "model_call", {"model": "unknown-model",
+                                      "prompt": "p"},
+                    {"input": 9000, "output": 9000},
+                    "2026-11-22T10:04:30Z"),
+            _record(5, "model_call", {"model": "gpt-5", "prompt": "small"},
+                    50, "2026-11-22T10:05:00Z"),
+            _record(6, "summary", {"events": 6, "total_tokens": 19550,
+                                   "sampled_out": 2},
+                    None, "2026-11-22T10:06:00Z"),
+            _record(7, "checkpoint", {"compacted_count": 3,
+                                      "head_hash": "ab" * 32},
+                    None, "2026-11-22T09:00:00Z"),
+            _record(8, "tool_call", {"tool": "search", "args": {}},
+                    None, "2026-11-22T10:02:00"),
+        ]
+        with open(self.path, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_aggregates_window_keeps_only_in_window_steps(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            agg = aggregates_log(
+                self.path, since="2026-11-22T10:01:00Z",
+                until="2026-11-22T10:04:30Z")
+        self.assertEqual(agg["steps"], 4)
+        self.assertEqual(agg["started"], "2026-11-22T10:01:00Z")
+        self.assertEqual(agg["ended"], "2026-11-22T10:04:30Z")
+        self.assertEqual(agg["duration_seconds"], 210.0)
+        # Only seq 4 carries tokens (18000); the priced seq 0 call
+        # is outside the window, so nothing is priced.
+        self.assertEqual(agg["total_tokens"], 18000)
+        self.assertEqual(agg["total_cost_usd"], 0.0)
+        self.assertEqual(agg["unpriced_model_calls"], 1)
+        self.assertEqual(agg["errors"], 1)
+        self.assertNotIn("gpt-5", agg["by_model"])
+        # The naive-timestamp step sits inside the window's span but
+        # carries no timezone, so it never matches.
+        self.assertEqual(agg["by_tool"], {"search": 1})
+        self.assertIn("session: 4 steps", out.getvalue())
+
+    def test_aggregates_window_keeps_whole_log_bookkeeping(self):
+        # The summary and checkpoint are bookkeeping about the whole
+        # log, so sampled_out and compacted_count survive the window.
+        out = io.StringIO()
+        with redirect_stdout(out):
+            agg = aggregates_log(
+                self.path, since="2026-11-22T10:01:00Z",
+                until="2026-11-22T10:04:30Z")
+        self.assertEqual(agg["sampled_out"], 2)
+        self.assertEqual(agg["compacted_count"], 3)
+
+    def test_aggregates_since_only_and_until_only(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            agg = aggregates_log(self.path,
+                                 since="2026-11-22T10:04:00Z")
+        self.assertEqual(agg["steps"], 3)
+        self.assertEqual(agg["total_tokens"], 18050)
+        self.assertEqual(agg["errors"], 1)
+        with redirect_stdout(out):
+            agg = aggregates_log(self.path,
+                                 until="2026-11-22T10:01:00Z")
+        self.assertEqual(agg["steps"], 2)
+        self.assertEqual(agg["duration_seconds"], 60.0)
+        self.assertEqual(agg["total_tokens"], 1500)
+        self.assertEqual(agg["total_cost_usd"], 0.00625)
+
+    def test_aggregates_window_compares_as_datetimes(self):
+        # A fractional-second bound keeps seq 3 (10:04:00) but drops
+        # seq 2 (10:01:30), which a plain string comparison against
+        # the whole-second bound would get wrong.
+        out = io.StringIO()
+        with redirect_stdout(out):
+            agg = aggregates_log(
+                self.path, since="2026-11-22T10:01:30.500Z",
+                until="2026-11-22T10:04:00Z")
+        self.assertEqual(agg["steps"], 1)
+        self.assertEqual(agg["error_seqs"], [3])
+
+    def test_aggregates_window_accepts_a_timezone_offset(self):
+        # 12:01:00+02:00 is 10:01:00Z, so the window is the same one.
+        out = io.StringIO()
+        with redirect_stdout(out):
+            agg = aggregates_log(
+                self.path, since="2026-11-22T12:01:00+02:00",
+                until="2026-11-22T10:04:30Z")
+        self.assertEqual(agg["steps"], 4)
+
+    def test_aggregates_window_rejects_bad_bounds(self):
+        for bad in ("tomorrow", "2026-11-22T10:00:00", "", "10m"):
+            with self.assertRaises(ValueError):
+                aggregates_log(self.path, since=bad)
+            with self.assertRaises(ValueError):
+                aggregates_log(self.path, until=bad)
+        with self.assertRaises(ValueError):
+            aggregates_log(self.path,
+                           since="2026-11-22T10:05:00Z",
+                           until="2026-11-22T10:01:00Z")
+        with self.assertRaises(ValueError):
+            aggregates_log(self.path, last="5m",
+                           since="2026-11-22T10:01:00Z", now=NOW)
+        with self.assertRaises(ValueError):
+            aggregates_log(self.path, last="5m",
+                           until="2026-11-22T10:04:30Z", now=NOW)
+
+    def test_costs_window_keeps_only_in_window_steps(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            totals = cost_totals_log(
+                self.path, since="2026-11-22T10:01:00Z",
+                until="2026-11-22T10:04:30Z")
+        self.assertEqual(totals["total_cost_usd"], 0.0)
+        self.assertEqual(totals["unpriced_model_calls"], 1)
+        self.assertEqual(totals["per_model"]["unknown-model"]["calls"], 1)
+        self.assertNotIn("gpt-5", totals["per_model"])
+        # The search tool_call is in the window, but the model_call
+        # that invoked it is not, so it is counted as an orphan with
+        # no tokens and no cost.
+        self.assertEqual(totals["per_tool"]["search"]["calls"], 1)
+        self.assertIsNone(totals["per_tool"]["search"]["cost_usd"])
+        self.assertIn("cost totals: $0.000000 priced", out.getvalue())
+
+    def test_costs_window_rejects_bad_bounds(self):
+        for bad in ("tomorrow", "2026-11-22T10:00:00", ""):
+            with self.assertRaises(ValueError):
+                cost_totals_log(self.path, since=bad)
+        with self.assertRaises(ValueError):
+            cost_totals_log(self.path,
+                            since="2026-11-22T10:05:00Z",
+                            until="2026-11-22T10:01:00Z")
+        with self.assertRaises(ValueError):
+            cost_totals_log(self.path, last="5m",
+                            since="2026-11-22T10:01:00Z", now=NOW)
 
 
 if __name__ == "__main__":

@@ -168,7 +168,20 @@ rooted at step seq — the same node the
 its children in log order — so a client can read one branch
 without the whole tree, e.g. `blackbox://session/trace/2`.
 Reading it with a step number that is not an integer, or a step
-the session does not have, is an error.
+the session does not have, is an error. Five more resource
+templates name one slice each:
+`blackbox://session/aggregates/model/{model}` and
+`blackbox://session/aggregates/tool/{tool}` (one model's or one
+tool's totals), `blackbox://session/record/{seq}` (one step's raw
+record), `blackbox://session/transcript/{seq}` (one step's
+formatted line), and `blackbox://session/span/{seq}` (one step as
+a single OTLP span — the step kind as the span name, the step
+number as the span id, start/end times from the record's
+timestamps, and a USD cost attribute on a priced model_call,
+never a guessed number). Each reuses the same computation as the
+resource or report it mirrors, so the template and the original
+always agree; a step number that is not an integer, or a step the
+session does not have, is an error.
 One prompt template, `analyze_session`, hands the client a prompt
 for analysing the session, with an optional `focus` argument
 (`errors`, `cost`, `tool usage`, or anything else); the prompt
@@ -400,7 +413,7 @@ read-only.
 
 ## Measured
 
-- 324 tests, all passing (`make test`).
+- 337 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -615,9 +628,25 @@ read-only.
   resource, so the template and the resource always agree; a
   step number that is not an integer, or a step the session
   does not have, is an error, done (v0.34.0).
-  Next: a resource template for one step's OTLP span
-  (`blackbox://session/span/{seq}`), so a client can read one
-  step as a span without exporting the whole trace.
+- MCP resource template for one step's OTLP span:
+  `blackbox://session/span/{seq}`, listed by
+  `resources/templates/list`, so a client can read one step as
+  a single OTLP span without exporting the whole trace. It
+  reuses the same `record_to_span` from `otel.py` as the full
+  `blackbox otel` export, so the span agrees with the export,
+  the transcript and the raw record — with the step number as
+  the span id and the step kind as the span name, start/end
+  times from the record's timestamps (the next step's, or the
+  summary's for the last step; 1 ms if there is no later
+  timestamp), and a `blackbox.cost_usd` attribute on a
+  model_call with an input/output split and a known price; an
+  unpriced call carries none, never a guessed number, and a
+  step with no usable timestamp is an error instead of a span
+  with invented times. The summary record is not a step, so it
+  has no span, done (v0.35.0).
+  Next: a `blackbox span` CLI command that prints one step's
+  OTLP span, the same span the template serves, so the span is
+  readable without an MCP client.
 
 ## Layout
 
@@ -630,7 +659,8 @@ blackbox/
   mcp_server.py   MCP server on stdio: record / verify / replay tools,
                   session resources, resource templates for the
                   diff, a trace subtree, aggregates slices, one
-                  step's raw record and one step's transcript line, analyze_session,
+                  step's raw record, one step's transcript line and
+                  one step's OTLP span, analyze_session,
                   summarize_costs, summarize_anomalies,
                   summarize_sampling, summarize_trace,
                   summarize_diff and summarize_retention prompts,
@@ -668,7 +698,9 @@ blackbox/
                   trace/span ids from the hash chain, round-trip, and
                   OTLP Sum metrics (per-model calls, tokens, latency,
                   cost; per-tool calls); --causal parents from the
-                  causal trace reconstruction
+                  causal trace reconstruction; `session_span` renders
+                  one step as a single span for the
+                  blackbox://session/span/{seq} template
   live_export.py  live OTLP export: POST spans to a collector over
                   HTTP with retry/backoff, background batching
                   thread, Recorder integration, `export --live` CLI
@@ -682,5 +714,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            324 tests, all passing
+tests/            337 tests, all passing
 ```

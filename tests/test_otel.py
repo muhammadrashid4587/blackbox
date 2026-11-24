@@ -7,7 +7,7 @@ import unittest
 
 from blackbox import Recorder
 from blackbox.otel import (export_otlp, export_otlp_file, records_to_spans,
-                           spans_to_records)
+                           session_span, spans_to_records)
 
 
 class OtelTest(unittest.TestCase):
@@ -75,6 +75,37 @@ class OtelTest(unittest.TestCase):
         for span in spans:
             self.assertLessEqual(int(span["startTimeUnixNano"]),
                                 int(span["endTimeUnixNano"]))
+
+    def test_session_span_one_step(self):
+        span = session_span(self.records, 1)
+        self.assertEqual(span["spanId"], "%016x" % 1)
+        self.assertEqual(span["name"], "tool_call")
+        self.assertEqual(span["traceId"], self.records[0]["hash"][:32])
+        self.assertEqual(span["parentSpanId"],
+                         self.records[0]["hash"][:16])
+        exported = records_to_spans(self.records)[1]
+        self.assertEqual(span["startTimeUnixNano"],
+                         exported["startTimeUnixNano"])
+        self.assertEqual(span["endTimeUnixNano"],
+                         exported["endTimeUnixNano"])
+        self.assertEqual(span["attributes"], exported["attributes"])
+
+    def test_session_span_unknown_and_summary_seqs_are_none(self):
+        self.assertIsNone(session_span(self.records, 99))
+        self.assertIsNone(session_span(self.records, 3))  # the summary
+
+    def test_session_span_unpriced_model_has_no_cost(self):
+        # Model "m" has no published price: no cost attribute,
+        # never a guessed number.
+        span = session_span(self.records, 0)
+        keys = [a["key"] for a in span["attributes"]]
+        self.assertNotIn("blackbox.cost_usd", keys)
+
+    def test_session_span_missing_timestamp_is_an_error(self):
+        records = [dict(r) for r in self.records]
+        del records[0]["ts"]
+        with self.assertRaises(ValueError):
+            session_span(records, 0)
 
     def test_round_trip_recovers_steps(self):
         spans = self._spans()

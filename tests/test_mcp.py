@@ -6,9 +6,11 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 
 from blackbox import Recorder
 from blackbox.mcp_server import MCPServer
+from blackbox.otel import records_to_spans
 from blackbox.replay import load_records
 from blackbox.verify import verify
 
@@ -24,6 +26,14 @@ def _call(server, msg_id, tool, arguments):
     return server.handle_message(_request(
         msg_id, "tools/call",
         {"name": tool, "arguments": arguments}))
+
+
+def _nanos(ts):
+    """Unix nanoseconds for an ISO timestamp, exact like otel._nanos."""
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = (datetime.fromisoformat(ts.replace("Z", "+00:00")) - epoch)
+    return str((delta.days * 86400 + delta.seconds) * 1_000_000_000
+               + delta.microseconds * 1000)
 
 
 class MCPServerTest(unittest.TestCase):
@@ -133,7 +143,7 @@ class MCPServerTest(unittest.TestCase):
         response = self.server.handle_message(
             _request(2, "resources/templates/list"))
         templates = response["result"]["resourceTemplates"]
-        self.assertEqual(len(templates), 6)
+        self.assertEqual(len(templates), 7)
         self.assertEqual(
             [t["uriTemplate"] for t in templates],
             ["blackbox://session/diff/{other_path}",
@@ -141,23 +151,27 @@ class MCPServerTest(unittest.TestCase):
              "blackbox://session/aggregates/model/{model}",
              "blackbox://session/aggregates/tool/{tool}",
              "blackbox://session/record/{seq}",
-             "blackbox://session/transcript/{seq}"])
+             "blackbox://session/transcript/{seq}",
+             "blackbox://session/span/{seq}"])
         self.assertEqual(
             [t["name"] for t in templates],
             ["session/diff/{other_path}", "session/trace/{seq}",
              "session/aggregates/model/{model}",
              "session/aggregates/tool/{tool}",
              "session/record/{seq}",
-             "session/transcript/{seq}"])
+             "session/transcript/{seq}",
+             "session/span/{seq}"])
         self.assertEqual(
             [t["mimeType"] for t in templates],
-            ["application/json"] * 5 + ["text/plain"])
+            ["application/json"] * 5 + ["text/plain",
+                                        "application/json"])
         self.assertIn("other run", templates[0]["description"])
         self.assertIn("step", templates[1]["description"])
         self.assertIn("model", templates[2]["description"])
         self.assertIn("tool", templates[3]["description"])
         self.assertIn("record", templates[4]["description"])
         self.assertIn("transcript", templates[5]["description"])
+        self.assertIn("span", templates[6]["description"])
 
     def test_resources_read_session_transcript(self):
         self._init()
@@ -788,6 +802,153 @@ class MCPServerTest(unittest.TestCase):
         response = self.server.handle_message(
             _request(2, "resources/read",
                      {"uri": "blackbox://session/transcript/"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_span_template(self):
+        # One step as a single OTLP span: the step number as the
+        # span id, the step kind as the span name, times from the
+        # record's timestamps, and the priced cost as an attribute.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/span/0"}))
+        content = response["result"]["contents"][0]
+        self.assertEqual(content["uri"], "blackbox://session/span/0")
+        self.assertEqual(content["mimeType"], "application/json")
+        span = json.loads(content["text"])
+        records = load_records(self.path)
+        self.assertEqual(span["spanId"], "%016x" % 0)
+        self.assertEqual(span["name"], "model_call")
+        self.assertEqual(span["traceId"], records[0]["hash"][:32])
+        self.assertNotIn("parentSpanId", span)  # first step is the root
+        self.assertEqual(span["startTimeUnixNano"],
+                         _nanos(records[0]["ts"]))
+        self.assertEqual(span["endTimeUnixNano"],
+                         _nanos(records[1]["ts"]))
+        attrs = {a["key"]: a["value"] for a in span["attributes"]}
+        self.assertEqual(attrs["blackbox.seq"]["intValue"], "0")
+        self.assertEqual(attrs["blackbox.hash"]["stringValue"],
+                         records[0]["hash"])
+        self.assertEqual(attrs["gen_ai.request.model"]["stringValue"],
+                         "gpt-5")
+        self.assertEqual(attrs["gen_ai.usage.input_tokens"]["intValue"],
+                         "1200")
+        self.assertEqual(attrs["gen_ai.usage.output_tokens"]["intValue"],
+                         "340")
+        # gpt-5, 1200 in + 340 out = $0.0049.
+        self.assertEqual(attrs["blackbox.cost_usd"]["doubleValue"],
+                         0.0049)
+
+    def test_resources_read_session_span_template_matches_export_record_and_transcript(self):
+        # The template span agrees with the full `blackbox otel`
+        # export (same times, parent and attributes — only the
+        # span id and name differ, by design), with the raw record,
+        # and with the transcript line for the same step.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/span/1"}))
+        span = json.loads(response["result"]["contents"][0]["text"])
+        records = load_records(self.path)
+        exported = records_to_spans(records)[1]
+        self.assertEqual(span["traceId"], exported["traceId"])
+        self.assertEqual(span["startTimeUnixNano"],
+                         exported["startTimeUnixNano"])
+        self.assertEqual(span["endTimeUnixNano"],
+                         exported["endTimeUnixNano"])
+        self.assertEqual(span["parentSpanId"],
+                         exported["parentSpanId"])
+        self.assertEqual(span["attributes"], exported["attributes"])
+        attrs = {a["key"]: a["value"] for a in span["attributes"]}
+        self.assertEqual(
+            json.loads(attrs["blackbox.payload"]["stringValue"]),
+            records[1]["payload"])
+        self.assertEqual(attrs["tool.name"]["stringValue"], "search")
+        response = self.server.handle_message(
+            _request(7, "resources/read",
+                     {"uri": "blackbox://session/transcript/1"}))
+        line = response["result"]["contents"][0]["text"]
+        self.assertIn("tool_call", line)
+        self.assertIn("search(query=mcp)", line)
+
+    def test_resources_read_session_span_template_last_step_without_summary(self):
+        # No summary yet: the last step's span ends 1 ms after it
+        # starts, the same minimum-duration fallback as the full
+        # export — no end time is invented from a later step.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/span/3"}))
+        span = json.loads(response["result"]["contents"][0]["text"])
+        self.assertEqual(int(span["endTimeUnixNano"])
+                         - int(span["startTimeUnixNano"]), 1_000_000)
+
+    def test_resources_read_session_span_template_last_step_ends_at_summary(self):
+        self._init()
+        self._record_session()
+        self.server.close()  # writes the summary record
+        records = load_records(self.path)
+        summary = records[-1]
+        self.assertEqual(summary["type"], "summary")
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/span/3"}))
+        span = json.loads(response["result"]["contents"][0]["text"])
+        self.assertEqual(span["endTimeUnixNano"], _nanos(summary["ts"]))
+
+    def test_resources_read_session_span_template_unpriced_has_no_cost(self):
+        # An unknown model, and a model_call with a plain int token
+        # count (no input/output split), are both unpriced — the
+        # span carries no cost attribute, never a guessed number.
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "model_call",
+               "payload": {"model": "mystery-model", "prompt": "hi"},
+               "tokens": {"input": 100, "output": 50}})
+        _call(self.server, 3, "blackbox_record",
+              {"type": "model_call",
+               "payload": {"model": "gpt-5", "prompt": "hi"},
+               "tokens": 120})
+        for seq in (0, 1):
+            response = self.server.handle_message(
+                _request(6, "resources/read",
+                         {"uri": "blackbox://session/span/%d" % seq}))
+            span = json.loads(response["result"]["contents"][0]["text"])
+            keys = [a["key"] for a in span["attributes"]]
+            self.assertNotIn("blackbox.cost_usd", keys)
+
+    def test_resources_read_session_span_template_unknown_seq(self):
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/span/99"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_span_template_bad_seq(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/span/abc"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_span_template_needs_seq(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/span/"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_span_template_summary_is_not_a_step(self):
+        self._init()
+        self._record_session()
+        self.server.close()  # writes the summary record (seq 4)
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/span/4"}))
         self.assertEqual(response["error"]["code"], -32602)
 
     def test_resources_read_unknown_uri_is_an_error(self):

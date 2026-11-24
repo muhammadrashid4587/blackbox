@@ -11,7 +11,7 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
-It also exposes the session as five resources, five resource
+It also exposes the session as five resources, six resource
 templates, and eight prompts:
 
     blackbox://session        the session as a readable transcript
@@ -66,6 +66,26 @@ templates, and eight prompts:
                               blackbox://session.json resource
                               carries for that step, so a client can
                               read one step without the whole log
+    blackbox://session/transcript/{seq}
+                              one step's formatted transcript line
+                              as a resource template: the line the
+                              blackbox://session resource carries
+                              for step seq — the same line
+                              `blackbox replay` prints for that
+                              step — so a client can read one step
+                              without the whole transcript
+    blackbox://session/span/{seq}
+                              one step as a single OTLP span as a
+                              resource template: the span for step
+                              seq — the step kind as the span name,
+                              the step number as the span id,
+                              start/end times from the record's
+                              timestamps, and model/tool/token/cost
+                              attributes where the record has them
+                              (an unpriced call carries no cost,
+                              never a guessed number) — so a client
+                              can read one step as a span without
+                              exporting the whole trace
     analyze_session           a prompt template for analysing the
                               session (optional focus argument)
     summarize_costs           a prompt template for summarising the
@@ -133,6 +153,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .aggregates import cost_totals, format_aggregates, session_aggregates
 from .compact import _parse_ts, compact_log
 from .costs import cost_for
+from .otel import session_span
 from .recorder import Recorder
 from .redact import REDACTED
 from .replay import (_short, diff_records, format_record, load_records,
@@ -300,8 +321,9 @@ RESOURCES = [
 ]
 
 # Resource templates: the diff against a named run, one branch of
-# the causal trace, one model's or one tool's cost totals, and one
-# step's raw record, so a client can discover them from
+# the causal trace, one model's or one tool's cost totals, one
+# step's raw record, one step's transcript line, and one step as a
+# single OTLP span, so a client can discover them from
 # resources/templates/list and expand the template instead of
 # building a URI by hand. The diff template
 # parameter is the other run's log path, exactly the other_path the
@@ -410,6 +432,27 @@ RESOURCE_TEMPLATES = [
                         "expanding the template with a step number, "
                         "e.g. blackbox://session/transcript/2."),
         "mimeType": "text/plain",
+    },
+    {
+        "uriTemplate": "blackbox://session/span/{seq}",
+        "name": "session/span/{seq}",
+        "description": ("One step as a single OTLP span as JSON: "
+                        "the span for step seq — the step kind as "
+                        "the span name, the step number as the "
+                        "span id, start/end times from the "
+                        "record's timestamps, and model/tool/token/"
+                        "cost attributes where the record has them "
+                        "— the same span the `blackbox otel` "
+                        "export carries for that step, so a client "
+                        "can read one step as a span without "
+                        "exporting the whole trace. A model_call "
+                        "with an input/output token split and a "
+                        "known price carries its USD cost; an "
+                        "unpriced call carries none, never a "
+                        "guessed number. Read it by expanding the "
+                        "template with a step number, e.g. "
+                        "blackbox://session/span/2."),
+        "mimeType": "application/json",
     },
 ]
 
@@ -1505,6 +1548,42 @@ class MCPServer:
             {"uri": uri, "mimeType": "text/plain",
              "text": text}]})
 
+    def _read_span(self, msg_id, uri, seq_text):
+        """One step as a single OTLP span, as a resource read.
+
+        One implementation for the blackbox://session/span/{seq}
+        template: the span `session_span` in otel.py builds from
+        the record — the same span builder the full `blackbox
+        otel` export uses — so the template agrees with the
+        export, the transcript and the raw record. The span id
+        is the step number, the span name the step kind, start/end
+        times come from the record's timestamps, and a model_call
+        with an input/output split and a known price carries its
+        USD cost — an unpriced call carries none, never a guessed
+        number. A step number that is not an integer, a step the
+        session does not have, or a step with no usable timestamp,
+        is an error.
+        """
+        try:
+            seq = int(unquote(seq_text))
+        except ValueError:
+            return _error(
+                msg_id, INVALID_PARAMS,
+                "blackbox://session/span/{seq} needs a step number, "
+                "e.g. blackbox://session/span/2")
+        records = load_records(self.log_path)
+        try:
+            span = session_span(records, seq)
+        except ValueError as exc:
+            return _error(msg_id, INVALID_PARAMS, str(exc))
+        if span is None:
+            return _error(msg_id, INVALID_PARAMS,
+                          "no step %d in this session" % seq)
+        text = json.dumps(span, indent=2, sort_keys=True)
+        return _result(msg_id, {"contents": [
+            {"uri": uri, "mimeType": "application/json",
+             "text": text}]})
+
     def _resources_read(self, msg_id, params):
         uri = params.get("uri")
         if uri == "blackbox://session":
@@ -1577,6 +1656,19 @@ class MCPServer:
                     "step number, e.g. "
                     "blackbox://session/transcript/2")
             return self._read_transcript_step(msg_id, uri, seq_text)
+        if uri.startswith("blackbox://session/span/"):
+            # The resource template blackbox://session/span/{seq}:
+            # one step as a single OTLP span — the same span the
+            # `blackbox otel` export carries for that step, with
+            # the step number as the span id and the step kind as
+            # the span name.
+            seq_text = uri[len("blackbox://session/span/"):]
+            if not seq_text:
+                return _error(
+                    msg_id, INVALID_PARAMS,
+                    "blackbox://session/span/{seq} needs a step "
+                    "number, e.g. blackbox://session/span/2")
+            return self._read_span(msg_id, uri, seq_text)
         if uri.startswith("blackbox://session/trace/"):
             # The resource template blackbox://session/trace/{seq}:
             # the subtree rooted at step seq, the same node the

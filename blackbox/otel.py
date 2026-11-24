@@ -28,6 +28,13 @@ rebuilds each step's seq, timestamp, type, payload, tokens and hashes
 from the span attributes, so an exported trace can be checked back
 against the log it came from.
 
+Single-step spans: `session_span` renders one step as a single span
+— the span the blackbox://session/span/{seq} MCP resource template
+serves — reusing `record_to_span`, with the step number as the span
+id and the step kind as the span name, and a `blackbox.cost_usd`
+attribute on a priced model_call (an input/output token split and a
+known price), never a guessed cost.
+
 Causal parents: `records_to_spans(..., causal=True)` (or
 `blackbox otel --causal` / `blackbox export --causal`) sets each
 span's parentSpanId from `trace.link_parents` instead of the hash
@@ -90,9 +97,11 @@ def _nanos(dt):
 
 
 def _attr(key, value):
-    """One OTLP attribute; int/bool/str map to their value kinds."""
+    """One OTLP attribute; int/bool/float/str map to their value kinds."""
     if isinstance(value, bool):
         return {"key": key, "value": {"boolValue": value}}
+    if isinstance(value, float):
+        return {"key": key, "value": {"doubleValue": value}}
     if isinstance(value, int):
         return {"key": key, "value": {"intValue": str(value)}}
     return {"key": key, "value": {"stringValue": str(value)}}
@@ -234,6 +243,72 @@ def records_to_spans(records, service_name=SERVICE_NAME, causal=False,
             spans.append(record_to_span(record, trace_id, end=end,
                                         parent_sampled_out=gap))
     return spans
+
+
+def session_span(records, seq):
+    """One step as a single OTLP span dict, or None if the session has
+    no step with that seq.
+
+    The span for the blackbox://session/span/{seq} MCP resource
+    template: one recorded step rendered as a single OTLP span, so a
+    client can read one step as a span without exporting the whole
+    trace. It reuses `record_to_span` — the same span builder the
+    full `blackbox otel` export uses — so the span agrees with the
+    export, with the transcript (`format_record` over the same
+    record) and with the raw record
+    (`blackbox://session/record/{seq}`).
+
+    Two things differ from the full export, both by design: the span
+    id is the step number itself (16 hex chars, zero-padded), so the
+    span is addressable by seq, and the span name is the step kind
+    alone (e.g. "model_call"), not the export's "model_call gpt-5"
+    label. The span still carries the record's hash in
+    `blackbox.hash`, so it ties to exactly one tamper-evident
+    record, and its parentSpanId is the chain parent, as in the
+    export.
+
+    Start time is the record's timestamp; end time is the next
+    step's timestamp, or the summary's for the last step — the same
+    rule as `records_to_spans`. A step whose timestamp is missing
+    or unparseable raises ValueError: a span with no honest start
+    or end time is not a span, and times are never invented. A
+    model_call with an input/output token split and a known price
+    carries a `blackbox.cost_usd` attribute; an unpriced call
+    carries none — cost None is never guessed.
+    """
+    steps = [r for r in records if r["type"] != "summary"]
+    record = next((r for r in steps if r["seq"] == seq), None)
+    if record is None:
+        return None
+    if "ts" not in record:
+        raise ValueError("step %d has no timestamp" % seq)
+    try:
+        _parse_ts(record["ts"])
+    except ValueError:
+        raise ValueError("step %d has no usable timestamp" % seq)
+    index = steps.index(record)
+    try:
+        if index + 1 < len(steps):
+            end = _parse_ts(steps[index + 1]["ts"])
+        elif records and records[-1]["type"] == "summary":
+            end = _parse_ts(records[-1]["ts"])
+        else:
+            end = None
+    except (KeyError, ValueError):
+        raise ValueError("step %d has no usable end timestamp" % seq)
+    span = record_to_span(record, steps[0]["hash"][:32], end=end)
+    span["spanId"] = "%016x" % seq
+    span["name"] = record["type"]
+    payload = record.get("payload") or {}
+    if record["type"] == "model_call":
+        tokens = record.get("tokens")
+        if isinstance(tokens, dict):
+            cost = cost_for(payload.get("model"),
+                            tokens.get("input"), tokens.get("output"))
+            if cost is not None:
+                span["attributes"].append(
+                    _attr("blackbox.cost_usd", cost))
+    return span
 
 
 def _sum_metric(name, points, unit=None, monotonic=True):
@@ -423,6 +498,8 @@ def spans_to_records(spans):
             value = attr["value"]
             if "intValue" in value:
                 attrs[attr["key"]] = int(value["intValue"])
+            elif "doubleValue" in value:
+                attrs[attr["key"]] = value["doubleValue"]
             elif "boolValue" in value:
                 attrs[attr["key"]] = value["boolValue"]
             else:

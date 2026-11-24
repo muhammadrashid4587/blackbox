@@ -11,7 +11,7 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
-It also exposes the session as five resources, two resource
+It also exposes the session as five resources, four resource
 templates, and eight prompts:
 
     blackbox://session        the session as a readable transcript
@@ -42,6 +42,23 @@ templates, and eight prompts:
                               resource carries for that step, so a
                               client can read one branch without
                               the whole tree
+    blackbox://session/aggregates/model/{model}
+                              one model's totals as a resource
+                              template: calls, input/output tokens
+                              and USD cost for that model — the
+                              same entry the blackbox costs report
+                              carries for that model, so a client
+                              can read one model's spend without
+                              the whole breakdown
+    blackbox://session/aggregates/tool/{tool}
+                              one tool's totals as a resource
+                              template: calls, the input/output
+                              tokens of the model calls that
+                              invoked it, and their USD cost — the
+                              same entry the blackbox costs report
+                              carries for that tool, so a client
+                              can read one tool's cost without the
+                              whole breakdown
     analyze_session           a prompt template for analysing the
                               session (optional focus argument)
     summarize_costs           a prompt template for summarising the
@@ -106,7 +123,7 @@ import sys
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .aggregates import format_aggregates, session_aggregates
+from .aggregates import cost_totals, format_aggregates, session_aggregates
 from .compact import _parse_ts, compact_log
 from .costs import cost_for
 from .recorder import Recorder
@@ -275,14 +292,14 @@ RESOURCES = [
     },
 ]
 
-# Resource templates: the diff against a named run, and one branch
-# of the causal trace, so a client can discover them from
-# resources/templates/list and expand the template instead of
-# building a URI by hand. The diff template parameter is the other
-# run's log path, exactly the other_path the prompt takes and the
-# query-parameter resource takes — the template, the prompt and
-# the resource all read the same diff, so they always agree. The
-# parameter is a path, so it may contain slashes:
+# Resource templates: the diff against a named run, one branch of
+# the causal trace, and one model's or one tool's cost totals, so a
+# client can discover them from resources/templates/list and expand
+# the template instead of building a URI by hand. The diff template
+# parameter is the other run's log path, exactly the other_path the
+# prompt takes and the query-parameter resource takes — the template,
+# the prompt and the resource all read the same diff, so they always
+# agree. The parameter is a path, so it may contain slashes:
 # blackbox://session/diff/data/run-b.jsonl names the run
 # data/run-b.jsonl, and an absolute path keeps its leading slash
 # (blackbox://session/diff//tmp/run-b.jsonl). A client that needs
@@ -292,7 +309,15 @@ RESOURCES = [
 # is the subtree rooted at step 2, the same node
 # blackbox://session/trace carries for that step — the template
 # and the resource both read `trace_subtree` over `build_trace`,
-# so they always agree.
+# so they always agree. The aggregates templates name one model
+# or one tool: blackbox://session/aggregates/model/gpt-5 is the
+# per-model entry for gpt-5 and
+# blackbox://session/aggregates/tool/search the per-tool entry
+# for search — the same entries `cost_totals` computes for the
+# `blackbox costs` report, so the template and the report always
+# agree. A model or tool name may itself contain slashes, so the
+# name is the whole remainder of the URI after the prefix,
+# percent-decoded on read, like the diff template's path.
 RESOURCE_TEMPLATES = [
     {
         "uriTemplate": "blackbox://session/diff/{other_path}",
@@ -322,6 +347,33 @@ RESOURCE_TEMPLATES = [
                         "branch without the whole tree. Read it by "
                         "expanding the template with a step number, "
                         "e.g. blackbox://session/trace/2."),
+        "mimeType": "application/json",
+    },
+    {
+        "uriTemplate": "blackbox://session/aggregates/model/{model}",
+        "name": "session/aggregates/model/{model}",
+        "description": ("One model's totals as JSON: calls, "
+                        "input/output tokens and USD cost for that "
+                        "model — the same per-model entry the "
+                        "`blackbox costs` report carries, so a "
+                        "client can read one model's spend without "
+                        "the whole breakdown. Read it by expanding "
+                        "the template with a model name, e.g. "
+                        "blackbox://session/aggregates/model/gpt-5."),
+        "mimeType": "application/json",
+    },
+    {
+        "uriTemplate": "blackbox://session/aggregates/tool/{tool}",
+        "name": "session/aggregates/tool/{tool}",
+        "description": ("One tool's totals as JSON: calls, the "
+                        "input/output tokens of the model calls "
+                        "that invoked it, and their USD cost — the "
+                        "same per-tool entry the `blackbox costs` "
+                        "report carries, so a client can read one "
+                        "tool's cost without the whole breakdown. "
+                        "Read it by expanding the template with a "
+                        "tool name, e.g. blackbox://session/"
+                        "aggregates/tool/search."),
         "mimeType": "application/json",
     },
 ]
@@ -1328,6 +1380,41 @@ class MCPServer:
             {"uri": uri, "mimeType": "application/json",
              "text": text}]})
 
+    def _read_aggregates_slice(self, msg_id, uri, kind, name_text):
+        """One model's or one tool's cost totals, as a resource
+        read.
+
+        One implementation for both aggregates templates:
+        blackbox://session/aggregates/model/{model} and
+        blackbox://session/aggregates/tool/{tool}. Both reuse
+        `cost_totals` from aggregates.py — the same totals the
+        `blackbox costs` report prints — so the template and the
+        report always agree, and an unpriced call costs None,
+        never a guessed number. A model or tool the session does
+        not have, or an empty name, is an error.
+        """
+        name = unquote(name_text)
+        if not name:
+            return _error(
+                msg_id, INVALID_PARAMS,
+                "blackbox://session/aggregates/%s/{%s} needs a %s "
+                "name, e.g. blackbox://session/aggregates/%s/%s"
+                % (kind, kind, kind, kind,
+                   "gpt-5" if kind == "model" else "search"))
+        records = load_records(self.log_path)
+        totals = cost_totals(records)
+        section = ("per_model" if kind == "model" else "per_tool")
+        entry = totals[section].get(name)
+        if entry is None:
+            return _error(msg_id, INVALID_PARAMS,
+                          "no %s %r in this session" % (kind, name))
+        result = {kind: name}
+        result.update(entry)
+        text = json.dumps(result, indent=2, sort_keys=True)
+        return _result(msg_id, {"contents": [
+            {"uri": uri, "mimeType": "application/json",
+             "text": text}]})
+
     def _resources_read(self, msg_id, params):
         uri = params.get("uri")
         if uri == "blackbox://session":
@@ -1354,6 +1441,28 @@ class MCPServer:
             return _result(msg_id, {"contents": [
                 {"uri": uri, "mimeType": "application/json",
                  "text": text}]})
+        if uri.startswith("blackbox://session/aggregates/model/"):
+            # The resource template
+            # blackbox://session/aggregates/model/{model}: the
+            # per-model totals for one model — the same entry
+            # `cost_totals` computes for the `blackbox costs`
+            # report. The name is the whole remainder of the URI,
+            # percent-decoded, so a model name with a slash in it
+            # still names one model.
+            name_text = uri[len("blackbox://session/aggregates/model/"):]
+            return self._read_aggregates_slice(msg_id, uri, "model",
+                                               name_text)
+        if uri.startswith("blackbox://session/aggregates/tool/"):
+            # The resource template
+            # blackbox://session/aggregates/tool/{tool}: the
+            # per-tool totals for one tool — the same entry
+            # `cost_totals` computes for the `blackbox costs`
+            # report. The name is the whole remainder of the URI,
+            # percent-decoded, so a tool name with a slash in it
+            # still names one tool.
+            name_text = uri[len("blackbox://session/aggregates/tool/"):]
+            return self._read_aggregates_slice(msg_id, uri, "tool",
+                                               name_text)
         if uri.startswith("blackbox://session/trace/"):
             # The resource template blackbox://session/trace/{seq}:
             # the subtree rooted at step seq, the same node the

@@ -586,9 +586,19 @@ read-only.
   resource, so the template and the resource always agree; a
   step number that is not an integer, or a step the session
   does not have, is an error, done (v0.31.0).
+- MCP resource templates for the session aggregates:
+  `blackbox://session/aggregates/model/{model}` and
+  `blackbox://session/aggregates/tool/{tool}`, listed by
+  `resources/templates/list`, so a client can read one model's
+  or one tool's totals — calls, input/output tokens and USD
+  cost — without the whole breakdown. They reuse the same
+  `cost_totals` as the `blackbox costs` report, so the
+  template and the report always agree; a model or tool the
+  session does not have, or an empty name, is an error, done
+  (v0.32.0).
   Next: resource templates for the remaining session
-  resources (aggregates, and the transcript / raw records),
-  so a client can discover the whole session surface from
+  resources (the transcript / raw records), so a client can
+  discover the whole session surface from
   `resources/templates/list`.
 
 ## Layout

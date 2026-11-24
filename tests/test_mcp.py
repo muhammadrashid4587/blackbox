@@ -133,18 +133,24 @@ class MCPServerTest(unittest.TestCase):
         response = self.server.handle_message(
             _request(2, "resources/templates/list"))
         templates = response["result"]["resourceTemplates"]
-        self.assertEqual(len(templates), 2)
+        self.assertEqual(len(templates), 4)
         self.assertEqual(
             [t["uriTemplate"] for t in templates],
             ["blackbox://session/diff/{other_path}",
-             "blackbox://session/trace/{seq}"])
+             "blackbox://session/trace/{seq}",
+             "blackbox://session/aggregates/model/{model}",
+             "blackbox://session/aggregates/tool/{tool}"])
         self.assertEqual(
             [t["name"] for t in templates],
-            ["session/diff/{other_path}", "session/trace/{seq}"])
+            ["session/diff/{other_path}", "session/trace/{seq}",
+             "session/aggregates/model/{model}",
+             "session/aggregates/tool/{tool}"])
         for template in templates:
             self.assertEqual(template["mimeType"], "application/json")
         self.assertIn("other run", templates[0]["description"])
         self.assertIn("step", templates[1]["description"])
+        self.assertIn("model", templates[2]["description"])
+        self.assertIn("tool", templates[3]["description"])
 
     def test_resources_read_session_transcript(self):
         self._init()
@@ -562,6 +568,105 @@ class MCPServerTest(unittest.TestCase):
         response = self.server.handle_message(
             _request(2, "resources/read",
                      {"uri": "blackbox://session/trace/"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_aggregates_model_template(self):
+        # The same per-model entry `blackbox costs` prints for
+        # gpt-5: 2 calls, 1300 in + 390 out = $0.005525.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/aggregates/model/"
+                            "gpt-5"}))
+        content = response["result"]["contents"][0]
+        self.assertEqual(
+            content["uri"],
+            "blackbox://session/aggregates/model/gpt-5")
+        self.assertEqual(content["mimeType"], "application/json")
+        entry = json.loads(content["text"])
+        self.assertEqual(entry["model"], "gpt-5")
+        self.assertEqual(entry["calls"], 2)
+        self.assertEqual(entry["input_tokens"], 1300)
+        self.assertEqual(entry["output_tokens"], 390)
+        self.assertEqual(entry["tokens"], 0)
+        self.assertEqual(entry["cost_usd"], 0.005525)
+
+    def test_resources_read_session_aggregates_model_template_slash(self):
+        # A model name with a slash in it is one model, not two
+        # path segments: the name is the whole remainder of the
+        # URI. An unpriced model costs None, never a guessed
+        # number.
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "model_call",
+               "payload": {"model": "acme/gpt-x", "prompt": "hi"},
+               "tokens": {"input": 10, "output": 5}})
+        response = self.server.handle_message(
+            _request(3, "resources/read",
+                     {"uri": "blackbox://session/aggregates/model/"
+                            "acme/gpt-x"}))
+        entry = json.loads(response["result"]["contents"][0]["text"])
+        self.assertEqual(entry["model"], "acme/gpt-x")
+        self.assertEqual(entry["calls"], 1)
+        self.assertEqual(entry["input_tokens"], 10)
+        self.assertEqual(entry["output_tokens"], 5)
+        self.assertIsNone(entry["cost_usd"])
+
+    def test_resources_read_session_aggregates_model_template_unknown(self):
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/aggregates/model/"
+                            "claude-sonnet-4"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_aggregates_model_template_needs_name(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/aggregates/model/"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_aggregates_tool_template(self):
+        # The same per-tool entry `blackbox costs` prints for
+        # search: 1 call, charged with the 1200 in + 340 out of
+        # the model call that invoked it = $0.0049.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/aggregates/tool/"
+                            "search"}))
+        content = response["result"]["contents"][0]
+        self.assertEqual(
+            content["uri"],
+            "blackbox://session/aggregates/tool/search")
+        self.assertEqual(content["mimeType"], "application/json")
+        entry = json.loads(content["text"])
+        self.assertEqual(entry["tool"], "search")
+        self.assertEqual(entry["calls"], 1)
+        self.assertEqual(entry["input_tokens"], 1200)
+        self.assertEqual(entry["output_tokens"], 340)
+        self.assertEqual(entry["tokens"], 0)
+        self.assertEqual(entry["cost_usd"], 0.0049)
+        self.assertEqual(entry["unpriced_calls"], 0)
+
+    def test_resources_read_session_aggregates_tool_template_unknown(self):
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/aggregates/tool/"
+                            "browse"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_aggregates_tool_template_needs_name(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/aggregates/tool/"}))
         self.assertEqual(response["error"]["code"], -32602)
 
     def test_resources_read_unknown_uri_is_an_error(self):

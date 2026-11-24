@@ -154,7 +154,13 @@ summarises; read it as
 `blackbox://session/diff?other_path=<path to the other run's
 log>` — a resource read takes no arguments, so the other run's
 path rides in the URI as a query parameter, and reading the
-resource without it is an error.
+resource without it is an error. The same diff is also a resource
+template, `blackbox://session/diff/{other_path}`, listed by
+`resources/templates/list`: a client expands the template with the
+other run's log path — `blackbox://session/diff/data/run-b.jsonl`
+— so the other run is named in the URI itself instead of a query
+string, and the template, the `summarize_diff` prompt and the
+resource all read the same diff, so they always agree.
 One prompt template, `analyze_session`, hands the client a prompt
 for analysing the session, with an optional `focus` argument
 (`errors`, `cost`, `tool usage`, or anything else); the prompt
@@ -386,7 +392,7 @@ read-only.
 
 ## Measured
 
-- 292 tests, all passing (`make test`).
+- 297 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -547,8 +553,22 @@ read-only.
   invoked, with how many attributed calls were unpriced reported
   alongside — with a `blackbox costs` CLI command (report or
   `--json`), done (v0.29.0).
-  Next: an MCP resource template for the diff so clients can
-  discover the other_path parameter.
+- MCP resource template for the diff: `blackbox://session/diff/
+  {other_path}`, listed by `resources/templates/list`, so a
+  client can read the diff against any named run by expanding
+  the template instead of building a query string — the other
+  run's log path is the URI path after the prefix (an absolute
+  path keeps its leading slash, a path with special characters
+  is percent-encoded and decoded on read). It reuses the same
+  `session_diff` as the `blackbox://session/diff?other_path=...`
+  resource and the `summarize_diff` prompt, so the template, the
+  prompt and the resource always agree (cost None for an
+  unpriced call, never a guessed number); reading the template
+  without a path, or with an unreadable log, is an error, done
+  (v0.30.0).
+  Next: resource templates for the other session resources, so a
+  client can discover the whole session surface from
+  `resources/templates/list`.
 
 ## Layout
 
@@ -559,7 +579,8 @@ blackbox/
   sqlite_store.py SQLite store: same records, same chain, WAL + synchronous=FULL
   costs.py        per-model cost tracking: list prices, cost math
   mcp_server.py   MCP server on stdio: record / verify / replay tools,
-                  session resources, analyze_session,
+                  session resources, a resource template for the
+                  diff, analyze_session,
                   summarize_costs, summarize_anomalies,
                   summarize_sampling, summarize_trace,
                   summarize_diff and summarize_retention prompts,
@@ -610,5 +631,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            292 tests, all passing
+tests/            297 tests, all passing
 ```

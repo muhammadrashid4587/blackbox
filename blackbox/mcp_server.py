@@ -11,7 +11,8 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
-It also exposes the session as five resources, and eight prompts:
+It also exposes the session as five resources, one resource
+template, and eight prompts:
 
     blackbox://session        the session as a readable transcript
     blackbox://session.json   the session's records as JSON
@@ -25,6 +26,14 @@ It also exposes the session as five resources, and eight prompts:
                               what changed between this session and
                               another run as JSON, the same diff
                               `blackbox diff` prints
+    blackbox://session/diff/{other_path}
+                              the same diff as a resource template:
+                              a client lists it with
+                              resources/templates/list and reads it
+                              by expanding the template with the
+                              other run's log path, so the other
+                              run is named in the URI itself instead
+                              of a query parameter
     analyze_session           a prompt template for analysing the
                               session (optional focus argument)
     summarize_costs           a prompt template for summarising the
@@ -87,7 +96,7 @@ import json
 import re
 import sys
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .aggregates import format_aggregates, session_aggregates
 from .compact import _parse_ts, compact_log
@@ -254,6 +263,38 @@ RESOURCES = [
                         "?other_path=<path to the other run's log "
                         "(.jsonl or .db)>; without other_path the "
                         "read is an error."),
+        "mimeType": "application/json",
+    },
+]
+
+# Resource templates: the same diff as the blackbox://session/diff
+# resource, but with the other run named in the URI itself, so a
+# client can discover it from resources/templates/list and expand
+# the template instead of building a query string. The template
+# parameter is the other run's log path, exactly the other_path the
+# prompt takes and the query-parameter resource takes — the
+# template, the prompt and the resource all read the same diff, so
+# they always agree. The parameter is a path, so it may contain
+# slashes: blackbox://session/diff/data/run-b.jsonl names the run
+# data/run-b.jsonl, and an absolute path keeps its leading slash
+# (blackbox://session/diff//tmp/run-b.jsonl). A client that needs
+# to name a path with spaces or other special characters
+# percent-encodes it, and the server decodes it on read.
+RESOURCE_TEMPLATES = [
+    {
+        "uriTemplate": "blackbox://session/diff/{other_path}",
+        "name": "session/diff/{other_path}",
+        "description": ("What changed between the recorded session "
+                        "and another run as JSON: changed, added and "
+                        "removed steps (position by position, like "
+                        "`blackbox diff`), per-model token and cost "
+                        "deltas, and new vs fixed errors — the same "
+                        "diff the summarize_diff prompt summarises "
+                        "and the blackbox://session/diff resource "
+                        "exposes. Read it by expanding the template "
+                        "with the other run's log path (.jsonl or "
+                        ".db), e.g. blackbox://session/diff/"
+                        "data/run-b.jsonl."),
         "mimeType": "application/json",
     },
 ]
@@ -578,6 +619,9 @@ class MCPServer:
             return self._tools_call(msg_id, message.get("params") or {})
         if method == "resources/list":
             return _result(msg_id, {"resources": RESOURCES})
+        if method == "resources/templates/list":
+            return _result(msg_id,
+                           {"resourceTemplates": RESOURCE_TEMPLATES})
         if method == "resources/read":
             return self._resources_read(msg_id, message.get("params") or {})
         if method == "prompts/list":
@@ -1202,6 +1246,32 @@ class MCPServer:
             return "No steps recorded yet."
         return format_aggregates(agg)
 
+    def _read_diff(self, msg_id, uri, other_path):
+        """The session-vs-other-run diff as a resource read.
+
+        One implementation for both ways of naming the other run:
+        the blackbox://session/diff?other_path=... resource and the
+        blackbox://session/diff/{other_path} template. Both reuse
+        `session_diff` from replay.py — the same diff the
+        summarize_diff prompt summarises — so the template, the
+        prompt and the resource always agree, and an unpriced call
+        costs None, never a guessed number.
+        """
+        try:
+            records_a = load_records(self.log_path)
+            records_b = load_records(other_path)
+        except (OSError, ValueError) as exc:
+            return _error(msg_id, INVALID_PARAMS,
+                          "cannot read the other run's log %r: %s"
+                          % (other_path, exc))
+        diff = session_diff(
+            records_a, records_b,
+            default_model_a=self.recorder.model)
+        text = json.dumps(diff, indent=2, sort_keys=True)
+        return _result(msg_id, {"contents": [
+            {"uri": uri, "mimeType": "application/json",
+             "text": text}]})
+
     def _resources_read(self, msg_id, params):
         uri = params.get("uri")
         if uri == "blackbox://session":
@@ -1242,20 +1312,23 @@ class MCPServer:
                     "query parameter: the path of the second run's "
                     "log, e.g. blackbox://session/diff"
                     "?other_path=data/run-b.jsonl")
-            try:
-                records_a = load_records(self.log_path)
-                records_b = load_records(other_path)
-            except (OSError, ValueError) as exc:
-                return _error(msg_id, INVALID_PARAMS,
-                              "cannot read the other run's log %r: %s"
-                              % (other_path, exc))
-            diff = session_diff(
-                records_a, records_b,
-                default_model_a=self.recorder.model)
-            text = json.dumps(diff, indent=2, sort_keys=True)
-            return _result(msg_id, {"contents": [
-                {"uri": uri, "mimeType": "application/json",
-                 "text": text}]})
+            return self._read_diff(msg_id, uri, other_path)
+        if uri.startswith("blackbox://session/diff/"):
+            # The resource template blackbox://session/diff/
+            # {other_path}: the other run's log path is the URI
+            # path after the prefix, percent-decoded — an absolute
+            # path keeps its leading slash, so
+            # blackbox://session/diff//tmp/run-b.jsonl names
+            # /tmp/run-b.jsonl.
+            other_path = unquote(
+                uri[len("blackbox://session/diff/"):])
+            if not other_path:
+                return _error(
+                    msg_id, INVALID_PARAMS,
+                    "blackbox://session/diff/{other_path} needs the "
+                    "other run's log path in the URI, e.g. "
+                    "blackbox://session/diff/data/run-b.jsonl")
+            return self._read_diff(msg_id, uri, other_path)
         return _error(msg_id, INVALID_PARAMS,
                       "unknown resource: %r" % (uri,))
 

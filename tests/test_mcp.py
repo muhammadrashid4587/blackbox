@@ -128,6 +128,19 @@ class MCPServerTest(unittest.TestCase):
         for resource in response["result"]["resources"]:
             self.assertIn("mimeType", resource)
 
+    def test_resources_templates_list(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/templates/list"))
+        templates = response["result"]["resourceTemplates"]
+        self.assertEqual(len(templates), 1)
+        template = templates[0]
+        self.assertEqual(template["uriTemplate"],
+                         "blackbox://session/diff/{other_path}")
+        self.assertEqual(template["name"], "session/diff/{other_path}")
+        self.assertEqual(template["mimeType"], "application/json")
+        self.assertIn("other run", template["description"])
+
     def test_resources_read_session_transcript(self):
         self._init()
         _call(self.server, 2, "blackbox_record",
@@ -414,6 +427,79 @@ class MCPServerTest(unittest.TestCase):
         response = self.server.handle_message(
             _request(2, "resources/read",
                      {"uri": "blackbox://session/diff?other_path="
+                            + os.path.join(self.tmp.name,
+                                           "nope.jsonl")}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_diff_template(self):
+        # The same diff as the query-parameter resource, read by
+        # expanding the template: the other run's path is the URI
+        # path after blackbox://session/diff/ (an absolute path
+        # keeps its leading slash).
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        self._write_other_run(other, query="other",
+                              extra=True, error_result=True)
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/diff/" + other}))
+        content = response["result"]["contents"][0]
+        self.assertEqual(content["uri"],
+                         "blackbox://session/diff/" + other)
+        self.assertEqual(content["mimeType"], "application/json")
+        diff = json.loads(content["text"])
+        self.assertEqual(diff["run_a"], {"steps": 4, "tokens": 1690})
+        self.assertEqual(diff["run_b"], {"steps": 5, "tokens": 1690})
+        self.assertEqual(diff["tokens_diff"], 0)
+        self.assertFalse(diff["identical"])
+        self.assertEqual([c["position"] for c in diff["changed"]],
+                         [1, 2])
+        self.assertEqual(len(diff["added"]), 1)
+        self.assertEqual(diff["added"][0]["payload"]["tool"], "fetch")
+        self.assertEqual(diff["removed"], [])
+        gpt5 = diff["per_model"]["gpt-5"]
+        self.assertEqual(gpt5["tokens_a"], 1690)
+        self.assertEqual(gpt5["tokens_b"], 1690)
+        self.assertEqual(gpt5["cost_usd_a"], 0.005525)
+        self.assertEqual(gpt5["cost_usd_b"], 0.005525)
+        self.assertEqual(gpt5["cost_usd_delta"], 0)
+        self.assertEqual(len(diff["new_errors"]), 1)
+        self.assertEqual(diff["new_errors"][0]["payload"],
+                         {"tool": "search", "error": "timed out"})
+        self.assertEqual(diff["fixed_errors"], [])
+        self.assertEqual(diff["errors_a"], 0)
+        self.assertEqual(diff["errors_b"], 1)
+
+    def test_resources_read_session_diff_template_encoded_path(self):
+        # A path with a space, percent-encoded in the URI, is
+        # decoded before the log is read.
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other run.jsonl")
+        self._write_other_run(other)
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/diff/"
+                            + other.replace(" ", "%20")}))
+        diff = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertTrue(diff["identical"])
+        self.assertEqual(diff["run_a"], {"steps": 4, "tokens": 1690})
+        self.assertEqual(diff["run_b"], {"steps": 4, "tokens": 1690})
+
+    def test_resources_read_session_diff_template_needs_other_path(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/diff/"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_diff_template_missing_file_is_an_error(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/diff/"
                             + os.path.join(self.tmp.name,
                                            "nope.jsonl")}))
         self.assertEqual(response["error"]["code"], -32602)

@@ -351,7 +351,8 @@ def main(argv=None):
     p_query = sub.add_parser(
         "query", help="print the steps of a log matching filters "
         "(--type, --model, --tool, --min-tokens, --min-cost, "
-        "--errors-only, --since/--until); filters combine with AND")
+        "--errors-only, --since/--until, --last); filters combine "
+        "with AND")
     p_query.add_argument("logfile")
     p_query.add_argument("--type", action="append", dest="types",
                          help="event type to keep (repeatable)")
@@ -369,6 +370,10 @@ def main(argv=None):
                          "ISO timestamp")
     p_query.add_argument("--until", help="keep records at or before this "
                          "ISO timestamp")
+    p_query.add_argument("--last", help="keep records from the last "
+                         "this long, e.g. 10m, 2h, 1d, 1h30m "
+                         "(cannot be combined with --since or --until; "
+                         "the same relative window as watch --last)")
     p_query.add_argument("--json", action="store_true", dest="as_json",
                          help="print each match as one raw JSON record "
                          "per line instead of a transcript")
@@ -646,11 +651,17 @@ def main(argv=None):
             sys.stdout.write(text)
         return 0
     if args.command == "query":
-        query_log(args.logfile, types=args.types, model=args.model,
-                  tool=args.tool, min_tokens=args.min_tokens,
-                  min_cost=args.min_cost, errors_only=args.errors_only,
-                  since=args.since, until=args.until,
-                  as_json=args.as_json, count_only=args.count)
+        try:
+            query_log(args.logfile, types=args.types, model=args.model,
+                      tool=args.tool, min_tokens=args.min_tokens,
+                      min_cost=args.min_cost, errors_only=args.errors_only,
+                      since=args.since, until=args.until, last=args.last,
+                      as_json=args.as_json, count_only=args.count)
+        except ValueError as exc:
+            # A bad --last value, or --last combined with --since /
+            # --until.
+            print("query: %s" % exc, file=sys.stderr)
+            return 2
         return 0
     if args.command == "trace":
         trace_log(args.logfile, as_json=args.as_json)

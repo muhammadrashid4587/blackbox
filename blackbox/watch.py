@@ -59,14 +59,14 @@ not fire.
 import hashlib
 import json
 import os
-import re
 import sqlite3
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from urllib.parse import quote
 
-from .query import _is_error, _record_cost
+from .query import (_is_error, _parse_duration, _parse_record_ts,
+                    _record_cost)
 from .recorder import _normalize_ts, _tokens_total
 from .replay import format_record
 from .sqlite_store import _row_to_record, is_sqlite_path
@@ -89,46 +89,6 @@ def _parse_bound(value, flag):
                          "timezone, e.g. 2026-11-24T01:00:00Z"
                          % flag) from None
     return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
-
-
-def _parse_duration(value):
-    """Parse a --last value into a timedelta: a whole number of
-    seconds, minutes, hours or days, e.g. 30s, 10m, 2h, 1d, or a
-    combination in that order, e.g. 1h30m. Returns the timedelta.
-    Raises ValueError naming --last on anything else — a bare
-    number has no unit, a decimal has no honest meaning at this
-    granularity, and a zero or empty duration keeps nothing, so
-    all three are errors, exit code 2, never a guessed window."""
-    match = re.fullmatch(r"(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?"
-                         r"(?:(\d+)s)?", value.strip())
-    if match is None or not any(match.groups()):
-        raise ValueError("--last must be a duration like 10m, "
-                         "e.g. 30s, 10m, 2h, 1d, 1h30m")
-    days, hours, minutes, seconds = (
-        int(group) if group is not None else 0
-        for group in match.groups())
-    duration = timedelta(days=days, hours=hours, minutes=minutes,
-                         seconds=seconds)
-    if duration <= timedelta(0):
-        raise ValueError("--last must be a positive duration, "
-                         "e.g. 10m")
-    return duration
-
-
-def _parse_record_ts(ts):
-    """Parse a record's timestamp to an aware datetime, or None when
-    it is not a parseable timestamp with a timezone. A record whose
-    time cannot be placed in a window never matches a time filter —
-    the same strictness as `blackbox record --ts`."""
-    if not isinstance(ts, str):
-        return None
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        return None
-    return dt
 
 
 def _record_identity(record, line):

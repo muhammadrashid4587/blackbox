@@ -8,10 +8,13 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 
 from blackbox import Recorder
 from blackbox.__main__ import main
 from blackbox.query import _is_error, _record_cost, query_log, query_records
+
+NOW = datetime(2026, 11, 22, 10, 6, tzinfo=timezone.utc)
 
 
 def _record(seq, event_type, payload, tokens=None, ts="2026-11-22T10:00:00Z"):
@@ -77,6 +80,63 @@ class QueryRecordsTest(unittest.TestCase):
         matched = query_records(self.records, since="2026-11-22T10:02:00Z",
                                 until="2026-11-22T10:04:00Z")
         self.assertEqual([r["seq"] for r in matched], [2, 3, 4])
+
+    def test_last_keeps_only_recent_steps(self):
+        # now 10:06, last 5m -> bound 10:01, so seqs 1-5; the
+        # summary (10:06) is still excluded unless asked for.
+        matched = query_records(self.records, last="5m", now=NOW)
+        self.assertEqual([r["seq"] for r in matched], [1, 2, 3, 4, 5])
+        matched = query_records(self.records, last="1m", now=NOW)
+        self.assertEqual([r["seq"] for r in matched], [5])
+
+    def test_last_accepts_timedelta(self):
+        matched = query_records(self.records, last=timedelta(minutes=5),
+                                now=NOW)
+        self.assertEqual([r["seq"] for r in matched], [1, 2, 3, 4, 5])
+
+    def test_last_rejects_combination_with_since_or_until(self):
+        for kwargs in ({"since": "2026-11-22T10:00:00Z"},
+                       {"until": "2026-11-22T10:06:00Z"}):
+            with self.assertRaises(ValueError):
+                query_records(self.records, last="5m", now=NOW, **kwargs)
+
+    def test_last_rejects_bad_duration(self):
+        for bad in ("10", "1.5m", "0m", "", "next week"):
+            with self.assertRaises(ValueError):
+                query_records(self.records, last=bad, now=NOW)
+
+    def test_last_fractional_seconds_compare_as_datetimes(self):
+        # A record stamped half a second after a whole-second bound
+        # matches; a plain string comparison would get this wrong
+        # ("." sorts before "Z").
+        records = [_record(0, "tool_call", {"tool": "search"}, None,
+                           "2026-11-22T10:05:00.500Z")]
+        matched = query_records(records, last="1m",
+                                now=datetime(2026, 11, 22, 10, 6,
+                                             tzinfo=timezone.utc))
+        self.assertEqual([r["seq"] for r in matched], [0])
+
+    def test_last_excludes_summary_unless_type_summary(self):
+        matched = query_records(self.records, last="1m", now=NOW,
+                                types=["summary"])
+        self.assertEqual([r["seq"] for r in matched], [6])
+        matched = query_records(self.records, last="1h", now=NOW)
+        self.assertNotIn(6, [r["seq"] for r in matched])
+
+    def test_last_combines_with_other_filters(self):
+        # seq 0 is gpt-5 but older than the window; seq 4 is in the
+        # window but an unknown model — only seq 5 passes both.
+        matched = query_records(self.records, last="5m", now=NOW,
+                                model="gpt-5")
+        self.assertEqual([r["seq"] for r in matched], [5])
+
+    def test_last_ignores_records_with_unusable_timestamps(self):
+        records = [_record(0, "tool_call", {"tool": "search"}, None,
+                           "not-a-timestamp"),
+                   _record(1, "tool_call", {"tool": "search"}, None,
+                           "2026-11-22T10:05:00")]
+        matched = query_records(records, last="1d", now=NOW)
+        self.assertEqual(matched, [])
 
     def test_filters_combine_with_and(self):
         matched = query_records(self.records, model="gpt-5", min_tokens=100)
@@ -158,6 +218,21 @@ class QueryLogTest(unittest.TestCase):
             code = main(["query", self.path, "--errors-only", "--count"])
         self.assertEqual(code, 0)
         self.assertEqual(buf.getvalue().strip(), "1")
+
+    def test_cli_query_last(self):
+        # The log was just recorded, so --last 1d matches every step
+        # and --last 0s is an error; --last with --since is an error.
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["query", self.path, "--last", "1d", "--count"])
+        self.assertEqual(code, 0)
+        self.assertEqual(buf.getvalue().strip(), "4")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                main(["query", self.path, "--last", "10", "--count"]), 2)
+            self.assertEqual(
+                main(["query", self.path, "--last", "1d", "--since",
+                      "2026-11-22T10:00:00Z", "--count"]), 2)
 
 
 if __name__ == "__main__":

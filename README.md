@@ -404,8 +404,15 @@ summary record is never exported.
 `--min-cost` (USD, from the published list prices — a call with a
 plain int token count or an unknown model has no cost and never
 matches), `--errors-only` (an error field, a status of "error", or a
-tool result mentioning an error), and `--since` / `--until` ISO
-timestamps. The summary record is never a match unless `--type
+tool result mentioning an error), `--since` / `--until` ISO
+timestamps, and `--last 10m` (a relative window — a duration like
+30s, 2h, 1d or 1h30m — keeping only steps from the last that long,
+as a lower bound of now minus the duration, the same window as
+`blackbox watch --last`, so a finished session can be narrowed to
+the recent past the same way a live tail can; --last cannot be
+combined with --since or --until, because it sets the lower bound
+itself, and a value that is not a duration is an error, exit code
+2). The summary record is never a match unless `--type
 summary` is given. `--json` prints each match as one raw JSON record
 per line, `--count` prints only the number of matches, and the
 default transcript output ends with a footer: matches, token total,
@@ -538,7 +545,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 449 tests, all passing (`make test`).
+- 458 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -901,9 +908,29 @@ and `max_records` counts printed steps, not skipped ones.
   with AND, a filtered step is still marked seen, and
   `max_records` counts printed steps, not skipped ones. Works on
   `.jsonl` logs and `.db` stores, done (v0.45.0).
-  Next: a `--last` relative window for `blackbox query`, so a
-  finished session can be narrowed to the recent past the same way
-  a live tail can.
+- Query relative window: `blackbox query --last 10m` keeps only
+  steps from the last 10 minutes — a duration (30s, 2h, 1d,
+  1h30m), not a timestamp — as a lower bound of now minus that
+  duration, so a finished session can be narrowed to the recent
+  past the same way a live tail can. --last cannot be combined
+  with --since or --until, because it sets the lower bound itself,
+  and a value that is not a duration is an error, exit code 2. The
+  lower bound compares as datetimes, so a record stamped with
+  fractional seconds compares correctly against a whole-second
+  bound; a record whose timestamp does not parse, or carries no
+  timezone, never matches --last. The summary is kept only when
+  `--type summary` is given, the same rule as the other query
+  filters; filters combine with AND, and `query_records` /
+  `query_log` in `query.py` take the same filter as a Python API
+  (a duration string or a timedelta, with `now` fixable for
+  tests). `_parse_duration` / `_parse_record_ts` moved from
+  `watch.py` into `query.py` — the filter helpers live with the
+  filter — and `watch.py` imports them, so `blackbox watch
+  --last` is unchanged. Works on `.jsonl` logs and `.db` stores,
+  done (v0.46.0).
+  Next: a `--last` relative window for `blackbox aggregates` /
+  `blackbox costs`, so a finished session's totals can be narrowed
+  to the recent past the same way its steps can.
 
 ## Layout
 

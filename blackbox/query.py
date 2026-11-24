@@ -10,13 +10,61 @@ filter given. The summary record is never a match unless
 summary. Cost is per model_call, from the published list prices in
 costs.py: a call with a plain int token count (no input/output split)
 or an unknown model has no cost, so it never matches --min-cost.
+--last keeps only records from the last N seconds/minutes/hours/days
+(e.g. 10m), as a lower bound of now minus that duration — the same
+relative window as `blackbox watch --last`, so a finished session can
+be narrowed to the recent past the same way a live tail can. --last
+cannot be combined with --since or --until, because it sets the lower
+bound itself.
 """
 
 import json
+import re
+from datetime import datetime, timedelta, timezone
 
 from .costs import cost_for
 from .recorder import _tokens_total
 from .replay import format_record, load_records
+
+
+def _parse_duration(value):
+    """Parse a --last value into a timedelta: a whole number of
+    seconds, minutes, hours or days, e.g. 30s, 10m, 2h, 1d, or a
+    combination in that order, e.g. 1h30m. Returns the timedelta.
+    Raises ValueError naming --last on anything else — a bare
+    number has no unit, a decimal has no honest meaning at this
+    granularity, and a zero or empty duration keeps nothing, so
+    all three are errors, exit code 2, never a guessed window."""
+    match = re.fullmatch(r"(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?"
+                         r"(?:(\d+)s)?", value.strip())
+    if match is None or not any(match.groups()):
+        raise ValueError("--last must be a duration like 10m, "
+                         "e.g. 30s, 10m, 2h, 1d, 1h30m")
+    days, hours, minutes, seconds = (
+        int(group) if group is not None else 0
+        for group in match.groups())
+    duration = timedelta(days=days, hours=hours, minutes=minutes,
+                         seconds=seconds)
+    if duration <= timedelta(0):
+        raise ValueError("--last must be a positive duration, "
+                         "e.g. 10m")
+    return duration
+
+
+def _parse_record_ts(ts):
+    """Parse a record's timestamp to an aware datetime, or None when
+    it is not a parseable timestamp with a timezone. A record whose
+    time cannot be placed in a window never matches a time filter —
+    the same strictness as `blackbox record --ts`."""
+    if not isinstance(ts, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt
 
 
 def _record_cost(record):
@@ -50,7 +98,7 @@ def _is_error(record):
 
 def query_records(records, types=None, model=None, tool=None,
                   min_tokens=None, min_cost=None, errors_only=False,
-                  since=None, until=None):
+                  since=None, until=None, last=None, now=None):
     """Return the records matching every filter given.
 
     types is a list of event types to keep; model matches model_call
@@ -59,9 +107,28 @@ def query_records(records, types=None, model=None, tool=None,
     min_tokens keeps records with at least that many tokens;
     min_cost keeps model_call records costing at least that many USD;
     errors_only keeps steps that look like errors; since/until keep
-    records whose ISO timestamp falls in [since, until]. The summary
-    record is excluded unless "summary" is in types.
+    records whose ISO timestamp falls in [since, until]; last is a
+    relative window — a duration string like "10m" or a timedelta —
+    keeping only records from the last that long, as a lower bound of
+    now minus the duration (now defaults to the current UTC time, and
+    is a parameter so tests can fix it). last cannot be combined
+    with since or until, because it sets the lower bound itself, so
+    combining them raises ValueError, as does a value that is not a
+    duration. The lower bound compares as datetimes, so a record
+    stamped with fractional seconds compares correctly against a
+    whole-second bound, which a plain string comparison would get
+    wrong; a record whose timestamp does not parse, or carries no
+    timezone, never matches --last. The summary record is excluded
+    unless "summary" is in types.
     """
+    lower = None
+    if last is not None:
+        if since is not None or until is not None:
+            raise ValueError("--last cannot be combined with --since or "
+                             "--until — it sets the lower bound itself")
+        duration = last if isinstance(last, timedelta) else _parse_duration(last)
+        moment = now if now is not None else datetime.now(timezone.utc)
+        lower = moment - duration
     matched = []
     for record in records:
         if record["type"] == "summary" and not (types and "summary" in types):
@@ -91,13 +158,17 @@ def query_records(records, types=None, model=None, tool=None,
             continue
         if until is not None and record["ts"] > until:
             continue
+        if lower is not None:
+            ts = _parse_record_ts(record.get("ts"))
+            if ts is None or ts < lower:
+                continue
         matched.append(record)
     return matched
 
 
 def query_log(path, types=None, model=None, tool=None, min_tokens=None,
               min_cost=None, errors_only=False, since=None, until=None,
-              as_json=False, count_only=False):
+              as_json=False, count_only=False, last=None, now=None):
     """Query a log file and print the matches. Returns the matched records.
 
     By default each match is printed as a transcript line, followed by
@@ -109,7 +180,8 @@ def query_log(path, types=None, model=None, tool=None, min_tokens=None,
     steps = [r for r in records if r["type"] != "summary"]
     matched = query_records(records, types=types, model=model, tool=tool,
                             min_tokens=min_tokens, min_cost=min_cost,
-                            errors_only=errors_only, since=since, until=until)
+                            errors_only=errors_only, since=since, until=until,
+                            last=last, now=now)
     if count_only:
         print(len(matched))
         return matched

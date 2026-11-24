@@ -492,7 +492,13 @@ offset, so the byte offset goes stale and the next read starts
 mid-line), so the log is re-read and the missed steps still land.
 `watch_log` in `watch.py` is the same tail as a Python API, with
 `stop_after` / `max_records` test hooks for stopping without a
-signal.
+signal. `--type` (repeatable) keeps only steps of that type and
+`--errors-only` only steps that look like errors — the same error
+rule as `blackbox query`, so the two commands always agree — and
+the summary is kept only when `--type summary` is given. Filters
+combine with AND, a filtered step is still marked seen (so a
+re-read after a shrink does not re-check it), and `max_records`
+counts printed steps, not skipped ones.
 
 ## What it is not
 
@@ -506,7 +512,7 @@ signal.
 
 ## Measured
 
-- 409 tests, all passing (`make test`).
+- 414 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -802,8 +808,18 @@ signal.
   polls still lands the missed steps, and a genuinely malformed
   appended line is reported on stderr and skipped, never a crash,
   done (v0.40.0).
-  Next: filter flags for watch (`--type`, `--errors-only`) so a
-  busy run can be followed for just the steps you care about.
+- Watch filter flags: `blackbox watch --type tool_call`
+  (repeatable) keeps only steps of that type, and `--errors-only`
+  only steps that look like errors — the same error rule as
+  `blackbox query`, so the two commands always agree. The summary
+  record is kept only when `--type summary` is given explicitly,
+  and never under `--errors-only`; filters combine with AND, a
+  filtered step is still marked seen so a re-read after a shrink
+  does not re-check it, and `max_records` counts printed steps,
+  not skipped ones. Works on `.jsonl` logs and `.db` stores, done
+  (v0.41.0).
+  Next: `--model` / `--tool` filters for watch, so a live tail can
+  be narrowed to one model or one tool like `blackbox query` can.
 
 ## Layout
 
@@ -878,7 +894,9 @@ blackbox/
                   skipped by record hash, a line that fails to
                   parse is treated as a possible desync and
                   re-read, and a genuinely malformed line is
-                  reported and skipped; Ctrl-C stops cleanly
+                  reported and skipped; --type / --errors-only
+                  filters (the query's error rule) narrow the tail,
+                  and Ctrl-C stops cleanly
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model

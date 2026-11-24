@@ -11,6 +11,7 @@
     python -m blackbox record data/run.jsonl --file steps.jsonl
     python -m blackbox span data/run.jsonl 0  # one step as an OTLP span
     python -m blackbox watch data/run.jsonl  # tail a live log
+    python -m blackbox watch data/run.jsonl --type tool_call --errors-only
     python -m blackbox otel data/run.jsonl --out spans.json
     python -m blackbox metrics data/run.jsonl --out metrics.json
     python -m blackbox tail-sample data/run.jsonl --out spans.json
@@ -249,6 +250,13 @@ def main(argv=None):
     p_watch.add_argument("--poll-interval", type=float, default=0.2,
                          help="seconds between checks for new steps "
                          "(default: %(default)s)")
+    p_watch.add_argument("--type", action="append", dest="types",
+                         help="step type to keep, e.g. tool_call "
+                         "(repeatable; the summary is kept only when "
+                         "--type summary is given)")
+    p_watch.add_argument("--errors-only", action="store_true",
+                         help="keep only steps that look like errors "
+                         "(the same rule as query --errors-only)")
 
     p_otel = sub.add_parser("otel", help="export a log as OTLP/JSON spans")
     p_otel.add_argument("logfile")
@@ -517,7 +525,8 @@ def main(argv=None):
             return 2
         try:
             watch_log(args.logfile, from_start=args.from_start,
-                      poll_interval=args.poll_interval)
+                      poll_interval=args.poll_interval,
+                      types=args.types, errors_only=args.errors_only)
         except KeyboardInterrupt:
             # Ctrl-C stops the tail cleanly, exit code 0.
             return 0

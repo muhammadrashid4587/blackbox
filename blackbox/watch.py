@@ -7,7 +7,13 @@ A running agent's flight recorder can be followed in real time: each
 new step is printed as soon as it lands, in the same format as the
 `blackbox replay` transcript. By default watching starts at the end
 of the log and prints only new steps; --from-start replays the
-existing steps first, then follows.
+existing steps first, then follows. --type keeps only steps of that
+type (repeatable), --errors-only only steps that look like errors —
+the same error rule as `blackbox query` — so a busy run can be
+followed for just the steps you care about. The summary record is
+printed by default, but under a filter it follows the same rule as
+`blackbox query`: it is kept only when --type summary is given
+explicitly, and never under --errors-only.
 
 Both backends work: a .jsonl log is tailed by byte offset, a .db
 store by polling for rows past the last printed seq. A log that
@@ -38,6 +44,7 @@ import sys
 import time
 from urllib.parse import quote
 
+from .query import _is_error
 from .replay import format_record
 from .sqlite_store import _row_to_record, is_sqlite_path
 
@@ -69,6 +76,19 @@ def _is_record(record):
         return False
     tokens = record.get("tokens")
     if tokens is not None and not isinstance(tokens, (int, dict)):
+        return False
+    return True
+
+
+def _matches_filter(record, types, errors_only):
+    """Whether a record passes the watch filters: --type keeps only
+    steps of a listed type (the summary is kept only when "summary"
+    is listed, the same rule as `blackbox query`), --errors-only
+    keeps only steps that look like errors by the query's rule.
+    Filters combine with AND, like `blackbox query`."""
+    if types is not None and record["type"] not in types:
+        return False
+    if errors_only and not _is_error(record):
         return False
     return True
 
@@ -134,7 +154,7 @@ class _JsonlTail:
         self.offset = os.path.getsize(self.path)
         return hashes
 
-    def poll(self, printed, out, err):
+    def poll(self, printed, out, err, types=None, errors_only=False):
         """One check for new steps. Returns how many were printed."""
         try:
             st = os.stat(self.path)
@@ -165,18 +185,26 @@ class _JsonlTail:
         self.offset += len(data)
         self.buffer += data
         count, needs_reread = self._drain(printed, out, err,
-                                          reread_on_bad=True)
+                                          reread_on_bad=True,
+                                          types=types,
+                                          errors_only=errors_only)
         if needs_reread:
-            count += self._reread(printed, out, err)
+            count += self._reread(printed, out, err, types=types,
+                                  errors_only=errors_only)
         return count
 
-    def _drain(self, printed, out, err, reread_on_bad):
+    def _drain(self, printed, out, err, reread_on_bad,
+               types=None, errors_only=False):
         """Print every complete line in the buffer.
 
         Returns (count, needs_reread): needs_reread when a line
         failed to parse — the byte offset may have gone stale
         because the log was rewritten between polls, so the caller
         re-reads from the start instead of trusting the offset.
+        A record that fails the filters is still marked printed,
+        so a later re-read skips it instead of re-checking it —
+        but it is not counted, so max_records counts printed
+        steps, not skipped ones.
         """
         count = 0
         while b"\n" in self.buffer:
@@ -200,6 +228,8 @@ class _JsonlTail:
             if identity in printed:
                 continue
             printed.add(identity)
+            if not _matches_filter(record, types, errors_only):
+                continue
             _print_record(record, out)
             count += 1
         return count, False
@@ -216,7 +246,7 @@ class _JsonlTail:
                   % (self.lineno, reason))
         err.flush()
 
-    def _reread(self, printed, out, err):
+    def _reread(self, printed, out, err, types=None, errors_only=False):
         """Re-read the whole log from the start: the offset went
         stale. Records already printed are skipped by hash, so the
         missed steps land and nothing is printed twice; a malformed
@@ -230,7 +260,8 @@ class _JsonlTail:
             return 0
         # The buffer holds the whole file, so a trailing partial line
         # waits for its newline instead of being reported.
-        count, _ = self._drain(printed, out, err, reread_on_bad=False)
+        count, _ = self._drain(printed, out, err, reread_on_bad=False,
+                               types=types, errors_only=errors_only)
         return count
 
 
@@ -272,8 +303,13 @@ class _DbTail:
             return set(), -1
         return {row[1] for row in rows}, rows[-1][0]
 
-    def poll(self, printed, out, err):
-        """One check for new steps. Returns how many were printed."""
+    def poll(self, printed, out, err, types=None, errors_only=False):
+        """One check for new steps. Returns how many were printed.
+
+        The last printed seq advances past every valid record,
+        printed or filtered out, so a filtered step is not
+        re-fetched on every poll.
+        """
         try:
             max_seq = self.conn.execute(
                 "SELECT MAX(seq) FROM records").fetchone()[0]
@@ -342,16 +378,18 @@ class _DbTail:
             if identity in printed:
                 continue
             printed.add(identity)
+            self.last_seq = max(self.last_seq, record["seq"])
+            if not _matches_filter(record, types, errors_only):
+                continue
             _print_record(record, out)
             printed_now += 1
-            self.last_seq = max(self.last_seq, record["seq"])
         return printed_now
 
 
 def watch_log(path, from_start=False,
               poll_interval=DEFAULT_POLL_INTERVAL,
               output=None, error_output=None, stop_after=None,
-              max_records=None):
+              max_records=None, types=None, errors_only=False):
     """Follow a log, printing each new step's transcript line as it
     lands, in the same format `blackbox replay` prints.
 
@@ -361,6 +399,13 @@ def watch_log(path, from_start=False,
     appended line is reported on stderr and skipped, never a crash.
     A log that shrinks or is replaced while watched is re-read from
     the start, with already-printed steps skipped by record hash.
+
+    `types` keeps only steps of a listed type (the summary is kept
+    only when "summary" is listed, the same rule as `blackbox
+    query`); `errors_only` keeps only steps that look like errors
+    by the query's rule. Filters combine with AND, and a filtered
+    step is still marked seen, so it is not re-checked on a
+    re-read. `max_records` counts printed steps, not skipped ones.
 
     `stop_after` (seconds) and `max_records` stop the loop and
     return: test hooks, and the only way to stop besides Ctrl-C.
@@ -406,7 +451,8 @@ def watch_log(path, from_start=False,
     count = 0
     try:
         while _time_left():
-            count += tail.poll(printed, out, err)
+            count += tail.poll(printed, out, err, types=types,
+                               errors_only=errors_only)
             if max_records is not None and count >= max_records:
                 return count
             if not _time_left():

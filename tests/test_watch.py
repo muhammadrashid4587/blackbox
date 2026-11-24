@@ -1,7 +1,9 @@
 """`blackbox watch`: tail a live log and print new steps as they land,
 in the same format as the `blackbox replay` transcript. By default
 watching starts at the end and prints only new steps; --from-start
-replays the existing steps first. A malformed appended line is
+replays the existing steps first. --type keeps only steps of that
+type, --errors-only only steps that look like errors (the same rule
+as `blackbox query`). A malformed appended line is
 reported, not a crash; a log that shrinks while watched (a Recorder
 resuming drops the trailing summary) is re-read without reprinting
 what was already printed; Ctrl-C stops cleanly with exit code 0."""
@@ -43,7 +45,7 @@ class WatchTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def _run_watch(self, path=None, from_start=False, stop_after=5.0,
-                   max_records=None):
+                   max_records=None, types=None, errors_only=False):
         """Start watch_log in a thread; returns (thread, result, out, err)."""
         out, err = io.StringIO(), io.StringIO()
         result = {}
@@ -52,7 +54,8 @@ class WatchTest(unittest.TestCase):
             result["count"] = watch_log(
                 path or self.path, from_start=from_start,
                 poll_interval=0.05, output=out, error_output=err,
-                stop_after=stop_after, max_records=max_records)
+                stop_after=stop_after, max_records=max_records,
+                types=types, errors_only=errors_only)
 
         thread = threading.Thread(target=target)
         thread.start()
@@ -261,6 +264,86 @@ class WatchTest(unittest.TestCase):
     def test_watch_bad_poll_interval_is_an_error(self):
         with self.assertRaises(ValueError):
             watch_log(self.path, poll_interval=0)
+
+    def test_watch_type_filter_keeps_only_matching_type(self):
+        # Fixture: model_call [0], tool_call [1], tool_result [2],
+        # summary [3]. --type tool_call keeps only the tool_call;
+        # the summary is dropped, like in `blackbox query`.
+        thread, result, out, err = self._run_watch(
+            from_start=True, types=["tool_call"], max_records=1)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[1]", lines)
+        self.assertIn("tool_call", lines)
+        self.assertNotIn("[0]", lines)
+        self.assertNotIn("[2]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_type_summary_kept_only_when_listed(self):
+        thread, result, out, err = self._run_watch(
+            from_start=True, types=["summary"], max_records=1)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[3]", lines)
+        self.assertIn("events:", lines)
+        self.assertNotIn("[0]", lines)
+        self.assertNotIn("[1]", lines)
+        self.assertNotIn("[2]", lines)
+
+    def test_watch_errors_only_skips_clean_steps(self):
+        # A clean step lands first, then an error step: the clean
+        # step must not count towards max_records, and only the
+        # error step is printed.
+        thread, result, out, err = self._run_watch(
+            errors_only=True, max_records=1)
+        time.sleep(0.3)
+        with Recorder(self.path, task="t", model="gpt-5") as rec:
+            rec.record("tool_call", {"tool": "fetch"})
+            rec.record("tool_result",
+                       {"tool": "fetch", "result": "error: timeout"})
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("tool_result", lines)
+        self.assertIn("timeout", lines)
+        self.assertNotIn("tool_call", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_type_filter_sqlite_backend(self):
+        path = os.path.join(self.tmp.name, "run.db")
+        with Recorder(path, task="t", model="gpt-5") as rec:
+            rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                       tokens={"input": 1200, "output": 340})
+            rec.record("tool_call", {"tool": "search"})
+        thread, result, out, err = self._run_watch(
+            path=path, from_start=True, types=["model_call"],
+            max_records=1)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[0]", lines)
+        self.assertIn("model_call", lines)
+        self.assertNotIn("[1]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_cli_passes_filter_flags(self):
+        with mock.patch("blackbox.__main__.watch_log") as patched:
+            code = main(["watch", self.path, "--type", "tool_call",
+                         "--type", "tool_result", "--errors-only"])
+        self.assertEqual(code, 0)
+        patched.assert_called_once_with(
+            self.path, from_start=False, poll_interval=0.2,
+            types=["tool_call", "tool_result"], errors_only=True)
 
     def test_watch_cli_ctrl_c_returns_zero(self):
         with mock.patch("blackbox.__main__.watch_log",

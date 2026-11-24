@@ -17,6 +17,7 @@
     python -m blackbox otel data/run.jsonl --out spans.json
     python -m blackbox metrics data/run.jsonl --out metrics.json
     python -m blackbox tail-sample data/run.jsonl --out spans.json
+    python -m blackbox tail-sample data/run.jsonl --last 10m  # recent steps only
     python -m blackbox export data/run.jsonl --live  # POST spans to a collector
     python -m blackbox query data/run.jsonl --model gpt-5 --min-cost 0.01
     python -m blackbox trace data/run.jsonl  # causal parent-child tree
@@ -352,6 +353,17 @@ def main(argv=None):
                         "trace instead of the hash chain, so the "
                         "sampled trace stays connected (same tree as "
                         "`blackbox trace`)")
+    p_tail.add_argument("--last", help="keep steps from the last "
+                        "this long, e.g. 10m, 2h, 1d, 1h30m "
+                        "(the same relative window as query --last)")
+    p_tail.add_argument("--since", help="keep steps at or after "
+                        "this ISO timestamp (with a timezone, e.g. "
+                        "2026-11-24T01:00:00Z; the same window as "
+                        "query --since)")
+    p_tail.add_argument("--until", help="keep steps at or before "
+                        "this ISO timestamp (with a timezone, e.g. "
+                        "2026-11-24T01:00:00Z; the same window as "
+                        "query --until)")
 
     p_export = sub.add_parser(
         "export", help="export a log as OTLP/JSON, to a file or live to a collector")
@@ -674,8 +686,12 @@ def main(argv=None):
             data = export_tail_sampled_otlp(
                 args.logfile, keep_rate=args.keep_rate, seed=args.seed,
                 slow_ms=args.slow_ms, max_cost_usd=args.max_cost_usd,
-                service_name=args.service_name, causal=args.causal)
+                service_name=args.service_name, causal=args.causal,
+                last=args.last, since=args.since, until=args.until)
         except ValueError as exc:
+            # A bad --last value, a bad --since / --until value,
+            # --since after --until, or --last combined with --since /
+            # --until.
             print("tail-sample: %s" % exc, file=sys.stderr)
             return 2
         text = json.dumps(data, indent=2) + "\n"

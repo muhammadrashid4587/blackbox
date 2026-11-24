@@ -353,7 +353,11 @@ ancestors pulled in are counted separately in the decision
 (`causal_ancestors_kept`), so the export stays honest about which
 spans the RNG chose and which were added to keep the tree
 connected. Without `--causal` a kept span's chain parent may name a
-dropped record, as before.
+dropped record, as before. `--since` / `--until` (and `--last`)
+narrow the sampled export to a window, the same window as
+`blackbox otel --since` / `--until`, applied before the tail
+decision, so the triggers are judged on the windowed steps only —
+an error outside the window does not keep the trace whole.
 
 **OpenTelemetry export.** `python -m blackbox otel data/run.jsonl`
 writes the session as OTLP/JSON spans, one per step, in a single
@@ -1023,6 +1027,35 @@ and `max_records` counts printed steps, not skipped ones.
   Next: `--since` / `--until` time-range filters for `blackbox
   tail-sample`, so a sampled span export can be narrowed to a
   window the same way the full export can.
+- Tail-sample time-range filters: `blackbox tail-sample --since
+  2026-11-22T10:01:00Z --until 2026-11-22T10:01:03Z` (and
+  `--last 10m`) narrow the tail-sampled OTLP export to an absolute
+  or relative window — the same closed window as `blackbox query
+  --since` / `--until`, through the shared `_window_records` from
+  `aggregates.py`, so a value that does not parse or carries no
+  timezone is an error, exit code 2, --since after --until is an
+  error, exit code 2, --last cannot be combined with --since or
+  --until, exit code 2, and a step whose timestamp does not parse,
+  or carries no timezone, never matches. The window applies
+  before the tail decision, so the error / slow-span / high-cost
+  triggers are judged on the windowed steps only — an error
+  outside the window does not keep the trace whole — and the
+  last kept step runs to the summary timestamp, as in the
+  unwindowed export. `export_tail_sampled_otlp` /
+  `export_tail_sampled_otlp_file` in `tail_sampling.py` take the
+  same filters as a Python API (a duration string or a timedelta
+  for --last, with `now` fixable for tests). Works on `.jsonl`
+  logs and `.db` stores, done (v0.51.0). Along the way,
+  `tail_sample_records` stopped treating a checkpoint as a step
+  — it was counted in `total_spans` and its 09:00 timestamp could
+  end a step's span with a negative gap — takes the last step's
+  end time from the last summary record instead of assuming it
+  is the last record, and a step whose timestamp does not parse,
+  or carries no timezone, contributes no duration instead of
+  crashing the export.
+  Next: `--since` / `--until` time-range filters for `blackbox
+  trace`, so a causal trace can be narrowed to a window the same
+  way the exports can.
 
 ## Layout
 
@@ -1051,7 +1084,9 @@ blackbox/
                   tree of the full log; plain sampling marks kept
                   spans whose parent was dropped with
                   blackbox.parent_sampled_out and counts them as
-                  parent_gaps in the decision
+                  parent_gaps in the decision; --since / --until /
+                  --last narrow the sampled export to a window
+                  before the tail decision
   query.py        query CLI: filter a session's steps by type,
                   model, tool, min tokens, min cost, errors only,
                   time range; --json and --count output modes

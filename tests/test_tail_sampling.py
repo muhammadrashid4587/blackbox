@@ -5,10 +5,12 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 
 from blackbox import Recorder
 from blackbox.__main__ import main
 from blackbox.otel import export_otlp, spans_to_records
+from blackbox.sqlite_store import SQLiteStore
 from blackbox.tail_sampling import (export_tail_sampled_otlp,
                                     tail_sample_records)
 from blackbox.trace import link_parents
@@ -523,6 +525,241 @@ class ParentGapTest(unittest.TestCase):
             with open(out) as f:
                 data = json.load(f)
             self.assertEqual(data["tail_sampling"]["parent_gaps"], 1)
+
+
+class TailSampleWindowTest(unittest.TestCase):
+    """--since / --until (and --last) narrow the tail-sampled export
+    to a window, and the window is applied before the tail decision.
+
+    Same shape as the otel window fixture, plus an error step (seq 5)
+    just outside the window: with the window it does not keep the
+    trace whole, without it (or with a window that includes it) it
+    does. Steps are 1 s apart, so no span is slow and the slow-span
+    trigger never fires — the tests are about the window, not the
+    trigger. The checkpoint (seq 7) is not a step, and the
+    naive-timestamp step (seq 8) never matches a window.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "run.jsonl")
+        with open(self.path, "w", encoding="utf-8") as f:
+            for record in _window_fixture():
+                f.write(json.dumps(record) + "\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _spans(self, data):
+        return data["resourceSpans"][0]["scopeSpans"][0]["spans"]
+
+    @staticmethod
+    def _seqs(spans):
+        return [int(a["value"]["intValue"])
+                for s in spans for a in s["attributes"]
+                if a["key"] == "blackbox.seq"]
+
+    @staticmethod
+    def _durations(spans):
+        return {int(a["value"]["intValue"]): (
+            int(s["endTimeUnixNano"]) - int(s["startTimeUnixNano"])) / 1e9
+            for s in spans for a in s["attributes"]
+            if a["key"] == "blackbox.seq"}
+
+    def test_window_keeps_only_in_window_steps(self):
+        data = export_tail_sampled_otlp(
+            self.path, keep_rate=1.0,
+            since="2026-11-22T10:01:00Z",
+            until="2026-11-22T10:01:03Z")
+        decision = data["tail_sampling"]
+        self.assertEqual(decision["total_spans"], 4)
+        self.assertEqual(decision["kept_spans"], 4)
+        self.assertEqual(decision["reasons"], [])
+        self.assertEqual(self._seqs(self._spans(data)), [1, 2, 3, 4])
+        # Latency is measured between kept steps, and the last kept
+        # step runs to the summary timestamp: 2 s.
+        self.assertEqual(self._durations(self._spans(data)),
+                         {1: 1.0, 2: 1.0, 3: 1.0, 4: 2.0})
+
+    def test_checkpoint_is_not_a_step(self):
+        # Unwindowed, every step is kept at rate 1.0: the checkpoint
+        # is not counted in total_spans and gets no span. The
+        # naive-timestamp step is still counted by the decision (it
+        # gets no span) — only the window drops it.
+        data = export_tail_sampled_otlp(self.path, keep_rate=1.0)
+        decision = data["tail_sampling"]
+        self.assertEqual(decision["total_spans"], 7)
+        self.assertEqual(self._seqs(self._spans(data)),
+                         [0, 1, 2, 3, 4, 5])
+
+    def test_window_changes_the_trigger(self):
+        # The error step is at 10:01:04, outside the window: the
+        # windowed trace is boring and gets sampled down.
+        data = export_tail_sampled_otlp(
+            self.path, keep_rate=0.5, seed=7,
+            since="2026-11-22T10:01:00Z",
+            until="2026-11-22T10:01:03Z")
+        decision = data["tail_sampling"]
+        self.assertEqual(decision["decision"], "sampled")
+        self.assertEqual(decision["reasons"], [])
+        self.assertEqual(decision["total_spans"], 4)
+        # A window that includes the error keeps the trace whole.
+        data = export_tail_sampled_otlp(
+            self.path, keep_rate=0.5, seed=7,
+            since="2026-11-22T10:01:00Z",
+            until="2026-11-22T10:01:04Z")
+        decision = data["tail_sampling"]
+        self.assertEqual(decision["decision"], "kept_all")
+        self.assertEqual(decision["reasons"], ["error"])
+        self.assertEqual(decision["total_spans"], 5)
+        self.assertEqual(self._seqs(self._spans(data)),
+                         [1, 2, 3, 4, 5])
+
+    def test_window_since_only_and_until_only(self):
+        data = export_tail_sampled_otlp(
+            self.path, keep_rate=1.0,
+            since="2026-11-22T10:01:02Z")
+        self.assertEqual(data["tail_sampling"]["total_spans"], 3)
+        self.assertEqual(data["tail_sampling"]["decision"], "kept_all")
+        data = export_tail_sampled_otlp(
+            self.path, keep_rate=1.0,
+            until="2026-11-22T10:01:00Z")
+        self.assertEqual(data["tail_sampling"]["total_spans"], 2)
+        self.assertEqual(data["tail_sampling"]["decision"], "sampled")
+        self.assertEqual(self._seqs(self._spans(data)), [0, 1])
+
+    def test_window_last_relative(self):
+        # --last is a lower bound only: from 10:01:03Z back 3 s the
+        # bound is 10:01:00Z, so seqs 1-5 match, including the error
+        # step stamped after now — and it keeps the trace whole.
+        now = datetime(2026, 11, 22, 10, 1, 3, tzinfo=timezone.utc)
+        data = export_tail_sampled_otlp(self.path, keep_rate=0.5,
+                                        seed=7, last="3s", now=now)
+        decision = data["tail_sampling"]
+        self.assertEqual(decision["total_spans"], 5)
+        self.assertEqual(decision["decision"], "kept_all")
+        self.assertEqual(decision["reasons"], ["error"])
+
+    def test_window_compares_as_datetimes(self):
+        # A fractional-second bound keeps seqs 2-3: seq 1 (10:01:00)
+        # falls before it, and the closed until keeps seq 3
+        # (10:01:02).
+        data = export_tail_sampled_otlp(
+            self.path, keep_rate=1.0,
+            since="2026-11-22T10:01:00.500Z",
+            until="2026-11-22T10:01:02Z")
+        self.assertEqual(self._seqs(self._spans(data)), [2, 3])
+
+    def test_window_accepts_a_timezone_offset(self):
+        # 12:01:00+02:00 is 10:01:00Z, so the window is the same one.
+        data = export_tail_sampled_otlp(
+            self.path, keep_rate=1.0,
+            since="2026-11-22T12:01:00+02:00",
+            until="2026-11-22T10:01:03Z")
+        self.assertEqual(self._seqs(self._spans(data)), [1, 2, 3, 4])
+
+    def test_window_rejects_bad_bounds(self):
+        for bad in ("tomorrow", "2026-11-22T10:00:00", "", "10m"):
+            with self.assertRaises(ValueError):
+                export_tail_sampled_otlp(self.path, since=bad)
+            with self.assertRaises(ValueError):
+                export_tail_sampled_otlp(self.path, until=bad)
+        with self.assertRaises(ValueError):
+            export_tail_sampled_otlp(
+                self.path, since="2026-11-22T10:01:04Z",
+                until="2026-11-22T10:01:00Z")
+        now = datetime(2026, 11, 22, 10, 1, 3, tzinfo=timezone.utc)
+        with self.assertRaises(ValueError):
+            export_tail_sampled_otlp(
+                self.path, last="3s",
+                since="2026-11-22T10:01:00Z", now=now)
+        with self.assertRaises(ValueError):
+            export_tail_sampled_otlp(
+                self.path, last="3s",
+                until="2026-11-22T10:01:03Z", now=now)
+        with self.assertRaises(ValueError):
+            export_tail_sampled_otlp(self.path, last="10", now=now)
+
+    def test_window_works_on_sqlite_store(self):
+        db_path = os.path.join(self.tmp.name, "run.db")
+        store = SQLiteStore(db_path)
+        store.replace_all(_window_fixture())
+        store.close()
+        data = export_tail_sampled_otlp(
+            db_path, keep_rate=1.0,
+            since="2026-11-22T10:01:00Z",
+            until="2026-11-22T10:01:03Z")
+        decision = data["tail_sampling"]
+        self.assertEqual(decision["total_spans"], 4)
+        self.assertEqual(decision["reasons"], [])
+        self.assertEqual(self._seqs(self._spans(data)), [1, 2, 3, 4])
+
+    def test_cli_tail_sample_since_until(self):
+        # A wide absolute window matches every step with a timezone;
+        # a bad bound, a reversed window, and --last combined with
+        # --since are all errors, exit code 2.
+        out = os.path.join(self.tmp.name, "spans.json")
+        rc = main(["tail-sample", self.path, "--out", out,
+                   "--since", "2026-11-01T00:00:00Z",
+                   "--until", "2027-01-01T00:00:00Z",
+                   "--keep-rate", "1.0"])
+        self.assertEqual(rc, 0)
+        with open(out) as f:
+            data = json.load(f)
+        self.assertEqual(self._seqs(self._spans(data)),
+                         [0, 1, 2, 3, 4, 5])
+        for args in (
+                ["--since", "tomorrow"],
+                ["--since", "2027-01-01T00:00:00Z",
+                 "--until", "2026-11-01T00:00:00Z"],
+                ["--last", "1d",
+                 "--since", "2026-11-01T00:00:00Z"],
+                ["--last", "10"]):
+            self.assertEqual(
+                main(["tail-sample", self.path, "--out", out] + args),
+                2)
+        # The log was just recorded, so --last 1d matches every step.
+        live = os.path.join(self.tmp.name, "live.jsonl")
+        with Recorder(live, task="t", model="m") as rec:
+            rec.record("model_call", {"model": "m", "prompt": "hi"},
+                       tokens=10)
+            rec.record("tool_call", {"tool": "search", "args": {"q": "x"}})
+        rc = main(["tail-sample", live, "--out", out, "--last", "1d",
+                   "--keep-rate", "1.0"])
+        self.assertEqual(rc, 0)
+        with open(out) as f:
+            data = json.load(f)
+        self.assertEqual(data["tail_sampling"]["total_spans"], 2)
+
+
+def _window_fixture():
+    """Steps 1 s apart, an error step at 10:01:04, a summary, a
+    checkpoint, and a naive-timestamp step that never matches a
+    window. The closed window [10:01:00Z, 10:01:03Z] keeps seqs
+    1-4."""
+    return [
+        _record(0, "2026-11-22T10:00:59Z", "model_call",
+                {"model": "gpt-5", "prompt": "plan"},
+                {"input": 1000, "output": 500}),
+        _record(1, "2026-11-22T10:01:00Z", "tool_call",
+                {"tool": "search", "args": {"q": "x"}}),
+        _record(2, "2026-11-22T10:01:01Z", "tool_result",
+                {"tool": "search", "result": "ok"}),
+        _record(3, "2026-11-22T10:01:02Z", "tool_result",
+                {"tool": "fetch", "result": "ok"}),
+        _record(4, "2026-11-22T10:01:03Z", "model_call",
+                {"model": "unknown-model", "prompt": "p"},
+                {"input": 9000, "output": 9000}),
+        _record(5, "2026-11-22T10:01:04Z", "tool_result",
+                {"tool": "search", "error": "timeout"}),
+        _record(6, "2026-11-22T10:01:05Z", "summary",
+                {"events": 6, "total_tokens": 19550,
+                 "sampled_out": 2}),
+        _record(7, "2026-11-22T09:00:00Z", "checkpoint",
+                {"compacted_count": 3, "head_hash": "ab" * 32}),
+        _record(8, "2026-11-22T10:01:01", "tool_call",
+                {"tool": "search", "args": {}}),
+    ]
 
 
 if __name__ == "__main__":

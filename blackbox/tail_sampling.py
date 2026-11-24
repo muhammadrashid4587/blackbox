@@ -23,8 +23,8 @@ absent from the export; nothing is rewritten.
 
 Causal mode (`causal=True`, `blackbox tail-sample --causal`): a
 sampled trace stays connected. When the RNG keeps a span, its
-causal ancestors (from trace.link_parents on the full log) are
-kept too, so a tool_result never dangles without the tool_call it
+causal ancestors (from trace.link_parents over the log's steps)
+are kept too, so a tool_result never dangles without the tool_call it
 answers and a tool_call never dangles without the model_call that
 decided it. The exported spans then also take their parentSpanId
 from the same full-log causal tree (as `blackbox otel --causal`
@@ -42,13 +42,26 @@ otel.records_to_spans), so the gap is visible instead of a silent
 dangle. The decision counts them as `parent_gaps`: 0 for kept-all
 traces and for causal sampling, where closure guarantees every
 kept span's parent is in the export.
+
+Time windows (`last` / `since` / `until`, `blackbox tail-sample
+--last` / `--since` / `--until`): the export can be narrowed to a
+window the same way the full export can, through the shared
+`_window_records` from aggregates.py, so a bad bound, a reversed
+window, or --last combined with --since / --until is an error.
+The window applies before the tail decision, so the triggers are
+judged on the windowed steps only — an error outside the window
+does not keep the trace whole — and the summary and checkpoint
+records are kept untouched, so the last kept step still runs to
+the summary timestamp.
 """
 
 import json
 import random
 
+from .aggregates import _window_records
 from .costs import cost_for
-from .otel import SERVICE_NAME, _parse_ts, export_otlp, records_to_spans
+from .otel import SERVICE_NAME, export_otlp, records_to_spans
+from .query import _parse_record_ts
 from .replay import load_records
 from .trace import link_parents
 
@@ -70,22 +83,29 @@ def _is_error(record):
 def _span_durations_ms(records):
     """Each step's duration in ms: time until the next step (or the
     summary, for the last step). A step with no next timestamp has
-    no duration. Returns a list aligned with the steps."""
-    steps = [r for r in records if r["type"] != "summary"]
+    no duration. Returns a list aligned with the steps. The summary
+    timestamp comes from the last summary record, not assumed to be
+    the last record, and a step whose timestamp does not parse, or
+    carries no timezone, contributes no duration instead of crashing
+    the export."""
+    steps = [r for r in records
+             if r["type"] not in ("summary", "checkpoint")]
     summary_ts = None
-    if records and records[-1]["type"] == "summary":
-        summary_ts = _parse_ts(records[-1]["ts"])
+    for record in reversed(records):
+        if record["type"] == "summary":
+            summary_ts = _parse_record_ts(record.get("ts"))
+            break
     durations = []
     for i, record in enumerate(steps):
         if i + 1 < len(steps):
-            end = _parse_ts(steps[i + 1]["ts"])
+            end = _parse_record_ts(steps[i + 1].get("ts"))
         else:
             end = summary_ts
-        if end is None:
+        start = _parse_record_ts(record.get("ts"))
+        if end is None or start is None:
             durations.append(None)
         else:
-            durations.append(
-                (end - _parse_ts(record["ts"])).total_seconds() * 1000)
+            durations.append((end - start).total_seconds() * 1000)
     return durations
 
 
@@ -132,9 +152,10 @@ def tail_sample_records(records, keep_rate=0.5, seed=None,
             kept every kept span's parent)
 
     With causal=True and a sampled trace, a span the RNG keeps
-    pulls in its causal ancestors (trace.link_parents on the full
-    log), so the kept spans form a connected tree instead of a set
-    of orphans. The RNG choice itself is unchanged: the causal kept
+    pulls in its causal ancestors (trace.link_parents over the
+    log's steps, so a checkpoint never becomes a parent), so the
+    kept spans form a connected tree instead of a set of
+    orphans. The RNG choice itself is unchanged: the causal kept
     set is a superset of the plain kept set for the same seed.
     Without causal, a kept span whose chain parent was dropped is
     counted in parent_gaps and marked in the export with a
@@ -144,7 +165,12 @@ def tail_sample_records(records, keep_rate=0.5, seed=None,
     """
     if not 0 < keep_rate <= 1.0:
         raise ValueError("keep_rate must be in (0, 1]")
-    steps = [r for r in records if r["type"] != "summary"]
+    # A checkpoint is bookkeeping about records compacted away, not
+    # a step: it is not counted in total_spans, never kept or
+    # dropped, and never ends a step's latency (its 09:00 timestamp
+    # used to end the last step's span with a negative gap).
+    steps = [r for r in records
+             if r["type"] not in ("summary", "checkpoint")]
     durations = _span_durations_ms(records)
     total_cost = _total_cost_usd(records)
     timed = [d for d in durations if d is not None]
@@ -168,7 +194,9 @@ def tail_sample_records(records, keep_rate=0.5, seed=None,
         kept = [r for r in steps if rng.random() < keep_rate]
         decision = "sampled"
         if causal:
-            parents = link_parents(records)
+            # Parents over the log's steps only, so a checkpoint
+            # never becomes a span's parent.
+            parents = link_parents(steps)
             by_seq = {r["seq"]: r for r in steps}
             order = {r["seq"]: i for i, r in enumerate(steps)}
             kept_seqs = {r["seq"] for r in kept}
@@ -211,13 +239,33 @@ def tail_sample_records(records, keep_rate=0.5, seed=None,
 def export_tail_sampled_otlp(path, keep_rate=0.5, seed=None,
                              slow_ms=DEFAULT_SLOW_MS,
                              max_cost_usd=DEFAULT_MAX_COST_USD,
-                             service_name=SERVICE_NAME, causal=False):
+                             service_name=SERVICE_NAME, causal=False,
+                             last=None, since=None, until=None, now=None):
     """A log file as a tail-sampled OTLP/JSON dict.
 
     Works on .jsonl and .db logs. The shape is the same resourceSpans
     export as export_otlp, but with only the kept spans, plus a
     top-level "tail_sampling" key holding the decision dict, so the
     export records what was kept and why.
+
+    last is a relative window — a duration string like "10m" or a
+    timedelta — keeping only steps from the last that long, as a
+    lower bound of now minus the duration (now defaults to the
+    current UTC time, and is a parameter so tests can fix it); a
+    value that is not a duration raises ValueError. since / until
+    are ISO 8601 timestamps with a timezone, keeping only steps in
+    the closed window [since, until], the same window as `blackbox
+    query --since` / `--until`; a value that does not parse or
+    carries no timezone raises ValueError, as does --since after
+    --until, and --last cannot be combined with --since or --until.
+    The window is the shared `_window_records` from aggregates.py,
+    so the summary and checkpoint records are kept untouched and a
+    step whose timestamp does not parse, or carries no timezone,
+    never matches. The window applies before the tail decision, so
+    the error / slow-span / high-cost triggers are judged on the
+    windowed steps only — an error outside the window does not keep
+    the trace whole — and the last kept step runs to the summary
+    timestamp, as in the unwindowed export.
 
     With causal=True, the kept spans are closed under their causal
     ancestors (see tail_sample_records) and their parentSpanIds come
@@ -231,10 +279,19 @@ def export_tail_sampled_otlp(path, keep_rate=0.5, seed=None,
     parent_gaps in the decision, so the gap is honest.
     """
     records = load_records(path)
+    records = _window_records(records, last=last, since=since,
+                              until=until, now=now)
     kept, decision = tail_sample_records(
         records, keep_rate=keep_rate, seed=seed, slow_ms=slow_ms,
         max_cost_usd=max_cost_usd, causal=causal)
-    summary = records[-1] if records and records[-1]["type"] == "summary" else None
+    # The summary timestamp comes from the last summary record, not
+    # assumed to be the last record: a checkpoint or a step can
+    # follow it in the log.
+    summary = None
+    for record in reversed(records):
+        if record["type"] == "summary":
+            summary = record
+            break
     parents = link_parents(records) if causal else None
     spans = records_to_spans(kept + ([summary] if summary else []),
                              service_name, causal=causal, parents=parents)
@@ -247,13 +304,16 @@ def export_tail_sampled_otlp(path, keep_rate=0.5, seed=None,
 def export_tail_sampled_otlp_file(path, out_path, keep_rate=0.5,
                                   seed=None, slow_ms=DEFAULT_SLOW_MS,
                                   max_cost_usd=DEFAULT_MAX_COST_USD,
-                                  service_name=SERVICE_NAME, causal=False):
+                                  service_name=SERVICE_NAME, causal=False,
+                                  last=None, since=None, until=None,
+                                  now=None):
     """Write a log's tail-sampled OTLP/JSON export to a file.
-    Returns the dict."""
+    Returns the dict. last / since / until narrow the export to a
+    window, the same window as `export_tail_sampled_otlp`."""
     data = export_tail_sampled_otlp(
         path, keep_rate=keep_rate, seed=seed, slow_ms=slow_ms,
         max_cost_usd=max_cost_usd, service_name=service_name,
-        causal=causal)
+        causal=causal, last=last, since=since, until=until, now=now)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")

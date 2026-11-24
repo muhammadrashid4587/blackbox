@@ -5,7 +5,10 @@ replays the existing steps first. --type keeps only steps of that
 type, --errors-only only steps that look like errors (the same rule
 as `blackbox query`), --model keeps only model_call steps for one
 model and --tool keeps only tool_call / tool_result steps for one
-tool (the same match rules as `blackbox query`). A malformed appended
+tool (the same match rules as `blackbox query`), and --since /
+--until keep only steps whose timestamp falls in the closed window
+[since, until] (the same window as `blackbox query`, parsed the way
+`blackbox record --ts` parses a timestamp). A malformed appended
 line is reported, not a crash; a log that shrinks while watched (a
 Recorder resuming drops the trailing summary) is re-read without
 reprinting what was already printed; Ctrl-C stops cleanly with exit
@@ -49,7 +52,8 @@ class WatchTest(unittest.TestCase):
 
     def _run_watch(self, path=None, from_start=False, stop_after=5.0,
                    max_records=None, types=None, errors_only=False,
-                   model=None, tool=None, min_tokens=None, min_cost=None):
+                   model=None, tool=None, min_tokens=None, min_cost=None,
+                   since=None, until=None):
         """Start watch_log in a thread; returns (thread, result, out, err)."""
         out, err = io.StringIO(), io.StringIO()
         result = {}
@@ -61,11 +65,39 @@ class WatchTest(unittest.TestCase):
                 stop_after=stop_after, max_records=max_records,
                 types=types, errors_only=errors_only,
                 model=model, tool=tool, min_tokens=min_tokens,
-                min_cost=min_cost)
+                min_cost=min_cost, since=since, until=until)
 
         thread = threading.Thread(target=target)
         thread.start()
         return thread, result, out, err
+
+    def _assert_no_bad_line_report(self, err):
+        """No malformed-line report on stderr. A Recorder resuming
+        drops the trailing summary, so the log shrinks; a poll that
+        lands mid-resume legitimately reports the shrink and
+        re-reads, so stderr is not asserted empty here — only that
+        no line was called malformed, which would mean a real
+        desync bug."""
+        self.assertNotIn("not valid JSON", err.getvalue())
+        self.assertNotIn("not a blackbox record", err.getvalue())
+
+    def _timed_log(self, path=None):
+        """A log with steps stamped at fixed times: model_call at
+        10:00, tool_call at 11:00, tool_result at 12:00, all on
+        2026-11-24 UTC, plus the summary the Recorder writes on
+        close (stamped with the real now). Returns the path."""
+        path = path or os.path.join(self.tmp.name, "timed.jsonl")
+        with Recorder(path, task="t", model="gpt-5") as rec:
+            rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                       tokens={"input": 10, "output": 2},
+                       ts="2026-11-24T10:00:00Z")
+            rec.record("tool_call", {"tool": "search",
+                                     "args": {"query": "mcp"}},
+                       ts="2026-11-24T11:00:00Z")
+            rec.record("tool_result", {"tool": "search",
+                                       "result": "3 results"},
+                       ts="2026-11-24T12:00:00Z")
+        return path
 
     def test_watch_prints_appended_steps(self):
         # Two steps + the summary the Recorder writes on close.
@@ -78,7 +110,7 @@ class WatchTest(unittest.TestCase):
         thread.join(timeout=10)
         self.assertFalse(thread.is_alive())
         self.assertEqual(result["count"], 3)
-        self.assertEqual(err.getvalue(), "")
+        self._assert_no_bad_line_report(err)
         lines = out.getvalue()
         self.assertIn("[3]", lines)
         self.assertIn("tool_call", lines)
@@ -181,7 +213,10 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(lines.count("[3]"), 1)
         # The stale byte offset (the resume rewrote the log between
         # polls) must not surface as a bogus malformed-line report.
-        self.assertEqual(err.getvalue(), "")
+        # A poll landing mid-resume may legitimately report the
+        # shrink itself, so only the malformed-line report is
+        # forbidden here.
+        self._assert_no_bad_line_report(err)
 
     def test_watch_truncated_log_reprints_only_new_steps(self):
         # A rotation that truncates the log to its first two lines,
@@ -316,7 +351,7 @@ class WatchTest(unittest.TestCase):
         thread.join(timeout=10)
         self.assertFalse(thread.is_alive())
         self.assertEqual(result["count"], 1)
-        self.assertEqual(err.getvalue(), "")
+        self._assert_no_bad_line_report(err)
         lines = out.getvalue()
         self.assertIn("tool_result", lines)
         self.assertIn("timeout", lines)
@@ -437,7 +472,7 @@ class WatchTest(unittest.TestCase):
         thread.join(timeout=10)
         self.assertFalse(thread.is_alive())
         self.assertEqual(result["count"], 1)
-        self.assertEqual(err.getvalue(), "")
+        self._assert_no_bad_line_report(err)
         lines = out.getvalue()
         self.assertIn("tool_result", lines)
         self.assertIn("timeout", lines)
@@ -538,6 +573,203 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(out.getvalue(), "")
         self.assertEqual(err.getvalue(), "")
 
+    def test_watch_since_until_keeps_only_window(self):
+        # Steps at 10:00, 11:00, 12:00 plus the summary. --since
+        # 11:00 --until 12:00 keeps the 11:00 and 12:00 steps — both
+        # bounds inclusive, the same closed window as `blackbox
+        # query` — and drops the 10:00 step and the summary.
+        path = self._timed_log()
+        thread, result, out, err = self._run_watch(
+            path=path, from_start=True,
+            since="2026-11-24T11:00:00Z",
+            until="2026-11-24T12:00:00Z", max_records=2)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[1]", lines)
+        self.assertIn("tool_call", lines)
+        self.assertIn("[2]", lines)
+        self.assertIn("tool_result", lines)
+        self.assertNotIn("[0]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_since_until_boundaries_are_inclusive(self):
+        # --since and --until at the same instant keep exactly the
+        # step stamped at that instant: both bounds are inclusive.
+        path = self._timed_log()
+        thread, result, out, err = self._run_watch(
+            path=path, from_start=True,
+            since="2026-11-24T11:00:00Z",
+            until="2026-11-24T11:00:00Z", max_records=1)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[1]", lines)
+        self.assertIn("tool_call", lines)
+        self.assertNotIn("[0]", lines)
+        self.assertNotIn("[2]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_since_until_sqlite_backend(self):
+        path = self._timed_log(os.path.join(self.tmp.name, "timed.db"))
+        thread, result, out, err = self._run_watch(
+            path=path, from_start=True,
+            since="2026-11-24T11:00:00Z",
+            until="2026-11-24T12:00:00Z", max_records=2)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[1]", lines)
+        self.assertIn("tool_call", lines)
+        self.assertIn("[2]", lines)
+        self.assertIn("tool_result", lines)
+        self.assertNotIn("[0]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_since_until_and_type_combine_with_and(self):
+        # --since 10:00 --until 12:00 --type tool_call keeps only
+        # the tool steps in the window: the 10:00 model_call is in
+        # the window but the wrong type, and the summary is dropped
+        # under a filter, like in `blackbox query`.
+        path = self._timed_log()
+        thread, result, out, err = self._run_watch(
+            path=path, from_start=True,
+            since="2026-11-24T10:00:00Z",
+            until="2026-11-24T12:00:00Z", types=["tool_call"],
+            max_records=1)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[1]", lines)
+        self.assertIn("tool_call", lines)
+        self.assertNotIn("[0]", lines)
+        self.assertNotIn("[2]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_since_with_offset_is_normalised_to_utc(self):
+        # --since given with a +02:00 offset means 11:00 UTC, the
+        # same normalisation `blackbox record --ts` applies: the
+        # 10:00 step is dropped and the 11:00 and 12:00 steps kept.
+        path = self._timed_log()
+        thread, result, out, err = self._run_watch(
+            path=path, from_start=True,
+            since="2026-11-24T13:00:00+02:00",
+            until="2026-11-24T12:00:00Z", max_records=2)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[1]", lines)
+        self.assertIn("[2]", lines)
+        self.assertNotIn("[0]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_fractional_second_step_after_whole_second_until(self):
+        # A step stamped 11:00:00.5 is after --until 11:00:00, so it
+        # is dropped. The bounds compare as datetimes, not strings:
+        # a plain string comparison would order ".5" before "Z" and
+        # wrongly keep it.
+        path = os.path.join(self.tmp.name, "frac.jsonl")
+        with Recorder(path, task="t", model="gpt-5") as rec:
+            rec.record("tool_call", {"tool": "search"},
+                       ts="2026-11-24T11:00:00Z")
+            rec.record("tool_call", {"tool": "fetch"},
+                       ts="2026-11-24T11:00:00.500000Z")
+        thread, result, out, err = self._run_watch(
+            path=path, from_start=True,
+            until="2026-11-24T11:00:00Z", max_records=1)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[0]", lines)
+        self.assertIn("search", lines)
+        self.assertNotIn("fetch", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_time_filtered_step_not_reprinted_after_shrink(self):
+        # A live step outside the window is filtered out and marked
+        # seen: when the Recorder resumes (dropping the summary, so
+        # the log shrinks and is re-read) it must not print, while
+        # the in-window step that lands with it does.
+        path = self._timed_log()
+        thread, result, out, err = self._run_watch(
+            path=path, since="2026-11-24T11:30:00Z", stop_after=2.5)
+        time.sleep(0.3)
+        with Recorder(path, task="t", model="gpt-5") as rec:
+            rec.record("tool_call", {"tool": "fetch"},
+                       ts="2026-11-24T10:30:00Z")
+            rec.record("tool_result", {"tool": "search",
+                                       "result": "ok"},
+                       ts="2026-11-24T12:00:00Z")
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        lines = out.getvalue()
+        self.assertIn("[4]", lines)  # the in-window step
+        self.assertIn("tool_result", lines)
+        self.assertIn("search", lines)
+        self.assertNotIn("fetch", lines)  # filtered out, not reprinted
+        self.assertNotIn("[0]", lines)
+        self.assertNotIn("[1]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_cli_passes_since_and_until_flags(self):
+        with mock.patch("blackbox.__main__.watch_log") as patched:
+            code = main(["watch", self.path,
+                         "--since", "2026-11-24T11:00:00Z",
+                         "--until", "2026-11-24T12:00:00Z"])
+        self.assertEqual(code, 0)
+        patched.assert_called_once_with(
+            self.path, from_start=False, poll_interval=0.2,
+            types=None, errors_only=False,
+            model=None, tool=None, min_tokens=None, min_cost=None,
+            since="2026-11-24T11:00:00Z",
+            until="2026-11-24T12:00:00Z")
+
+    def test_watch_cli_bad_since_exits_two(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["watch", self.path, "--since", "not-a-time"])
+        self.assertEqual(code, 2)
+        self.assertIn("--since", err.getvalue())
+
+    def test_watch_cli_naive_since_exits_two(self):
+        # A timestamp with no timezone is an error, never a silent
+        # assumption of UTC — the same rule as `blackbox record --ts`.
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["watch", self.path,
+                         "--since", "2026-11-24T11:00:00"])
+        self.assertEqual(code, 2)
+        self.assertIn("--since", err.getvalue())
+
+    def test_watch_cli_bad_until_exits_two(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["watch", self.path, "--until", "yesterday"])
+        self.assertEqual(code, 2)
+        self.assertIn("--until", err.getvalue())
+
+    def test_watch_cli_since_after_until_exits_two(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["watch", self.path,
+                         "--since", "2026-11-24T12:00:00Z",
+                         "--until", "2026-11-24T11:00:00Z"])
+        self.assertEqual(code, 2)
+        self.assertIn("--since", err.getvalue())
+
     def test_watch_cli_passes_filter_flags(self):
         with mock.patch("blackbox.__main__.watch_log") as patched:
             code = main(["watch", self.path, "--type", "tool_call",
@@ -546,7 +778,8 @@ class WatchTest(unittest.TestCase):
         patched.assert_called_once_with(
             self.path, from_start=False, poll_interval=0.2,
             types=["tool_call", "tool_result"], errors_only=True,
-            model=None, tool=None, min_tokens=None, min_cost=None)
+            model=None, tool=None, min_tokens=None, min_cost=None,
+            since=None, until=None)
 
     def test_watch_cli_passes_model_and_tool_flags(self):
         with mock.patch("blackbox.__main__.watch_log") as patched:
@@ -557,7 +790,7 @@ class WatchTest(unittest.TestCase):
             self.path, from_start=False, poll_interval=0.2,
             types=None, errors_only=False,
             model="gpt-5", tool="search", min_tokens=None,
-            min_cost=None)
+            min_cost=None, since=None, until=None)
 
     def test_watch_cli_passes_min_tokens_and_min_cost_flags(self):
         with mock.patch("blackbox.__main__.watch_log") as patched:
@@ -567,7 +800,8 @@ class WatchTest(unittest.TestCase):
         patched.assert_called_once_with(
             self.path, from_start=False, poll_interval=0.2,
             types=None, errors_only=False,
-            model=None, tool=None, min_tokens=100, min_cost=0.01)
+            model=None, tool=None, min_tokens=100, min_cost=0.01,
+            since=None, until=None)
 
     def test_watch_cli_ctrl_c_returns_zero(self):
         with mock.patch("blackbox.__main__.watch_log",

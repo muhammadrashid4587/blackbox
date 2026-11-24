@@ -12,6 +12,7 @@
     python -m blackbox span data/run.jsonl 0  # one step as an OTLP span
     python -m blackbox watch data/run.jsonl  # tail a live log
     python -m blackbox watch data/run.jsonl --type tool_call --errors-only
+    python -m blackbox watch data/run.jsonl --since 2026-11-24T01:00:00Z --until 2026-11-24T02:00:00Z
     python -m blackbox otel data/run.jsonl --out spans.json
     python -m blackbox metrics data/run.jsonl --out metrics.json
     python -m blackbox tail-sample data/run.jsonl --out spans.json
@@ -273,6 +274,14 @@ def main(argv=None):
                          help="keep model_call records costing at least "
                          "this many USD (unpriced calls never match; "
                          "the same rule as query --min-cost)")
+    p_watch.add_argument("--since", help="keep records at or after this "
+                         "ISO timestamp (with a timezone, e.g. "
+                         "2026-11-24T01:00:00Z; the same window as "
+                         "query --since)")
+    p_watch.add_argument("--until", help="keep records at or before this "
+                         "ISO timestamp (with a timezone, e.g. "
+                         "2026-11-24T01:00:00Z; the same window as "
+                         "query --until)")
 
     p_otel = sub.add_parser("otel", help="export a log as OTLP/JSON spans")
     p_otel.add_argument("logfile")
@@ -545,10 +554,15 @@ def main(argv=None):
                       types=args.types, errors_only=args.errors_only,
                       model=args.model, tool=args.tool,
                       min_tokens=args.min_tokens,
-                      min_cost=args.min_cost)
+                      min_cost=args.min_cost,
+                      since=args.since, until=args.until)
         except KeyboardInterrupt:
             # Ctrl-C stops the tail cleanly, exit code 0.
             return 0
+        except ValueError as exc:
+            # A bad --since / --until value, or --since after --until.
+            print("watch: %s" % exc, file=sys.stderr)
+            return 2
         except OSError as exc:
             print("watch: %s" % (exc.strerror or exc), file=sys.stderr)
             return 1

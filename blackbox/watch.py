@@ -16,10 +16,16 @@ tool_result steps for one tool, both the same match rules as
 at least that many tokens or at least that many USD of cost — the
 same cost rule as `blackbox query`, so a call with a plain int token
 count or an unknown model has no cost and never matches --min-cost.
+--since / --until keep only steps whose timestamp falls in the
+closed window [since, until] — the same window as `blackbox query`
+— parsed the way `blackbox record --ts` parses a timestamp: ISO
+8601 with a timezone, normalised to UTC, and a value that does not
+parse or carries no timezone is an error, exit code 2, never a
+silent assumption of UTC.
 The summary record is printed by default, but under a filter it
 follows the same rule as `blackbox query`: it is kept only when
 --type summary is given explicitly, and never under --errors-only,
---model, --tool, --min-tokens or --min-cost.
+--model, --tool, --min-tokens, --min-cost, --since or --until.
 
 Both backends work: a .jsonl log is tailed by byte offset, a .db
 store by polling for rows past the last printed seq. A log that
@@ -48,15 +54,48 @@ import os
 import sqlite3
 import sys
 import time
+from datetime import datetime
 from urllib.parse import quote
 
 from .query import _is_error, _record_cost
-from .recorder import _tokens_total
+from .recorder import _normalize_ts, _tokens_total
 from .replay import format_record
 from .sqlite_store import _row_to_record, is_sqlite_path
 
 DEFAULT_POLL_INTERVAL = 0.2
 _READ_CHUNK = 65536
+
+
+def _parse_bound(value, flag):
+    """Parse a --since / --until value the way `blackbox record --ts`
+    parses one: ISO 8601 with a timezone, normalised to UTC.
+    Returns an aware datetime. Raises ValueError naming the flag on
+    a value that does not parse or carries no timezone — a naive
+    timestamp has no honest meaning, so it is an error, not a silent
+    assumption of UTC."""
+    try:
+        normalized = _normalize_ts(value)
+    except ValueError:
+        raise ValueError("%s must be an ISO 8601 timestamp with a "
+                         "timezone, e.g. 2026-11-24T01:00:00Z"
+                         % flag) from None
+    return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+
+
+def _parse_record_ts(ts):
+    """Parse a record's timestamp to an aware datetime, or None when
+    it is not a parseable timestamp with a timezone. A record whose
+    time cannot be placed in a window never matches a time filter —
+    the same strictness as `blackbox record --ts`."""
+    if not isinstance(ts, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt
 
 
 def _record_identity(record, line):
@@ -88,7 +127,8 @@ def _is_record(record):
 
 
 def _matches_filter(record, types, errors_only, model=None, tool=None,
-                    min_tokens=None, min_cost=None):
+                    min_tokens=None, min_cost=None, since=None,
+                    until=None):
     """Whether a record passes the watch filters: --type keeps only
     steps of a listed type (the summary is kept only when "summary"
     is listed, the same rule as `blackbox query`), --errors-only
@@ -100,17 +140,24 @@ def _matches_filter(record, types, errors_only, model=None, tool=None,
     that many tokens and --min-cost only model_call records costing
     at least that many USD, by the query's cost rule: a call with a
     plain int token count or an unknown model has no cost and never
-    matches. The summary is a roll-up, not a step, so under any
-    filter it is kept only when --type summary is given — the same
-    rule as `blackbox query` — and with no filter at all it is
-    printed, like an unfiltered watch. Filters combine with AND, like
-    `blackbox query`."""
+    matches. --since / --until keep only records whose timestamp
+    falls in the closed window [since, until], the same window as
+    `blackbox query`, compared as datetimes — so a record stamped
+    with fractional seconds compares correctly against a whole-second
+    bound, which a plain string comparison would get wrong. A record
+    whose timestamp does not parse, or carries no timezone, never
+    matches a time filter. The summary is a roll-up, not a step, so
+    under any filter it is kept only when --type summary is given —
+    the same rule as `blackbox query` — and with no filter at all it
+    is printed, like an unfiltered watch. Filters combine with AND,
+    like `blackbox query`."""
     if types is not None and record["type"] not in types:
         return False
     if record["type"] == "summary" and not (types and "summary" in types):
         if (types is not None or errors_only or model is not None
                 or tool is not None or min_tokens is not None
-                or min_cost is not None):
+                or min_cost is not None or since is not None
+                or until is not None):
             return False
     payload = record.get("payload") or {}
     if model is not None:
@@ -131,6 +178,14 @@ def _matches_filter(record, types, errors_only, model=None, tool=None,
             return False
     if errors_only and not _is_error(record):
         return False
+    if since is not None or until is not None:
+        ts = _parse_record_ts(record.get("ts"))
+        if ts is None:
+            return False
+        if since is not None and ts < since:
+            return False
+        if until is not None and ts > until:
+            return False
     return True
 
 
@@ -196,7 +251,8 @@ class _JsonlTail:
         return hashes
 
     def poll(self, printed, out, err, types=None, errors_only=False,
-             model=None, tool=None, min_tokens=None, min_cost=None):
+             model=None, tool=None, min_tokens=None, min_cost=None,
+             since=None, until=None):
         """One check for new steps. Returns how many were printed."""
         try:
             st = os.stat(self.path)
@@ -232,18 +288,20 @@ class _JsonlTail:
                                           errors_only=errors_only,
                                           model=model, tool=tool,
                                           min_tokens=min_tokens,
-                                          min_cost=min_cost)
+                                          min_cost=min_cost,
+                                          since=since, until=until)
         if needs_reread:
             count += self._reread(printed, out, err, types=types,
                                   errors_only=errors_only,
                                   model=model, tool=tool,
                                   min_tokens=min_tokens,
-                                  min_cost=min_cost)
+                                  min_cost=min_cost,
+                                  since=since, until=until)
         return count
 
     def _drain(self, printed, out, err, reread_on_bad,
                types=None, errors_only=False, model=None, tool=None,
-               min_tokens=None, min_cost=None):
+               min_tokens=None, min_cost=None, since=None, until=None):
         """Print every complete line in the buffer.
 
         Returns (count, needs_reread): needs_reread when a line
@@ -280,7 +338,8 @@ class _JsonlTail:
             if not _matches_filter(record, types, errors_only,
                                    model=model, tool=tool,
                                    min_tokens=min_tokens,
-                                   min_cost=min_cost):
+                                   min_cost=min_cost,
+                                   since=since, until=until):
                 continue
             _print_record(record, out)
             count += 1
@@ -299,7 +358,8 @@ class _JsonlTail:
         err.flush()
 
     def _reread(self, printed, out, err, types=None, errors_only=False,
-                model=None, tool=None, min_tokens=None, min_cost=None):
+                model=None, tool=None, min_tokens=None, min_cost=None,
+                since=None, until=None):
         """Re-read the whole log from the start: the offset went
         stale. Records already printed are skipped by hash, so the
         missed steps land and nothing is printed twice; a malformed
@@ -316,7 +376,8 @@ class _JsonlTail:
         count, _ = self._drain(printed, out, err, reread_on_bad=False,
                                types=types, errors_only=errors_only,
                                model=model, tool=tool,
-                               min_tokens=min_tokens, min_cost=min_cost)
+                               min_tokens=min_tokens, min_cost=min_cost,
+                               since=since, until=until)
         return count
 
 
@@ -359,7 +420,8 @@ class _DbTail:
         return {row[1] for row in rows}, rows[-1][0]
 
     def poll(self, printed, out, err, types=None, errors_only=False,
-             model=None, tool=None, min_tokens=None, min_cost=None):
+             model=None, tool=None, min_tokens=None, min_cost=None,
+             since=None, until=None):
         """One check for new steps. Returns how many were printed.
 
         The last printed seq advances past every valid record,
@@ -438,7 +500,8 @@ class _DbTail:
             if not _matches_filter(record, types, errors_only,
                                    model=model, tool=tool,
                                    min_tokens=min_tokens,
-                                   min_cost=min_cost):
+                                   min_cost=min_cost,
+                                   since=since, until=until):
                 continue
             _print_record(record, out)
             printed_now += 1
@@ -449,7 +512,8 @@ def watch_log(path, from_start=False,
               poll_interval=DEFAULT_POLL_INTERVAL,
               output=None, error_output=None, stop_after=None,
               max_records=None, types=None, errors_only=False,
-              model=None, tool=None, min_tokens=None, min_cost=None):
+              model=None, tool=None, min_tokens=None, min_cost=None,
+              since=None, until=None):
     """Follow a log, printing each new step's transcript line as it
     lands, in the same format `blackbox replay` prints.
 
@@ -470,12 +534,18 @@ def watch_log(path, from_start=False,
     records with at least that many tokens and `min_cost` only
     model_call records costing at least that many USD, by the
     query's cost rule — a call with a plain int token count or an
-    unknown model has no cost and never matches. The summary is a
-    roll-up, not a step, so under any filter it is kept only when
-    --type summary is given, the same rule as `blackbox query`.
-    Filters combine with AND, and a filtered step is still marked
-    seen, so it is not re-checked on a re-read. `max_records`
-    counts printed steps, not skipped ones.
+    unknown model has no cost and never matches. `since` / `until`
+    are ISO 8601 timestamps with a timezone, keeping only records
+    whose timestamp falls in the closed window [since, until] — the
+    same window as `blackbox query` — parsed the way `blackbox
+    record --ts` parses one, so a value that does not parse or
+    carries no timezone raises ValueError, and --since after --until
+    raises ValueError too. The summary is a roll-up, not a step, so
+    under any filter it is kept only when --type summary is given,
+    the same rule as `blackbox query`. Filters combine with AND, and
+    a filtered step is still marked seen, so it is not re-checked
+    on a re-read. `max_records` counts printed steps, not skipped
+    ones.
 
     `stop_after` (seconds) and `max_records` stop the loop and
     return: test hooks, and the only way to stop besides Ctrl-C.
@@ -484,6 +554,11 @@ def watch_log(path, from_start=False,
     """
     if poll_interval <= 0:
         raise ValueError("poll_interval must be positive")
+    since_dt = _parse_bound(since, "--since") if since is not None else None
+    until_dt = _parse_bound(until, "--until") if until is not None else None
+    if (since_dt is not None and until_dt is not None
+            and since_dt > until_dt):
+        raise ValueError("--since must be at or before --until")
     out = output if output is not None else sys.stdout
     err = error_output if error_output is not None else sys.stderr
     deadline = None if stop_after is None else time.monotonic() + stop_after
@@ -525,7 +600,8 @@ def watch_log(path, from_start=False,
                                errors_only=errors_only,
                                model=model, tool=tool,
                                min_tokens=min_tokens,
-                               min_cost=min_cost)
+                               min_cost=min_cost,
+                               since=since_dt, until=until_dt)
             if max_records is not None and count >= max_records:
                 return count
             if not _time_left():

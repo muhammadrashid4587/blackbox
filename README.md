@@ -504,12 +504,18 @@ tokens and `--min-cost` only model_call steps costing at least
 that many USD, by the query's cost rule — a call with a plain int
 token count or an unknown model has no cost and never matches
 --min-cost — so a live tail can be narrowed to heavy or expensive
-steps like `blackbox query` can. The summary is kept only when
+steps like `blackbox query` can. `--since` / `--until` keep only
+steps whose timestamp falls in the closed window [since, until],
+the same window as `blackbox query`, parsed the way `blackbox
+record --ts` parses a timestamp — ISO 8601 with a timezone,
+normalised to UTC, and a value that does not parse or carries no
+timezone is an error, exit code 2 — so a live tail can be narrowed
+to a time window like `blackbox query` can. The summary is kept only when
 `--type summary` is given, and never under `--errors-only`,
-`--model`, `--tool`, `--min-tokens` or `--min-cost`. Filters
-combine with AND, a filtered step is still marked seen (so a
-re-read after a shrink does not re-check it), and `max_records`
-counts printed steps, not skipped ones.
+`--model`, `--tool`, `--min-tokens`, `--min-cost`, `--since` or
+`--until`. Filters combine with AND, a filtered step is still
+marked seen (so a re-read after a shrink does not re-check it),
+and `max_records` counts printed steps, not skipped ones.
 
 ## What it is not
 
@@ -523,7 +529,7 @@ counts printed steps, not skipped ones.
 
 ## Measured
 
-- 426 tests, all passing (`make test`).
+- 438 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -856,6 +862,24 @@ counts printed steps, not skipped ones.
   Next: `--since` / `--until` time-range filters for watch, so a
   live tail can be narrowed to a time window like `blackbox query`
   can.
+- Watch time-range filters: `blackbox watch --since
+  2026-11-24T01:00:00Z --until 2026-11-24T02:00:00Z` keeps only
+  steps whose timestamp falls in the closed window [since, until]
+  — the same window as `blackbox query`, so the two commands always
+  agree — parsed the way `blackbox record --ts` parses a timestamp:
+  ISO 8601 with a timezone, normalised to UTC, and a value that
+  does not parse or carries no timezone is an error, exit code 2,
+  as is --since after --until. Bounds compare as datetimes, so a
+  step stamped with fractional seconds compares correctly against
+  a whole-second bound. The summary is kept only when `--type
+  summary` is given, and never under `--since` or `--until`, the
+  same rule as `blackbox query`; filters combine with AND, a
+  filtered step is still marked seen, and `max_records` counts
+  printed steps, not skipped ones. Works on `.jsonl` logs and
+  `.db` stores, done (v0.44.0).
+  Next: a `--last` relative window for watch (e.g. `--last 10m`),
+  so a live tail can be narrowed to the recent past without
+  computing an absolute timestamp.
 
 ## Layout
 

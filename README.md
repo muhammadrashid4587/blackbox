@@ -931,6 +931,25 @@ and `max_records` counts printed steps, not skipped ones.
   Next: a `--last` relative window for `blackbox aggregates` /
   `blackbox costs`, so a finished session's totals can be narrowed
   to the recent past the same way its steps can.
+- Aggregates/costs relative window: `blackbox aggregates --last
+  10m` and `blackbox costs --last 10m` narrow a finished session's
+  totals to the last 10 minutes — a duration (30s, 2h, 1d, 1h30m),
+  not a timestamp — as a lower bound of now minus that duration,
+  the same relative window as `blackbox query --last`, so a
+  session's totals can be narrowed to the recent past the same way
+  its steps can. The window reuses the shared duration parser and
+  filter in `query.py`, so a value that is not a duration is an
+  error, exit code 2, and a step whose timestamp does not parse, or
+  carries no timezone, never matches. The summary and checkpoint
+  records are kept untouched, so `sampled_out` and
+  `compacted_count` still describe the whole log, not just the
+  window. `aggregates_log` / `cost_totals_log` in `aggregates.py`
+  take the same filter as a Python API (a duration string or a
+  timedelta, with `now` fixable for tests). Works on `.jsonl` logs
+  and `.db` stores, done (v0.47.0).
+  Next: `--since` / `--until` time-range filters for `blackbox
+  aggregates` / `blackbox costs`, so a finished session's totals can
+  be narrowed to an absolute window the same way its steps can.
 
 ## Layout
 

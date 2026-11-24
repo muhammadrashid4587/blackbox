@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 
 from blackbox import Recorder
 from blackbox.__main__ import main
@@ -158,6 +159,20 @@ class AggregatesLogTest(unittest.TestCase):
                 main(["aggregates", self.path, "--json"]), 0)
         data = json.loads(out.getvalue())
         self.assertEqual(data["steps"], 3)
+
+    def test_cli_aggregates_last(self):
+        # The log was just recorded, so --last 1d (and the compound
+        # 1h30m) matches every step; a bare number is an error.
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(
+                main(["aggregates", self.path, "--last", "1d"]), 0)
+        self.assertIn("session: 3 steps", out.getvalue())
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                main(["aggregates", self.path, "--last", "1h30m"]), 0)
+            self.assertEqual(
+                main(["aggregates", self.path, "--last", "10"]), 2)
 
     def test_works_on_sqlite_store(self):
         db_path = os.path.join(self.tmp.name, "run.db")
@@ -348,6 +363,116 @@ class CostTotalsLogTest(unittest.TestCase):
             self.assertEqual(main(["costs", self.path, "--json"]), 0)
         data = json.loads(out.getvalue())
         self.assertEqual(data["total_cost_usd"], 0.00625)
+
+    def test_cli_costs_last(self):
+        # The log was just recorded, so --last 1d (and the compound
+        # 1h30m) matches every step; a bare number is an error.
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(main(["costs", self.path, "--last", "1d"]), 0)
+        self.assertIn("cost totals: $0.006250 priced", out.getvalue())
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                main(["costs", self.path, "--last", "1h30m"]), 0)
+            self.assertEqual(
+                main(["costs", self.path, "--last", "10"]), 2)
+
+
+NOW = datetime(2026, 11, 22, 10, 6, tzinfo=timezone.utc)
+
+
+class AggregatesLastTest(unittest.TestCase):
+    """--last narrows aggregates and costs to the recent past.
+
+    now is 10:06, so last 5m keeps seqs 1-5 (bound 10:01); seq 0,
+    the priced gpt-5 call at 10:00, falls outside the window.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "run.jsonl")
+        records = [
+            _record(0, "model_call", {"model": "gpt-5", "prompt": "plan"},
+                    {"input": 1000, "output": 500},
+                    "2026-11-22T10:00:00Z"),
+            _record(1, "tool_call", {"tool": "search", "args": {"q": "x"}},
+                    None, "2026-11-22T10:01:00Z"),
+            _record(2, "tool_result", {"tool": "search", "result": "ok"},
+                    None, "2026-11-22T10:01:30Z"),
+            _record(3, "tool_result", {"tool": "fetch",
+                                       "result": "error: 404"},
+                    None, "2026-11-22T10:04:00Z"),
+            _record(4, "model_call", {"model": "unknown-model",
+                                      "prompt": "p"},
+                    {"input": 9000, "output": 9000},
+                    "2026-11-22T10:04:30Z"),
+            _record(5, "model_call", {"model": "gpt-5", "prompt": "small"},
+                    50, "2026-11-22T10:05:00Z"),
+            _record(6, "summary", {"events": 6, "total_tokens": 19550,
+                                   "sampled_out": 2},
+                    None, "2026-11-22T10:06:00Z"),
+            _record(7, "checkpoint", {"compacted_count": 3,
+                                      "head_hash": "ab" * 32},
+                    None, "2026-11-22T09:00:00Z"),
+        ]
+        with open(self.path, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_aggregates_last_keeps_only_recent_steps(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            agg = aggregates_log(self.path, last="5m", now=NOW)
+        self.assertEqual(agg["steps"], 5)
+        self.assertEqual(agg["started"], "2026-11-22T10:01:00Z")
+        self.assertEqual(agg["ended"], "2026-11-22T10:05:00Z")
+        self.assertEqual(agg["duration_seconds"], 240.0)
+        # seq 4 (18000 tokens) + seq 5 (50); the priced seq 0 call
+        # is outside the window, so nothing is priced.
+        self.assertEqual(agg["total_tokens"], 18050)
+        self.assertEqual(agg["total_cost_usd"], 0.0)
+        self.assertEqual(agg["unpriced_model_calls"], 2)
+        self.assertEqual(agg["errors"], 1)
+        self.assertEqual(agg["by_model"]["gpt-5"]["calls"], 1)
+        self.assertIn("session: 5 steps", out.getvalue())
+
+    def test_aggregates_last_keeps_whole_log_bookkeeping(self):
+        # The summary and checkpoint are bookkeeping about the whole
+        # log, so sampled_out and compacted_count survive the window.
+        out = io.StringIO()
+        with redirect_stdout(out):
+            agg = aggregates_log(self.path, last="5m", now=NOW)
+        self.assertEqual(agg["sampled_out"], 2)
+        self.assertEqual(agg["compacted_count"], 3)
+
+    def test_aggregates_last_rejects_bad_duration(self):
+        for bad in ("10", "1.5m", "0m", "", "next week"):
+            with self.assertRaises(ValueError):
+                aggregates_log(self.path, last=bad, now=NOW)
+
+    def test_costs_last_keeps_only_recent_steps(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            totals = cost_totals_log(self.path, last="5m", now=NOW)
+        self.assertEqual(totals["total_cost_usd"], 0.0)
+        self.assertEqual(totals["unpriced_model_calls"], 2)
+        self.assertEqual(totals["per_model"]["gpt-5"]["calls"], 1)
+        self.assertIsNone(totals["per_model"]["gpt-5"]["cost_usd"])
+        self.assertEqual(totals["per_model"]["unknown-model"]["calls"], 1)
+        # The search tool_call is in the window, but the model_call
+        # that invoked it is not, so it is counted as an orphan with
+        # no tokens and no cost.
+        self.assertEqual(totals["per_tool"]["search"]["calls"], 1)
+        self.assertIsNone(totals["per_tool"]["search"]["cost_usd"])
+        self.assertIn("cost totals: $0.000000 priced", out.getvalue())
+
+    def test_costs_last_rejects_bad_duration(self):
+        for bad in ("10", "1.5m", "0m", "", "next week"):
+            with self.assertRaises(ValueError):
+                cost_totals_log(self.path, last=bad, now=NOW)
 
 
 if __name__ == "__main__":

@@ -396,6 +396,9 @@ def main(argv=None):
     p_aggregates.add_argument("--json", action="store_true", dest="as_json",
                               help="print the aggregates as JSON instead "
                               "of a report")
+    p_aggregates.add_argument("--last", help="keep steps from the last "
+                              "this long, e.g. 10m, 2h, 1d, 1h30m "
+                              "(the same relative window as query --last)")
 
     p_costs = sub.add_parser(
         "costs", help="print cost totals broken down per model and per "
@@ -405,6 +408,9 @@ def main(argv=None):
     p_costs.add_argument("--json", action="store_true", dest="as_json",
                          help="print the cost totals as JSON instead "
                          "of a report")
+    p_costs.add_argument("--last", help="keep steps from the last "
+                         "this long, e.g. 10m, 2h, 1d, 1h30m "
+                         "(the same relative window as query --last)")
 
     p_compact = sub.add_parser(
         "compact", help="retention: drop old records and anchor them "
@@ -667,10 +673,22 @@ def main(argv=None):
         trace_log(args.logfile, as_json=args.as_json)
         return 0
     if args.command == "aggregates":
-        aggregates_log(args.logfile, as_json=args.as_json)
+        try:
+            aggregates_log(args.logfile, as_json=args.as_json,
+                           last=args.last)
+        except ValueError as exc:
+            # A bad --last value.
+            print("aggregates: %s" % exc, file=sys.stderr)
+            return 2
         return 0
     if args.command == "costs":
-        cost_totals_log(args.logfile, as_json=args.as_json)
+        try:
+            cost_totals_log(args.logfile, as_json=args.as_json,
+                            last=args.last)
+        except ValueError as exc:
+            # A bad --last value.
+            print("costs: %s" % exc, file=sys.stderr)
+            return 2
         return 0
     if args.command == "compact":
         try:

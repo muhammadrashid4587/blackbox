@@ -3,10 +3,13 @@ in the same format as the `blackbox replay` transcript. By default
 watching starts at the end and prints only new steps; --from-start
 replays the existing steps first. --type keeps only steps of that
 type, --errors-only only steps that look like errors (the same rule
-as `blackbox query`). A malformed appended line is
-reported, not a crash; a log that shrinks while watched (a Recorder
-resuming drops the trailing summary) is re-read without reprinting
-what was already printed; Ctrl-C stops cleanly with exit code 0."""
+as `blackbox query`), --model keeps only model_call steps for one
+model and --tool keeps only tool_call / tool_result steps for one
+tool (the same match rules as `blackbox query`). A malformed appended
+line is reported, not a crash; a log that shrinks while watched (a
+Recorder resuming drops the trailing summary) is re-read without
+reprinting what was already printed; Ctrl-C stops cleanly with exit
+code 0."""
 
 import io
 import json
@@ -45,7 +48,8 @@ class WatchTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def _run_watch(self, path=None, from_start=False, stop_after=5.0,
-                   max_records=None, types=None, errors_only=False):
+                   max_records=None, types=None, errors_only=False,
+                   model=None, tool=None):
         """Start watch_log in a thread; returns (thread, result, out, err)."""
         out, err = io.StringIO(), io.StringIO()
         result = {}
@@ -55,7 +59,8 @@ class WatchTest(unittest.TestCase):
                 path or self.path, from_start=from_start,
                 poll_interval=0.05, output=out, error_output=err,
                 stop_after=stop_after, max_records=max_records,
-                types=types, errors_only=errors_only)
+                types=types, errors_only=errors_only,
+                model=model, tool=tool)
 
         thread = threading.Thread(target=target)
         thread.start()
@@ -336,6 +341,107 @@ class WatchTest(unittest.TestCase):
         self.assertNotIn("[1]", lines)
         self.assertNotIn("events:", lines)
 
+    def test_watch_model_filter_keeps_only_matching_model(self):
+        # Two model calls, different models, plus a tool step: only
+        # the gpt-5 call prints, and the match is case-insensitive —
+        # the same rule as `blackbox query`. The summary is dropped,
+        # like in `blackbox query`.
+        path = os.path.join(self.tmp.name, "models.jsonl")
+        with Recorder(path, task="t", model="gpt-5") as rec:
+            rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                       tokens={"input": 10, "output": 2})
+            rec.record("model_call",
+                       {"model": "claude-sonnet-4-5", "prompt": "hi"},
+                       tokens={"input": 10, "output": 2})
+            rec.record("tool_call", {"tool": "search"})
+        thread, result, out, err = self._run_watch(
+            path=path, from_start=True, model="GPT-5", max_records=1)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[0]", lines)
+        self.assertIn("model_call", lines)
+        self.assertIn("gpt-5", lines)
+        self.assertNotIn("claude", lines)
+        self.assertNotIn("[1]", lines)
+        self.assertNotIn("[2]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_tool_filter_keeps_only_matching_tool(self):
+        # Fixture: model_call [0], tool_call search [1], tool_result
+        # search [2], summary [3]. --tool search keeps both search
+        # steps and nothing else.
+        thread, result, out, err = self._run_watch(
+            from_start=True, tool="SEARCH", max_records=2)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[1]", lines)
+        self.assertIn("tool_call", lines)
+        self.assertIn("[2]", lines)
+        self.assertIn("tool_result", lines)
+        self.assertNotIn("[0]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_model_filter_sqlite_backend(self):
+        path = os.path.join(self.tmp.name, "models.db")
+        with Recorder(path, task="t", model="gpt-5") as rec:
+            rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                       tokens={"input": 10, "output": 2})
+            rec.record("model_call",
+                       {"model": "claude-sonnet-4-5", "prompt": "hi"},
+                       tokens={"input": 10, "output": 2})
+            rec.record("tool_call", {"tool": "search"})
+        thread, result, out, err = self._run_watch(
+            path=path, from_start=True, model="claude-sonnet-4-5",
+            max_records=1)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[1]", lines)
+        self.assertIn("claude-sonnet-4-5", lines)
+        self.assertNotIn("[0]", lines)
+        self.assertNotIn("[2]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_model_and_type_filters_combine_with_and(self):
+        # --model gpt-5 with --type tool_call matches nothing: a
+        # model_call is not a tool_call, and the tool steps are not
+        # gpt-5 calls. Nothing prints and the watch still stops.
+        thread, result, out, err = self._run_watch(
+            from_start=True, model="gpt-5", types=["tool_call"],
+            stop_after=0.8)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 0)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_watch_tool_and_errors_only_combine_with_and(self):
+        # A clean search result lands, then an error fetch result:
+        # --tool search --errors-only prints nothing for the clean
+        # search steps, and the fetch error is the wrong tool.
+        thread, result, out, err = self._run_watch(
+            tool="search", errors_only=True, max_records=1)
+        time.sleep(0.3)
+        with Recorder(self.path, task="t", model="gpt-5") as rec:
+            rec.record("tool_result",
+                       {"tool": "search", "result": "error: timeout"})
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("tool_result", lines)
+        self.assertIn("timeout", lines)
+        self.assertNotIn("events:", lines)
+
     def test_watch_cli_passes_filter_flags(self):
         with mock.patch("blackbox.__main__.watch_log") as patched:
             code = main(["watch", self.path, "--type", "tool_call",
@@ -343,7 +449,18 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(code, 0)
         patched.assert_called_once_with(
             self.path, from_start=False, poll_interval=0.2,
-            types=["tool_call", "tool_result"], errors_only=True)
+            types=["tool_call", "tool_result"], errors_only=True,
+            model=None, tool=None)
+
+    def test_watch_cli_passes_model_and_tool_flags(self):
+        with mock.patch("blackbox.__main__.watch_log") as patched:
+            code = main(["watch", self.path, "--model", "gpt-5",
+                         "--tool", "search"])
+        self.assertEqual(code, 0)
+        patched.assert_called_once_with(
+            self.path, from_start=False, poll_interval=0.2,
+            types=None, errors_only=False,
+            model="gpt-5", tool="search")
 
     def test_watch_cli_ctrl_c_returns_zero(self):
         with mock.patch("blackbox.__main__.watch_log",

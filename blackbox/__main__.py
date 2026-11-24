@@ -257,6 +257,15 @@ def main(argv=None):
     p_watch.add_argument("--errors-only", action="store_true",
                          help="keep only steps that look like errors "
                          "(the same rule as query --errors-only)")
+    p_watch.add_argument("--model",
+                         help="keep only model_call steps for one "
+                         "model, e.g. gpt-5 (case-insensitive; the "
+                         "same rule as query --model)")
+    p_watch.add_argument("--tool",
+                         help="keep only tool_call / tool_result "
+                         "steps for one tool, e.g. search "
+                         "(case-insensitive; the same rule as "
+                         "query --tool)")
 
     p_otel = sub.add_parser("otel", help="export a log as OTLP/JSON spans")
     p_otel.add_argument("logfile")
@@ -526,7 +535,8 @@ def main(argv=None):
         try:
             watch_log(args.logfile, from_start=args.from_start,
                       poll_interval=args.poll_interval,
-                      types=args.types, errors_only=args.errors_only)
+                      types=args.types, errors_only=args.errors_only,
+                      model=args.model, tool=args.tool)
         except KeyboardInterrupt:
             # Ctrl-C stops the tail cleanly, exit code 0.
             return 0

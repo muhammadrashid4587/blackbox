@@ -495,7 +495,12 @@ mid-line), so the log is re-read and the missed steps still land.
 signal. `--type` (repeatable) keeps only steps of that type and
 `--errors-only` only steps that look like errors — the same error
 rule as `blackbox query`, so the two commands always agree — and
-the summary is kept only when `--type summary` is given. Filters
+`--model` keeps only model_call steps for one model and `--tool`
+keeps only tool_call / tool_result steps for one tool, both
+matched case-insensitively on the payload, the same rules as
+`blackbox query`, so a live tail can be narrowed to one model or
+one tool. The summary is kept only when `--type summary` is given,
+and never under `--errors-only`, `--model` or `--tool`. Filters
 combine with AND, a filtered step is still marked seen (so a
 re-read after a shrink does not re-check it), and `max_records`
 counts printed steps, not skipped ones.
@@ -512,7 +517,7 @@ counts printed steps, not skipped ones.
 
 ## Measured
 
-- 414 tests, all passing (`make test`).
+- 420 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -818,8 +823,19 @@ counts printed steps, not skipped ones.
   does not re-check it, and `max_records` counts printed steps,
   not skipped ones. Works on `.jsonl` logs and `.db` stores, done
   (v0.41.0).
-  Next: `--model` / `--tool` filters for watch, so a live tail can
-  be narrowed to one model or one tool like `blackbox query` can.
+- Watch model/tool filters: `blackbox watch --model gpt-5` keeps
+  only model_call steps for that model, and `blackbox watch
+  --tool search` keeps only tool_call / tool_result steps for
+  that tool — both matched case-insensitively on the payload, the
+  same rules as `blackbox query`, so the two commands always
+  agree. The summary is kept only when `--type summary` is given,
+  and never under `--model` or `--tool`; filters combine with AND,
+  a filtered step is still marked seen, and `max_records` counts
+  printed steps, not skipped ones. Works on `.jsonl` logs and
+  `.db` stores, done (v0.42.0).
+  Next: `--min-tokens` / `--min-cost` filters for watch, so a live
+  tail can be narrowed to heavy or expensive steps like
+  `blackbox query` can.
 
 ## Layout
 
@@ -900,5 +916,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            409 tests, all passing
+tests/            420 tests, all passing
 ```

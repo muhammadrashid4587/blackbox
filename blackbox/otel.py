@@ -311,6 +311,43 @@ def session_span(records, seq):
     return span
 
 
+def _iso_from_nanos(nanos):
+    """Unix nanoseconds back to a blackbox ISO timestamp (trailing Z)."""
+    seconds, ns = divmod(int(nanos), 1_000_000_000)
+    dt = (datetime.fromtimestamp(seconds, timezone.utc)
+          + timedelta(microseconds=ns // 1000))
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+def format_span(span):
+    """One OTLP span dict as readable lines: name and span id, trace
+    and parent ids, start/end times and duration, then one
+    `key: value` line per attribute. The human-readable form of the
+    `blackbox span` CLI command; `--json` prints the dict instead.
+    """
+    lines = ["%s (span %s)" % (span["name"], span["spanId"])]
+    lines.append("  trace: %s" % span["traceId"])
+    if "parentSpanId" in span:
+        lines.append("  parent: %s" % span["parentSpanId"])
+    start = int(span["startTimeUnixNano"])
+    end = int(span["endTimeUnixNano"])
+    lines.append("  start: %s" % _iso_from_nanos(start))
+    lines.append("  end: %s" % _iso_from_nanos(end))
+    lines.append("  duration: %.3f s" % ((end - start) / 1e9))
+    for attr in span.get("attributes", []):
+        value = attr["value"]
+        if "intValue" in value:
+            rendered = value["intValue"]
+        elif "doubleValue" in value:
+            rendered = repr(value["doubleValue"])
+        elif "boolValue" in value:
+            rendered = "true" if value["boolValue"] else "false"
+        else:
+            rendered = value.get("stringValue", "")
+        lines.append("  %s: %s" % (attr["key"], rendered))
+    return "\n".join(lines) + "\n"
+
+
 def _sum_metric(name, points, unit=None, monotonic=True):
     """One OTLP Sum metric from (attributes, value) points.
 

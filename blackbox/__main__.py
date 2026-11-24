@@ -4,6 +4,7 @@
     python -m blackbox replay data/demo.jsonl
     python -m blackbox diff data/run-a.jsonl data/run-b.jsonl
     python -m blackbox mcp data/run.jsonl   # MCP server on stdio
+    python -m blackbox span data/run.jsonl 0  # one step as an OTLP span
     python -m blackbox otel data/run.jsonl --out spans.json
     python -m blackbox metrics data/run.jsonl --out metrics.json
     python -m blackbox tail-sample data/run.jsonl --out spans.json
@@ -26,9 +27,9 @@ from .aggregates import aggregates_log, cost_totals_log
 from .compact import compact_log
 from .live_export import DEFAULT_OTLP_ENDPOINT, OtlpHttpExporter
 from .mcp_server import serve_stdio
-from .otel import export_otlp, export_otlp_metrics
+from .otel import export_otlp, export_otlp_metrics, format_span, session_span
 from .query import query_log
-from .replay import diff, replay
+from .replay import diff, load_records, replay
 from .tail_sampling import (DEFAULT_MAX_COST_USD, DEFAULT_SLOW_MS,
                             export_tail_sampled_otlp)
 from .trace import trace_log
@@ -55,6 +56,16 @@ def main(argv=None):
     p_mcp.add_argument("logfile")
     p_mcp.add_argument("--task")
     p_mcp.add_argument("--model")
+
+    p_span = sub.add_parser(
+        "span", help="print one step as an OTLP span: the same span "
+        "the blackbox://session/span/{seq} MCP resource template "
+        "serves, so the span is readable without an MCP client")
+    p_span.add_argument("logfile")
+    p_span.add_argument("seq", type=int, help="step number to print")
+    p_span.add_argument("--json", action="store_true", dest="as_json",
+                        help="print the span as JSON instead of a "
+                        "report")
 
     p_otel = sub.add_parser("otel", help="export a log as OTLP/JSON spans")
     p_otel.add_argument("logfile")
@@ -194,6 +205,27 @@ def main(argv=None):
         return 0
     if args.command == "mcp":
         serve_stdio(args.logfile, task=args.task, model=args.model)
+        return 0
+    if args.command == "span":
+        try:
+            records = load_records(args.logfile)
+        except FileNotFoundError:
+            print("span: file not found: %s" % args.logfile,
+                  file=sys.stderr)
+            return 1
+        try:
+            span = session_span(records, args.seq)
+        except ValueError as exc:
+            print("span: %s" % exc, file=sys.stderr)
+            return 2
+        if span is None:
+            print("span: no step %d in %s" % (args.seq, args.logfile),
+                  file=sys.stderr)
+            return 2
+        if args.as_json:
+            sys.stdout.write(json.dumps(span, indent=2) + "\n")
+        else:
+            sys.stdout.write(format_span(span))
         return 0
     if args.command == "otel":
         data = export_otlp(args.logfile, args.service_name,

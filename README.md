@@ -644,9 +644,19 @@ read-only.
   step with no usable timestamp is an error instead of a span
   with invented times. The summary record is not a step, so it
   has no span, done (v0.35.0).
-  Next: a `blackbox span` CLI command that prints one step's
-  OTLP span, the same span the template serves, so the span is
-  readable without an MCP client.
+- `blackbox span` CLI command: prints one step as an OTLP span —
+  the same span the `blackbox://session/span/{seq}` template
+  serves (`session_span` from `otel.py`, so the command, the
+  template and the full `blackbox otel` export always agree) —
+  as a readable report (name, span/trace/parent ids, start/end
+  times, duration, one `key: value` line per attribute) or as
+  JSON with `--json`, so the span is readable without an MCP
+  client; an unknown step, the summary record, or a step with
+  no usable timestamp is an error, done (v0.36.0).
+  Next: a `blackbox record` CLI command that appends one step
+  to a log from the shell — type, payload JSON and token counts
+  as flags — so a step can be recorded without the MCP server
+  or a Python script.
 
 ## Layout
 
@@ -700,7 +710,9 @@ blackbox/
                   cost; per-tool calls); --causal parents from the
                   causal trace reconstruction; `session_span` renders
                   one step as a single span for the
-                  blackbox://session/span/{seq} template
+                  blackbox://session/span/{seq} template and the
+                  `blackbox span` CLI command (`format_span` prints
+                  it as a readable report)
   live_export.py  live OTLP export: POST spans to a collector over
                   HTTP with retry/backoff, background batching
                   thread, Recorder integration, `export --live` CLI
@@ -710,9 +722,9 @@ blackbox/
                   `session_diff` as JSON, per-model token usage)
   __main__.py     CLI: verify | replay | diff | mcp | otel | export
                   | metrics | tail-sample | query | trace | compact
-                  | aggregates | costs
+                  | aggregates | costs | span
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            337 tests, all passing
+tests/            349 tests, all passing
 ```

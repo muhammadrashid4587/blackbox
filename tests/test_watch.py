@@ -49,7 +49,7 @@ class WatchTest(unittest.TestCase):
 
     def _run_watch(self, path=None, from_start=False, stop_after=5.0,
                    max_records=None, types=None, errors_only=False,
-                   model=None, tool=None):
+                   model=None, tool=None, min_tokens=None, min_cost=None):
         """Start watch_log in a thread; returns (thread, result, out, err)."""
         out, err = io.StringIO(), io.StringIO()
         result = {}
@@ -60,7 +60,8 @@ class WatchTest(unittest.TestCase):
                 poll_interval=0.05, output=out, error_output=err,
                 stop_after=stop_after, max_records=max_records,
                 types=types, errors_only=errors_only,
-                model=model, tool=tool)
+                model=model, tool=tool, min_tokens=min_tokens,
+                min_cost=min_cost)
 
         thread = threading.Thread(target=target)
         thread.start()
@@ -442,6 +443,101 @@ class WatchTest(unittest.TestCase):
         self.assertIn("timeout", lines)
         self.assertNotIn("events:", lines)
 
+    def test_watch_min_tokens_keeps_only_heavy_steps(self):
+        # Fixture: model_call [0] with 1540 tokens, tool_call [1]
+        # and tool_result [2] with none, summary [3]. --min-tokens
+        # 100 keeps only the model call; the summary is dropped,
+        # like in `blackbox query`.
+        thread, result, out, err = self._run_watch(
+            from_start=True, min_tokens=100, max_records=1)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[0]", lines)
+        self.assertIn("model_call", lines)
+        self.assertNotIn("[1]", lines)
+        self.assertNotIn("[2]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_min_tokens_zero_still_drops_summary(self):
+        # --min-tokens 0 matches every step (even one with no
+        # tokens), but the summary is a roll-up, not a step, so it
+        # is still dropped under a filter — the same rule as
+        # `blackbox query`.
+        thread, result, out, err = self._run_watch(
+            from_start=True, min_tokens=0, max_records=3)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 3)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[0]", lines)
+        self.assertIn("[1]", lines)
+        self.assertIn("[2]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_min_cost_keeps_only_expensive_calls(self):
+        # gpt-5 1200/340 costs $0.0049, gpt-5-nano 10/2 costs
+        # $0.000001, and a plain int token count has no cost at
+        # all — so --min-cost 0.004 keeps only the gpt-5 call,
+        # the same rule as `blackbox query`.
+        path = os.path.join(self.tmp.name, "costs.jsonl")
+        with Recorder(path, task="t", model="gpt-5") as rec:
+            rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                       tokens={"input": 1200, "output": 340})
+            rec.record("model_call",
+                       {"model": "gpt-5-nano", "prompt": "hi"},
+                       tokens={"input": 10, "output": 2})
+            rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                       tokens=5000)
+        thread, result, out, err = self._run_watch(
+            path=path, from_start=True, min_cost=0.004, stop_after=0.8)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[0]", lines)
+        self.assertIn("gpt-5", lines)
+        self.assertNotIn("gpt-5-nano", lines)
+        self.assertNotIn("[1]", lines)
+        self.assertNotIn("[2]", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_min_cost_sqlite_backend(self):
+        path = os.path.join(self.tmp.name, "costs.db")
+        with Recorder(path, task="t", model="gpt-5") as rec:
+            rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                       tokens={"input": 1200, "output": 340})
+            rec.record("model_call",
+                       {"model": "gpt-5-nano", "prompt": "hi"},
+                       tokens={"input": 10, "output": 2})
+        thread, result, out, err = self._run_watch(
+            path=path, from_start=True, min_cost=0.004, stop_after=0.8)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue()
+        self.assertIn("[0]", lines)
+        self.assertNotIn("gpt-5-nano", lines)
+        self.assertNotIn("events:", lines)
+
+    def test_watch_min_tokens_and_type_combine_with_and(self):
+        # --min-tokens 100 with --type tool_call matches nothing:
+        # the heavy step is a model_call, and the tool steps carry
+        # no tokens. Nothing prints and the watch still stops.
+        thread, result, out, err = self._run_watch(
+            from_start=True, min_tokens=100, types=["tool_call"],
+            stop_after=0.8)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["count"], 0)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue(), "")
+
     def test_watch_cli_passes_filter_flags(self):
         with mock.patch("blackbox.__main__.watch_log") as patched:
             code = main(["watch", self.path, "--type", "tool_call",
@@ -450,7 +546,7 @@ class WatchTest(unittest.TestCase):
         patched.assert_called_once_with(
             self.path, from_start=False, poll_interval=0.2,
             types=["tool_call", "tool_result"], errors_only=True,
-            model=None, tool=None)
+            model=None, tool=None, min_tokens=None, min_cost=None)
 
     def test_watch_cli_passes_model_and_tool_flags(self):
         with mock.patch("blackbox.__main__.watch_log") as patched:
@@ -460,7 +556,18 @@ class WatchTest(unittest.TestCase):
         patched.assert_called_once_with(
             self.path, from_start=False, poll_interval=0.2,
             types=None, errors_only=False,
-            model="gpt-5", tool="search")
+            model="gpt-5", tool="search", min_tokens=None,
+            min_cost=None)
+
+    def test_watch_cli_passes_min_tokens_and_min_cost_flags(self):
+        with mock.patch("blackbox.__main__.watch_log") as patched:
+            code = main(["watch", self.path, "--min-tokens", "100",
+                         "--min-cost", "0.01"])
+        self.assertEqual(code, 0)
+        patched.assert_called_once_with(
+            self.path, from_start=False, poll_interval=0.2,
+            types=None, errors_only=False,
+            model=None, tool=None, min_tokens=100, min_cost=0.01)
 
     def test_watch_cli_ctrl_c_returns_zero(self):
         with mock.patch("blackbox.__main__.watch_log",

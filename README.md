@@ -499,8 +499,14 @@ rule as `blackbox query`, so the two commands always agree — and
 keeps only tool_call / tool_result steps for one tool, both
 matched case-insensitively on the payload, the same rules as
 `blackbox query`, so a live tail can be narrowed to one model or
-one tool. The summary is kept only when `--type summary` is given,
-and never under `--errors-only`, `--model` or `--tool`. Filters
+one tool. `--min-tokens` keeps only steps with at least that many
+tokens and `--min-cost` only model_call steps costing at least
+that many USD, by the query's cost rule — a call with a plain int
+token count or an unknown model has no cost and never matches
+--min-cost — so a live tail can be narrowed to heavy or expensive
+steps like `blackbox query` can. The summary is kept only when
+`--type summary` is given, and never under `--errors-only`,
+`--model`, `--tool`, `--min-tokens` or `--min-cost`. Filters
 combine with AND, a filtered step is still marked seen (so a
 re-read after a shrink does not re-check it), and `max_records`
 counts printed steps, not skipped ones.
@@ -517,7 +523,7 @@ counts printed steps, not skipped ones.
 
 ## Measured
 
-- 420 tests, all passing (`make test`).
+- 426 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -836,6 +842,20 @@ counts printed steps, not skipped ones.
   Next: `--min-tokens` / `--min-cost` filters for watch, so a live
   tail can be narrowed to heavy or expensive steps like
   `blackbox query` can.
+- Watch token/cost filters: `blackbox watch --min-tokens 1000`
+  keeps only steps with at least that many tokens, and
+  `blackbox watch --min-cost 0.01` only model_call steps costing
+  at least that many USD — by the query's cost rule, so a call
+  with a plain int token count or an unknown model has no cost and
+  never matches. The summary is kept only when `--type summary` is
+  given, and never under `--min-tokens` or `--min-cost`, the same
+  rule as `blackbox query`; filters combine with AND, a filtered
+  step is still marked seen, and `max_records` counts printed
+  steps, not skipped ones. Works on `.jsonl` logs and `.db` stores,
+  done (v0.43.0).
+  Next: `--since` / `--until` time-range filters for watch, so a
+  live tail can be narrowed to a time window like `blackbox query`
+  can.
 
 ## Layout
 
@@ -910,9 +930,10 @@ blackbox/
                   skipped by record hash, a line that fails to
                   parse is treated as a possible desync and
                   re-read, and a genuinely malformed line is
-                  reported and skipped; --type / --errors-only
-                  filters (the query's error rule) narrow the tail,
-                  and Ctrl-C stops cleanly
+                  reported and skipped; --type / --errors-only /
+                  --model / --tool / --min-tokens / --min-cost
+                  filters (the query's match and cost rules) narrow
+                  the tail, and Ctrl-C stops cleanly
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model

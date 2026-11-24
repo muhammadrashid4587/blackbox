@@ -12,11 +12,14 @@ type (repeatable), --errors-only only steps that look like errors —
 the same error rule as `blackbox query` — --model keeps only
 model_call steps for one model and --tool keeps only tool_call /
 tool_result steps for one tool, both the same match rules as
-`blackbox query`, so a busy run can be followed for just the steps
-you care about. The summary record is printed by default, but under
-a filter it follows the same rule as `blackbox query`: it is kept
-only when --type summary is given explicitly, and never under
---errors-only, --model or --tool.
+`blackbox query`, and --min-tokens / --min-cost keep only steps with
+at least that many tokens or at least that many USD of cost — the
+same cost rule as `blackbox query`, so a call with a plain int token
+count or an unknown model has no cost and never matches --min-cost.
+The summary record is printed by default, but under a filter it
+follows the same rule as `blackbox query`: it is kept only when
+--type summary is given explicitly, and never under --errors-only,
+--model, --tool, --min-tokens or --min-cost.
 
 Both backends work: a .jsonl log is tailed by byte offset, a .db
 store by polling for rows past the last printed seq. A log that
@@ -47,7 +50,8 @@ import sys
 import time
 from urllib.parse import quote
 
-from .query import _is_error
+from .query import _is_error, _record_cost
+from .recorder import _tokens_total
 from .replay import format_record
 from .sqlite_store import _row_to_record, is_sqlite_path
 
@@ -83,7 +87,8 @@ def _is_record(record):
     return True
 
 
-def _matches_filter(record, types, errors_only, model=None, tool=None):
+def _matches_filter(record, types, errors_only, model=None, tool=None,
+                    min_tokens=None, min_cost=None):
     """Whether a record passes the watch filters: --type keeps only
     steps of a listed type (the summary is kept only when "summary"
     is listed, the same rule as `blackbox query`), --errors-only
@@ -91,12 +96,22 @@ def _matches_filter(record, types, errors_only, model=None, tool=None):
     --model keeps only model_call steps for one model and --tool
     keeps only tool_call / tool_result steps for one tool — both
     matched case-insensitively on the payload, the same rules as
-    `blackbox query`, so the two commands always agree. The summary
-    is never a model_call or a tool_call, so it is dropped under
-    --model or --tool. Filters combine with AND, like
+    `blackbox query` — --min-tokens keeps only records with at least
+    that many tokens and --min-cost only model_call records costing
+    at least that many USD, by the query's cost rule: a call with a
+    plain int token count or an unknown model has no cost and never
+    matches. The summary is a roll-up, not a step, so under any
+    filter it is kept only when --type summary is given — the same
+    rule as `blackbox query` — and with no filter at all it is
+    printed, like an unfiltered watch. Filters combine with AND, like
     `blackbox query`."""
     if types is not None and record["type"] not in types:
         return False
+    if record["type"] == "summary" and not (types and "summary" in types):
+        if (types is not None or errors_only or model is not None
+                or tool is not None or min_tokens is not None
+                or min_cost is not None):
+            return False
     payload = record.get("payload") or {}
     if model is not None:
         if record["type"] != "model_call":
@@ -107,6 +122,12 @@ def _matches_filter(record, types, errors_only, model=None, tool=None):
         if record["type"] not in ("tool_call", "tool_result"):
             return False
         if str(payload.get("tool", "")).lower() != tool.lower():
+            return False
+    if min_tokens is not None and _tokens_total(record.get("tokens")) < min_tokens:
+        return False
+    if min_cost is not None:
+        cost = _record_cost(record)
+        if cost is None or cost < min_cost:
             return False
     if errors_only and not _is_error(record):
         return False
@@ -175,7 +196,7 @@ class _JsonlTail:
         return hashes
 
     def poll(self, printed, out, err, types=None, errors_only=False,
-             model=None, tool=None):
+             model=None, tool=None, min_tokens=None, min_cost=None):
         """One check for new steps. Returns how many were printed."""
         try:
             st = os.stat(self.path)
@@ -209,15 +230,20 @@ class _JsonlTail:
                                           reread_on_bad=True,
                                           types=types,
                                           errors_only=errors_only,
-                                          model=model, tool=tool)
+                                          model=model, tool=tool,
+                                          min_tokens=min_tokens,
+                                          min_cost=min_cost)
         if needs_reread:
             count += self._reread(printed, out, err, types=types,
                                   errors_only=errors_only,
-                                  model=model, tool=tool)
+                                  model=model, tool=tool,
+                                  min_tokens=min_tokens,
+                                  min_cost=min_cost)
         return count
 
     def _drain(self, printed, out, err, reread_on_bad,
-               types=None, errors_only=False, model=None, tool=None):
+               types=None, errors_only=False, model=None, tool=None,
+               min_tokens=None, min_cost=None):
         """Print every complete line in the buffer.
 
         Returns (count, needs_reread): needs_reread when a line
@@ -252,7 +278,9 @@ class _JsonlTail:
                 continue
             printed.add(identity)
             if not _matches_filter(record, types, errors_only,
-                                   model=model, tool=tool):
+                                   model=model, tool=tool,
+                                   min_tokens=min_tokens,
+                                   min_cost=min_cost):
                 continue
             _print_record(record, out)
             count += 1
@@ -271,7 +299,7 @@ class _JsonlTail:
         err.flush()
 
     def _reread(self, printed, out, err, types=None, errors_only=False,
-                model=None, tool=None):
+                model=None, tool=None, min_tokens=None, min_cost=None):
         """Re-read the whole log from the start: the offset went
         stale. Records already printed are skipped by hash, so the
         missed steps land and nothing is printed twice; a malformed
@@ -287,7 +315,8 @@ class _JsonlTail:
         # waits for its newline instead of being reported.
         count, _ = self._drain(printed, out, err, reread_on_bad=False,
                                types=types, errors_only=errors_only,
-                               model=model, tool=tool)
+                               model=model, tool=tool,
+                               min_tokens=min_tokens, min_cost=min_cost)
         return count
 
 
@@ -330,7 +359,7 @@ class _DbTail:
         return {row[1] for row in rows}, rows[-1][0]
 
     def poll(self, printed, out, err, types=None, errors_only=False,
-             model=None, tool=None):
+             model=None, tool=None, min_tokens=None, min_cost=None):
         """One check for new steps. Returns how many were printed.
 
         The last printed seq advances past every valid record,
@@ -407,7 +436,9 @@ class _DbTail:
             printed.add(identity)
             self.last_seq = max(self.last_seq, record["seq"])
             if not _matches_filter(record, types, errors_only,
-                                   model=model, tool=tool):
+                                   model=model, tool=tool,
+                                   min_tokens=min_tokens,
+                                   min_cost=min_cost):
                 continue
             _print_record(record, out)
             printed_now += 1
@@ -418,7 +449,7 @@ def watch_log(path, from_start=False,
               poll_interval=DEFAULT_POLL_INTERVAL,
               output=None, error_output=None, stop_after=None,
               max_records=None, types=None, errors_only=False,
-              model=None, tool=None):
+              model=None, tool=None, min_tokens=None, min_cost=None):
     """Follow a log, printing each new step's transcript line as it
     lands, in the same format `blackbox replay` prints.
 
@@ -435,10 +466,16 @@ def watch_log(path, from_start=False,
     by the query's rule; `model` keeps only model_call steps for
     one model and `tool` keeps only tool_call / tool_result steps
     for one tool, both matched case-insensitively on the payload,
-    the same rules as `blackbox query`. Filters combine with AND,
-    and a filtered step is still marked seen, so it is not
-    re-checked on a re-read. `max_records` counts printed steps,
-    not skipped ones.
+    the same rules as `blackbox query`; `min_tokens` keeps only
+    records with at least that many tokens and `min_cost` only
+    model_call records costing at least that many USD, by the
+    query's cost rule — a call with a plain int token count or an
+    unknown model has no cost and never matches. The summary is a
+    roll-up, not a step, so under any filter it is kept only when
+    --type summary is given, the same rule as `blackbox query`.
+    Filters combine with AND, and a filtered step is still marked
+    seen, so it is not re-checked on a re-read. `max_records`
+    counts printed steps, not skipped ones.
 
     `stop_after` (seconds) and `max_records` stop the loop and
     return: test hooks, and the only way to stop besides Ctrl-C.
@@ -486,7 +523,9 @@ def watch_log(path, from_start=False,
         while _time_left():
             count += tail.poll(printed, out, err, types=types,
                                errors_only=errors_only,
-                               model=model, tool=tool)
+                               model=model, tool=tool,
+                               min_tokens=min_tokens,
+                               min_cost=min_cost)
             if max_records is not None and count >= max_records:
                 return count
             if not _time_left():

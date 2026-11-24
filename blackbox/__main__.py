@@ -266,6 +266,13 @@ def main(argv=None):
                          "steps for one tool, e.g. search "
                          "(case-insensitive; the same rule as "
                          "query --tool)")
+    p_watch.add_argument("--min-tokens", type=int, default=None,
+                         help="keep records with at least this many "
+                         "tokens (the same rule as query --min-tokens)")
+    p_watch.add_argument("--min-cost", type=float, default=None,
+                         help="keep model_call records costing at least "
+                         "this many USD (unpriced calls never match; "
+                         "the same rule as query --min-cost)")
 
     p_otel = sub.add_parser("otel", help="export a log as OTLP/JSON spans")
     p_otel.add_argument("logfile")
@@ -536,7 +543,9 @@ def main(argv=None):
             watch_log(args.logfile, from_start=args.from_start,
                       poll_interval=args.poll_interval,
                       types=args.types, errors_only=args.errors_only,
-                      model=args.model, tool=args.tool)
+                      model=args.model, tool=args.tool,
+                      min_tokens=args.min_tokens,
+                      min_cost=args.min_cost)
         except KeyboardInterrupt:
             # Ctrl-C stops the tail cleanly, exit code 0.
             return 0

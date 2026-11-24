@@ -35,6 +35,9 @@ printf '%s\n' \
     '{"type": "tool_call", "payload": {"tool": "search"}}' \
     | python -m blackbox record data/run.jsonl --stdin
 
+# Or record a whole run from a file, same step JSON
+python -m blackbox record data/run.jsonl --file steps.jsonl
+
 # Check the log: OK, or the exact seq of the first broken record
 python -m blackbox verify data/demo.jsonl
 # OK: 9 records, hash chain intact
@@ -105,6 +108,15 @@ so a bad line, a reserved type (`summary` / `checkpoint`), bad
 tokens or a bad timestamp exits non-zero and leaves the log
 untouched; `--stdin` cannot be combined with `--type`, `--payload`,
 `--tokens` or `--ts`. It works on `.jsonl` logs and `.db` stores,
+and `--task` / `--model` still name the session.
+
+`--file steps.jsonl` reads the same step JSON as `--stdin` from a
+file instead of a pipe — one JSON object per line (blank lines
+skipped) or a single JSON array — for runs too big to pipe. The
+same all-or-nothing validation applies: a bad line, a reserved
+type, bad tokens or a bad timestamp exits non-zero and leaves the
+log untouched, and `--file` cannot be combined with `--stdin` or
+the single-step flags. A missing or unreadable file is an error,
 and `--task` / `--model` still name the session.
 
 SQLite backend: pass a `.db` path instead of `.jsonl` and records go
@@ -735,9 +747,21 @@ read-only.
   tokens or a bad timestamp exits non-zero and leaves the log
   untouched, and it works on `.jsonl` logs and `.db` stores,
   done (v0.38.0).
-  Next: record steps in bulk from a file — `blackbox record
-  --file steps.jsonl` reads the same step JSON as `--stdin`
-  from a file, for runs too big to pipe.
+- `blackbox record --file`: reads steps from a file — the same
+  step JSON as `--stdin` (one JSON object per line, blank lines
+  skipped, or a single JSON array of step objects, each carrying
+  its own type, payload, tokens and ts) — and appends them through
+  the same Recorder path (redacted, hash-chained, fsynced, one
+  fresh summary for the whole batch), for runs too big to pipe;
+  every step is validated before the log is opened, so a bad line,
+  a reserved type, bad tokens or a bad timestamp exits non-zero
+  and leaves the log untouched; `--file` cannot be combined with
+  `--stdin` or the single-step flags, and a missing or unreadable
+  file is an error; it works on `.jsonl` logs and `.db` stores,
+  done (v0.39.0).
+  Next: `blackbox watch` — tail a live log and print new steps as
+  they land, so a running agent's flight recorder can be followed
+  in real time.
 
 ## Layout
 

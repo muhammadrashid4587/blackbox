@@ -8,6 +8,7 @@
         --payload '{"tool": "search", "args": {"query": "mcp"}}'
     printf '%s\n' '{"type": "tool_call", "payload": {"tool": "search"}}' \
         | python -m blackbox record data/run.jsonl --stdin
+    python -m blackbox record data/run.jsonl --file steps.jsonl
     python -m blackbox span data/run.jsonl 0  # one step as an OTLP span
     python -m blackbox otel data/run.jsonl --out spans.json
     python -m blackbox metrics data/run.jsonl --out metrics.json
@@ -90,27 +91,35 @@ def _record_task_model(args):
     return task, model
 
 
-def _parse_stdin_steps(text):
-    """Parse piped steps for `blackbox record --stdin`: one JSON
-    object per line, or a single JSON array of step objects. Each
-    step is {"type": ..., "payload": {...}, "tokens": ..., "ts": ...};
-    payload, tokens and ts are optional. Raises ValueError with a
-    plain message on anything else — a bad step is never guessed at,
-    and the caller validates every step before opening the log, so
-    a bad batch leaves the log untouched.
+def _parse_bulk_steps(text, source):
+    """Parse bulk steps for `blackbox record --stdin` / `--file`:
+    one JSON object per line, or a single JSON array of step
+    objects. Each step is {"type": ..., "payload": {...}, "tokens":
+    ..., "ts": ...}; payload, tokens and ts are optional. `source`
+    is "--stdin" or "--file" and names the input in error messages.
+    Raises ValueError with a plain message on anything else — a bad
+    step is never guessed at, and the caller validates every step
+    before opening the log, so a bad batch leaves the log untouched.
     """
     stripped = text.strip()
     if not stripped:
-        raise ValueError("--stdin: no steps on stdin")
+        raise ValueError("%s: no steps %s"
+                         % (source, "in the file"
+                            if source == "--file" else "on stdin"))
     if stripped.startswith("["):
         try:
             parsed = json.loads(stripped)
         except json.JSONDecodeError:
-            raise ValueError("--stdin: stdin must be JSON steps, one "
-                             "per line or a JSON array") from None
+            raise ValueError("%s: %s must be JSON steps, one "
+                             "per line or a JSON array"
+                             % (source, "file"
+                                if source == "--file" else "stdin")) \
+                from None
         if not isinstance(parsed, list):
-            raise ValueError("--stdin: stdin must be JSON steps, one "
-                             "per line or a JSON array")
+            raise ValueError("%s: %s must be JSON steps, one "
+                             "per line or a JSON array"
+                             % (source, "file"
+                                if source == "--file" else "stdin"))
     else:
         parsed = []
         for lineno, line in enumerate(text.splitlines(), 1):
@@ -119,13 +128,15 @@ def _parse_stdin_steps(text):
             try:
                 parsed.append(json.loads(line))
             except json.JSONDecodeError:
-                raise ValueError("--stdin line %d: not a JSON object"
-                                 % lineno) from None
+                raise ValueError("%s line %d: not a JSON object"
+                                 % (source, lineno)) from None
     if not parsed:
-        raise ValueError("--stdin: no steps on stdin")
+        raise ValueError("%s: no steps %s"
+                         % (source, "in the file"
+                            if source == "--file" else "on stdin"))
     steps = []
     for index, step in enumerate(parsed):
-        where = "--stdin step %d" % (index + 1)
+        where = "%s step %d" % (source, index + 1)
         if not isinstance(step, dict):
             raise ValueError("%s: must be a JSON object" % where)
         event_type = step.get("type")
@@ -182,7 +193,8 @@ def main(argv=None):
     p_record.add_argument("logfile")
     p_record.add_argument("--type",
                           help="step type, e.g. model_call, tool_call, "
-                          "tool_result (required unless --stdin is given)")
+                          "tool_result (required unless --stdin or "
+                          "--file is given)")
     p_record.add_argument("--payload", default=None,
                           help="step payload as a JSON object "
                           "(default: {})")
@@ -193,6 +205,11 @@ def main(argv=None):
                           "its own type, payload, tokens and ts, so a "
                           "shell pipeline can log a whole run without "
                           "one process per step")
+    p_record.add_argument("--file", default=None, metavar="PATH",
+                          help="read steps from this file instead of "
+                          "the flags: the same step JSON as --stdin — "
+                          "one JSON object per line, or a JSON array "
+                          "of step objects — for runs too big to pipe")
     p_record.add_argument("--tokens",
                           help="token count as a JSON int, or an "
                           "input/output split as a JSON object, e.g. "
@@ -358,7 +375,31 @@ def main(argv=None):
         serve_stdio(args.logfile, task=args.task, model=args.model)
         return 0
     if args.command == "record":
-        if args.stdin:
+        steps = None
+        if args.file is not None:
+            # --file carries its own type/payload/tokens/ts per step,
+            # so it must not be mixed with --stdin or the
+            # single-step flags.
+            if (args.stdin or args.type is not None
+                    or args.payload is not None or args.tokens is not None
+                    or args.ts is not None):
+                print("record: --file cannot be combined with --stdin, "
+                      "--type, --payload, --tokens or --ts — each step "
+                      "carries its own", file=sys.stderr)
+                return 2
+            try:
+                with open(args.file, encoding="utf-8") as f:
+                    text = f.read()
+            except OSError as exc:
+                print("record: cannot read --file %s: %s"
+                      % (args.file, exc.strerror or exc), file=sys.stderr)
+                return 2
+            try:
+                steps = _parse_bulk_steps(text, "--file")
+            except ValueError as exc:
+                print("record: %s" % exc, file=sys.stderr)
+                return 2
+        elif args.stdin:
             # --stdin carries its own type/payload/tokens/ts per step,
             # so the single-step flags must not be mixed in.
             if (args.type is not None or args.payload is not None
@@ -368,10 +409,11 @@ def main(argv=None):
                       "its own", file=sys.stderr)
                 return 2
             try:
-                steps = _parse_stdin_steps(sys.stdin.read())
+                steps = _parse_bulk_steps(sys.stdin.read(), "--stdin")
             except ValueError as exc:
                 print("record: %s" % exc, file=sys.stderr)
                 return 2
+        if steps is not None:
             task, model = _record_task_model(args)
             try:
                 with Recorder(args.logfile, task=task,
@@ -394,7 +436,8 @@ def main(argv=None):
                       % (len(seqs), seqs[0], seqs[-1]))
             return 0
         if args.type is None:
-            parser.error("--type is required unless --stdin is given")
+            parser.error("--type is required unless --stdin or --file "
+                         "is given")
         # Validate everything before opening the log: opening a
         # Recorder resumes it, which drops a trailing summary, so a
         # failed record must not get that far.

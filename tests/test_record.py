@@ -440,6 +440,190 @@ class RecordStdinTest(unittest.TestCase):
             self.assertIn("--stdin", err)
 
 
+class RecordFileTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "run.jsonl")
+        with Recorder(self.path, task="t", model="gpt-5") as rec:
+            rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                       tokens={"input": 1200, "output": 340})
+            rec.record("tool_call", {"tool": "search",
+                                     "args": {"query": "mcp"}})
+            rec.record("tool_result", {"tool": "search",
+                                       "result": "3 results"})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_steps(self, text, name="steps.jsonl"):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+
+    def _run(self, steps_path, log_path=None, extra=()):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["record", log_path or self.path,
+                         "--file", steps_path] + list(extra))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_file_jsonl_appends_steps_and_keeps_chain(self):
+        steps = self._write_steps(
+            '{"type": "tool_call", "payload": {"tool": "fetch", '
+            '"args": {"url": "https://example.com"}}}\n'
+            '\n'
+            '{"type": "tool_result", "payload": {"tool": "fetch", '
+            '"result": "ok"}}\n'
+            '{"type": "model_call", "payload": {"model": "gpt-5", '
+            '"prompt": "next"}, "tokens": {"input": 100, '
+            '"output": 20}, "ts": "2026-11-24T02:00:00Z"}\n')
+        code, out, err = self._run(steps)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(out, "recorded 3 steps (seqs 3-5)\n")
+        records = load_records(self.path)
+        self.assertEqual(len(records), 7)  # 6 steps + summary
+        self.assertEqual([r["seq"] for r in records[:6]],
+                         [0, 1, 2, 3, 4, 5])
+        for i in range(1, 6):
+            self.assertEqual(records[i]["prev_hash"],
+                             records[i - 1]["hash"])
+        self.assertEqual(records[3]["type"], "tool_call")
+        self.assertEqual(records[5]["ts"], "2026-11-24T02:00:00Z")
+        self.assertEqual(records[5]["tokens"],
+                         {"input": 100, "output": 20})
+        self.assertEqual(records[6]["type"], "summary")
+        self.assertEqual(records[6]["payload"]["events"], 6)
+        self.assertEqual(records[6]["payload"]["task"], "t")
+        self.assertTrue(verify(self.path)["ok"])
+
+    def test_file_json_array_form(self):
+        steps = self._write_steps(json.dumps([
+            {"type": "tool_call", "payload": {"tool": "search"}},
+            {"type": "tool_result",
+             "payload": {"tool": "search", "result": "ok"}},
+        ]))
+        path = os.path.join(self.tmp.name, "fresh.jsonl")
+        code, out, err = self._run(steps, log_path=path)
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "recorded 2 steps (seqs 0-1)\n")
+        records = load_records(path)
+        self.assertEqual(len(records), 3)  # 2 steps + summary
+        self.assertEqual(records[0]["type"], "tool_call")
+        self.assertEqual(records[1]["type"], "tool_result")
+        self.assertTrue(verify(path)["ok"])
+
+    def test_file_single_step_reports_like_record(self):
+        steps = self._write_steps(
+            '{"type": "tool_call", "payload": {"tool": "search"}}\n')
+        code, out, err = self._run(steps)
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "recorded step 3 (tool_call)\n")
+        self.assertTrue(verify(self.path)["ok"])
+
+    def test_file_redacts_secrets(self):
+        steps = self._write_steps(
+            '{"type": "tool_call", "payload": {"tool": "search", '
+            '"api_key": "sk-live-123"}}\n')
+        code, out, err = self._run(steps)
+        self.assertEqual(code, 0)
+        records = load_records(self.path)
+        self.assertEqual(records[3]["payload"]["api_key"], "[REDACTED]")
+        with open(self.path, encoding="utf-8") as f:
+            self.assertNotIn("sk-live-123", f.read())
+
+    def test_file_sqlite_backend(self):
+        steps = self._write_steps(
+            '{"type": "tool_call", "payload": {"tool": "search"}}\n'
+            '{"type": "tool_result", "payload": {"tool": "search", '
+            '"result": "ok"}}\n')
+        path = os.path.join(self.tmp.name, "run.db")
+        code, out, err = self._run(steps, log_path=path,
+                                   extra=["--task", "t",
+                                          "--model", "gpt-5"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "recorded 2 steps (seqs 0-1)\n")
+        self.assertTrue(verify(path)["ok"])
+        self.assertEqual(load_records(path)[-1]["payload"]["events"], 2)
+
+    def test_file_bad_line_leaves_log_untouched(self):
+        before = load_records(self.path)
+        steps = self._write_steps(
+            '{"type": "tool_call", "payload": {"tool": "search"}}\n'
+            '{not json\n')
+        code, out, err = self._run(steps)
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("file", err)
+        self.assertEqual(load_records(self.path), before)
+
+    def test_file_bad_step_leaves_log_untouched(self):
+        before = load_records(self.path)
+        bad_steps = [
+            # no type
+            '{"payload": {"tool": "search"}}',
+            # reserved type
+            '{"type": "summary", "payload": {}}',
+            # payload not an object
+            '{"type": "tool_call", "payload": ["search"]}',
+            # bad tokens
+            '{"type": "tool_call", "payload": {}, "tokens": -5}',
+            # bad ts (no timezone)
+            '{"type": "tool_call", "payload": {}, '
+            '"ts": "2026-11-24T01:00:00"}',
+            # not an object at all
+            '["tool_call"]',
+        ]
+        for bad in bad_steps:
+            steps = self._write_steps(bad + "\n")
+            code, out, err = self._run(steps)
+            self.assertEqual(code, 2, bad)
+            self.assertEqual(out, "", bad)
+            self.assertIn("file", err, bad)
+            self.assertEqual(load_records(self.path), before, bad)
+
+    def test_file_empty_is_an_error_and_creates_nothing(self):
+        path = os.path.join(self.tmp.name, "never.jsonl")
+        for text in ("", "  \n\n"):
+            steps = self._write_steps(text)
+            code, out, err = self._run(steps, log_path=path)
+            self.assertEqual(code, 2, repr(text))
+            self.assertEqual(out, "")
+            self.assertIn("file", err)
+            self.assertFalse(os.path.exists(path))
+
+    def test_file_missing_is_an_error_and_creates_nothing(self):
+        missing = os.path.join(self.tmp.name, "no-such-file.jsonl")
+        path = os.path.join(self.tmp.name, "never.jsonl")
+        code, out, err = self._run(missing, log_path=path)
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("no-such-file.jsonl", err)
+        self.assertFalse(os.path.exists(path))
+
+    def test_file_directory_is_an_error_and_leaves_log_untouched(self):
+        before = load_records(self.path)
+        code, out, err = self._run(self.tmp.name)
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("file", err)
+        self.assertEqual(load_records(self.path), before)
+
+    def test_file_cannot_combine_with_stdin_or_single_step_flags(self):
+        steps = self._write_steps(
+            '{"type": "tool_call", "payload": {}}\n')
+        for extra in (["--stdin"],
+                      ["--type", "tool_call"],
+                      ["--payload", '{"tool": "search"}'],
+                      ["--tokens", "120"],
+                      ["--ts", "2026-11-24T01:00:00Z"]):
+            code, out, err = self._run(steps, extra=extra)
+            self.assertEqual(code, 2, extra)
+            self.assertEqual(out, "")
+            self.assertIn("--file", err)
+
+
 class RecorderTsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

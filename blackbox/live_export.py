@@ -131,14 +131,19 @@ class OtlpHttpExporter:
         """POST spans built from records. True on a 2xx response."""
         return self.export_spans(records_to_spans(records))
 
-    def export_log(self, path, causal=False):
+    def export_log(self, path, causal=False, last=None, since=None,
+                   until=None, now=None):
         """POST a whole log's spans (summary excluded, as in otel.py).
 
         With causal=True, span parents come from the causal trace
-        reconstruction instead of the hash chain. Returns True only
-        when the collector answered 2xx.
+        reconstruction instead of the hash chain. last / since /
+        until narrow the export to a window, the same window as
+        `blackbox otel` — a bad bound, a reversed window, or --last
+        combined with --since / --until raises ValueError. Returns
+        True only when the collector answered 2xx.
         """
-        data = export_otlp(path, self.service_name, causal=causal)
+        data = export_otlp(path, self.service_name, causal=causal,
+                           last=last, since=since, until=until, now=now)
         spans = data["resourceSpans"][0]["scopeSpans"][0]["spans"]
         return self.post_payload(data, span_count=len(spans))
 

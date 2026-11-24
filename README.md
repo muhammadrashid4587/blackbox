@@ -380,6 +380,13 @@ the earlier call by FIFO order, and an orphaned result falls back
 to the previous step. Note the background `LiveExporter` (spans
 sent as they are recorded) still uses chain parents: a causal
 parent needs the full trace, which is only known after the run.
+With `--since` / `--until` (or `--last 10m`) the export narrows to
+a window — the same closed window as `blackbox query --since` /
+`--until`, so a bad bound, a reversed window, or `--last` combined
+with `--since` / `--until` is an error, exit code 2 — and the last
+kept step runs to the summary timestamp, as in the unwindowed
+export. The same flags work on `blackbox export`, file export and
+`--live`.
 
 **Live OTLP export.** `python -m blackbox export data/run.jsonl
 --live` POSTs the same spans to an OTLP/HTTP collector instead of
@@ -545,7 +552,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 484 tests, all passing (`make test`).
+- 497 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -988,10 +995,34 @@ and `max_records` counts printed steps, not skipped ones.
   model call's latency with a negative gap — and a step whose
   timestamp does not parse, or carries no timezone, now
   contributes no latency instead of crashing the export.
+- OTel span time-range filters: `blackbox otel --since
+  2026-11-22T10:01:00Z --until 2026-11-22T10:04:30Z` (and
+  `--last 10m`, and the same flags on `blackbox export`, file
+  export and `--live`) narrow the OTLP span export to an absolute
+  or relative window — the same closed window as `blackbox query
+  --since` / `--until`, through the shared `_window_records` from
+  `aggregates.py`, so a value that does not parse or carries no
+  timezone is an error, exit code 2, --since after --until is an
+  error, exit code 2, --last cannot be combined with --since or
+  --until, exit code 2, and a step whose timestamp does not parse,
+  or carries no timezone, never matches. The summary and
+  checkpoint records are kept untouched, and the last kept step
+  runs to the summary timestamp, as in the unwindowed export.
+  `export_otlp` / `export_otlp_file` in `otel.py` and
+  `export_log` in `live_export.py` take the same filters as a
+  Python API (a duration string or a timedelta for --last, with
+  `now` fixable for tests). Works on `.jsonl` logs and `.db`
+  stores, done (v0.50.0). Along the way, `records_to_spans`
+  stopped treating a checkpoint as a step — on a compacted log
+  its 09:00 timestamp used to end the last step's span with a
+  negative gap — takes the last step's end time from the last
+  summary record instead of assuming it is the last record, and
+  a step whose timestamp does not parse, or carries no timezone,
+  gets no span and contributes no latency instead of crashing
+  the export.
   Next: `--since` / `--until` time-range filters for `blackbox
-  otel` / `blackbox export`, so the OTLP span export can be
-  narrowed to an absolute window the same way the metrics export
-  can.
+  tail-sample`, so a sampled span export can be narrowed to a
+  window the same way the full export can.
 
 ## Layout
 

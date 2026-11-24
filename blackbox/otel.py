@@ -69,7 +69,14 @@ window as aggregates and costs, through the shared _window_records
 in aggregates.py, so the metrics can be narrowed to the recent past
 or an absolute window the same way the totals can; latency is
 measured between kept steps, and the last kept step runs to the
-summary timestamp, as in the unwindowed export.
+summary timestamp, as in the unwindowed export. export_otlp takes
+the same window, so the span export can be narrowed the same way:
+--since / --until keep only steps in the closed window
+[since, until], --last keeps only steps from the last that long,
+and a step whose timestamp does not parse, or carries no timezone,
+never matches. The summary and checkpoint records are kept
+untouched by the window, so a windowed export still ends the last
+kept step at the summary timestamp.
 """
 
 import json
@@ -198,7 +205,8 @@ def record_to_span(record, trace_id, end=None, parent_span_id=_CHAIN_PARENT,
 
 def records_to_spans(records, service_name=SERVICE_NAME, causal=False,
                      parents=None):
-    """A list of records as OTLP span dicts (summary excluded).
+    """A list of records as OTLP span dicts (summary and checkpoint
+    excluded).
 
     With causal=True, each span's parent comes from
     trace.link_parents — the same parent-child tree `blackbox trace`
@@ -218,23 +226,42 @@ def records_to_spans(records, service_name=SERVICE_NAME, causal=False,
     honest about the gap: the parentSpanId still names the real
     (absent) parent instead of silently dangling. A full log has
     no gaps, so a full export is unchanged.
+
+    A checkpoint is bookkeeping about records compacted away, not
+    a step, so it contributes no span and never ends a step's
+    latency; the last step runs to the last summary record's
+    timestamp, not assumed to be the last record. A step whose
+    timestamp does not parse, or carries no timezone, gets no span
+    — a span with no honest start time is not a span — and it
+    contributes no latency: the step before it ends 1 ms after it
+    starts instead of crashing the export.
     """
-    steps = [r for r in records if r["type"] != "summary"]
+    steps = [r for r in records
+             if r["type"] not in ("summary", "checkpoint")]
     if not steps:
         return []
+    summary_ts = None
+    for record in reversed(records):
+        if record["type"] == "summary":
+            summary_ts = _parse_record_ts(record.get("ts"))
+            break
     trace_id = steps[0]["hash"][:32]
     if causal and parents is None:
         parents = link_parents(records)
-    by_seq = {r["seq"]: r for r in steps} if causal else None
-    kept_ids = {r["hash"][:16] for r in steps}
+    by_seq = {r["seq"]: r for r in steps
+              if _parse_record_ts(r.get("ts")) is not None} \
+        if causal else None
+    kept_ids = {r["hash"][:16] for r in steps
+                if _parse_record_ts(r.get("ts")) is not None}
     spans = []
     for i, record in enumerate(steps):
+        start = _parse_record_ts(record.get("ts"))
+        if start is None:
+            continue
         if i + 1 < len(steps):
-            end = _parse_ts(steps[i + 1]["ts"])
-        elif records and records[-1]["type"] == "summary":
-            end = _parse_ts(records[-1]["ts"])
+            end = _parse_record_ts(steps[i + 1].get("ts"))
         else:
-            end = None
+            end = summary_ts
         if causal:
             parent_seq = parents.get(record["seq"])
             parent_span_id = (by_seq[parent_seq]["hash"][:16]
@@ -530,13 +557,31 @@ def export_otlp_metrics_file(path, out_path, service_name=SERVICE_NAME,
     return data
 
 
-def export_otlp(path, service_name=SERVICE_NAME, causal=False):
+def export_otlp(path, service_name=SERVICE_NAME, causal=False,
+                last=None, since=None, until=None, now=None):
     """A log file as an OTLP/JSON dict. Works on .jsonl and .db logs.
 
     With causal=True, span parents come from the causal trace
     reconstruction instead of the hash chain (see records_to_spans).
+    last is a relative window — a duration string like "10m" or a
+    timedelta — keeping only steps from the last that long, as a
+    lower bound of now minus the duration (now defaults to the
+    current UTC time, and is a parameter so tests can fix it); a
+    value that is not a duration raises ValueError. since / until
+    are ISO 8601 timestamps with a timezone, keeping only steps in
+    the closed window [since, until], the same window as `blackbox
+    query --since` / `--until`; a value that does not parse or
+    carries no timezone raises ValueError, as does --since after
+    --until, and --last cannot be combined with --since or --until.
+    The window is the shared `_window_records` from aggregates.py,
+    so the summary and checkpoint records are kept untouched and a
+    step whose timestamp does not parse, or carries no timezone,
+    never matches. The last kept step runs to the summary
+    timestamp, as in the unwindowed export.
     """
     records = load_records(path)
+    records = _window_records(records, last=last, since=since,
+                              until=until, now=now)
     return {
         "resourceSpans": [{
             "resource": {"attributes": [
@@ -552,9 +597,13 @@ def export_otlp(path, service_name=SERVICE_NAME, causal=False):
 
 
 def export_otlp_file(path, out_path, service_name=SERVICE_NAME,
-                     causal=False):
-    """Write a log's OTLP/JSON export to a file. Returns the dict."""
-    data = export_otlp(path, service_name, causal=causal)
+                     causal=False, last=None, since=None, until=None,
+                     now=None):
+    """Write a log's OTLP/JSON export to a file. Returns the dict.
+    last / since / until narrow the export to a window, the same
+    window as `export_otlp`."""
+    data = export_otlp(path, service_name, causal=causal, last=last,
+                       since=since, until=until, now=now)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")

@@ -296,6 +296,17 @@ def main(argv=None):
                         "(tool_result -> tool_call, tool_call -> "
                         "model_call) instead of the hash chain; "
                         "same tree as `blackbox trace`")
+    p_otel.add_argument("--last", help="keep steps from the last "
+                        "this long, e.g. 10m, 2h, 1d, 1h30m "
+                        "(the same relative window as query --last)")
+    p_otel.add_argument("--since", help="keep steps at or after "
+                        "this ISO timestamp (with a timezone, e.g. "
+                        "2026-11-24T01:00:00Z; the same window as "
+                        "query --since)")
+    p_otel.add_argument("--until", help="keep steps at or before "
+                        "this ISO timestamp (with a timezone, e.g. "
+                        "2026-11-24T01:00:00Z; the same window as "
+                        "query --until)")
 
     p_metrics = sub.add_parser(
         "metrics", help="export a log as OTLP/JSON metrics (per-model "
@@ -358,6 +369,17 @@ def main(argv=None):
                           help="collector URL (default: %(default)s)")
     p_export.add_argument("--max-retries", type=int, default=3)
     p_export.add_argument("--timeout", type=float, default=10.0)
+    p_export.add_argument("--last", help="keep steps from the last "
+                          "this long, e.g. 10m, 2h, 1d, 1h30m "
+                          "(the same relative window as query --last)")
+    p_export.add_argument("--since", help="keep steps at or after "
+                          "this ISO timestamp (with a timezone, e.g. "
+                          "2026-11-24T01:00:00Z; the same window as "
+                          "query --since)")
+    p_export.add_argument("--until", help="keep steps at or before "
+                          "this ISO timestamp (with a timezone, e.g. "
+                          "2026-11-24T01:00:00Z; the same window as "
+                          "query --until)")
 
     p_query = sub.add_parser(
         "query", help="print the steps of a log matching filters "
@@ -612,8 +634,16 @@ def main(argv=None):
             return 1
         return 0
     if args.command == "otel":
-        data = export_otlp(args.logfile, args.service_name,
-                           causal=args.causal)
+        try:
+            data = export_otlp(args.logfile, args.service_name,
+                               causal=args.causal, last=args.last,
+                               since=args.since, until=args.until)
+        except ValueError as exc:
+            # A bad --last value, a bad --since / --until value,
+            # --since after --until, or --last combined with --since /
+            # --until.
+            print("otel: %s" % exc, file=sys.stderr)
+            return 2
         text = json.dumps(data, indent=2) + "\n"
         if args.out:
             with open(args.out, "w", encoding="utf-8") as f:
@@ -670,21 +700,31 @@ def main(argv=None):
             sys.stdout.write(text)
         return 0
     if args.command == "export":
-        if args.live:
-            exporter = OtlpHttpExporter(
-                args.otlp_endpoint, timeout=args.timeout,
-                max_retries=args.max_retries,
-                service_name=args.service_name)
-            ok = exporter.export_log(args.logfile, causal=args.causal)
-            if ok:
-                print("exported %d spans to %s"
-                      % (exporter.exported_spans, args.otlp_endpoint))
-                return 0
-            print("export failed: %s" % exporter.last_error,
-                  file=sys.stderr)
-            return 1
-        data = export_otlp(args.logfile, args.service_name,
-                           causal=args.causal)
+        try:
+            if args.live:
+                exporter = OtlpHttpExporter(
+                    args.otlp_endpoint, timeout=args.timeout,
+                    max_retries=args.max_retries,
+                    service_name=args.service_name)
+                ok = exporter.export_log(args.logfile, causal=args.causal,
+                                         last=args.last, since=args.since,
+                                         until=args.until)
+                if ok:
+                    print("exported %d spans to %s"
+                          % (exporter.exported_spans, args.otlp_endpoint))
+                    return 0
+                print("export failed: %s" % exporter.last_error,
+                      file=sys.stderr)
+                return 1
+            data = export_otlp(args.logfile, args.service_name,
+                               causal=args.causal, last=args.last,
+                               since=args.since, until=args.until)
+        except ValueError as exc:
+            # A bad --last value, a bad --since / --until value,
+            # --since after --until, or --last combined with --since /
+            # --until.
+            print("export: %s" % exc, file=sys.stderr)
+            return 2
         text = json.dumps(data, indent=2) + "\n"
         if args.out:
             with open(args.out, "w", encoding="utf-8") as f:

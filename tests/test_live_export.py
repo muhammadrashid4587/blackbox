@@ -240,6 +240,32 @@ class ExportCliTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(self.state["requests"], 0)
 
+    def test_export_live_command_honours_window(self):
+        # --last 1d matches the step just recorded; a --since after
+        # it matches nothing, so the collector gets an empty span
+        # list; a bad bound exits 2 without posting.
+        rc = cli_main(["export", self.path, "--live", "--last", "1d",
+                       "--otlp-endpoint", self.endpoint,
+                       "--max-retries", "1"])
+        self.assertEqual(rc, 0)
+        body = json.loads(self.state["bodies"][0])
+        spans = body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        self.assertEqual(len(spans), 1)
+        rc = cli_main(["export", self.path, "--live",
+                       "--since", "2027-01-01T00:00:00Z",
+                       "--otlp-endpoint", self.endpoint,
+                       "--max-retries", "1"])
+        self.assertEqual(rc, 0)
+        body = json.loads(self.state["bodies"][1])
+        spans = body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        self.assertEqual(spans, [])
+        rc = cli_main(["export", self.path, "--live",
+                       "--since", "tomorrow",
+                       "--otlp-endpoint", self.endpoint,
+                       "--max-retries", "1"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.state["requests"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

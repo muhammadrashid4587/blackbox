@@ -7,7 +7,7 @@ append-only log you can verify and replay.
 Pure Python 3 standard library. No dependencies.
 """
 
-__version__ = "0.49.0"
+__version__ = "0.50.0"
 
 from .compact import compact_log
 from .costs import cost_for, price_for, register_pricing

@@ -433,6 +433,17 @@ def main(argv=None):
     p_trace.add_argument("--json", action="store_true", dest="as_json",
                          help="print the nested tree as JSON instead of "
                          "an indented tree")
+    p_trace.add_argument("--last", help="keep steps from the last "
+                         "this long, e.g. 10m, 2h, 1d, 1h30m "
+                         "(the same relative window as query --last)")
+    p_trace.add_argument("--since", help="keep steps at or after "
+                         "this ISO timestamp (with a timezone, e.g. "
+                         "2026-11-24T01:00:00Z; the same window as "
+                         "query --since)")
+    p_trace.add_argument("--until", help="keep steps at or before "
+                         "this ISO timestamp (with a timezone, e.g. "
+                         "2026-11-24T01:00:00Z; the same window as "
+                         "query --until)")
 
     p_aggregates = sub.add_parser(
         "aggregates", help="print per-session totals: steps, duration, "
@@ -762,7 +773,15 @@ def main(argv=None):
             return 2
         return 0
     if args.command == "trace":
-        trace_log(args.logfile, as_json=args.as_json)
+        try:
+            trace_log(args.logfile, as_json=args.as_json,
+                      last=args.last, since=args.since, until=args.until)
+        except ValueError as exc:
+            # A bad --last value, a bad --since / --until value,
+            # --since after --until, or --last combined with --since /
+            # --until.
+            print("trace: %s" % exc, file=sys.stderr)
+            return 2
         return 0
     if args.command == "aggregates":
         try:

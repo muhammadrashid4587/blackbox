@@ -31,8 +31,11 @@ with `seq`, `type`, a short `label` (model or tool name), and
 `children`. `session_trace` is the same trace as a JSON-able dict —
 step count, per-type counts, slowest and error steps, parent gaps,
 and the tree — for the `blackbox://session/trace` MCP resource.
-`trace_log` prints it, indented, or as JSON with `--json`. The
-summary record is not a step and is never a node.
+`trace_log` prints it, indented, or as JSON with `--json`, and
+`--since` / `--until` (or `--last`) narrow it to a window, the same
+window as `blackbox query`, applied before the links are rebuilt —
+a kept step whose parent fell outside the window becomes a root.
+The summary record is not a step and is never a node.
 Works on .jsonl logs and .db stores.
 """
 
@@ -227,10 +230,32 @@ def _print_node(node, depth, lines):
         _print_node(child, depth + 1, lines)
 
 
-def trace_log(path, as_json=False):
+def trace_log(path, as_json=False, last=None, since=None, until=None,
+              now=None):
     """Print a log's causal trace: indented tree, or JSON with
-    as_json. Works on .jsonl logs and .db stores."""
-    records = load_records(path)
+    as_json. Works on .jsonl logs and .db stores.
+
+    last is a relative window — a duration string like "10m" or a
+    timedelta — keeping only steps from the last that long, as a
+    lower bound of now minus the duration (now defaults to the
+    current UTC time, and is a parameter so tests can fix it); a
+    value that is not a duration raises ValueError. since / until
+    are ISO 8601 timestamps with a timezone, keeping only steps in
+    the closed window [since, until], the same window as `blackbox
+    query --since` / `--until`; a value that does not parse or
+    carries no timezone raises ValueError, as does --since after
+    --until, and --last cannot be combined with --since or --until.
+    The window is applied before the links are rebuilt, through the
+    shared `_window_records`, so a kept step whose parent fell
+    outside the window becomes a root instead of pointing at a
+    step that is not in the tree, and a step whose timestamp does
+    not parse, or carries no timezone, never matches.
+    """
+    # Deferred: aggregates imports link_parents from this module,
+    # so importing it at the top would be circular.
+    from .aggregates import _window_records
+    records = _window_records(load_records(path), last=last,
+                              since=since, until=until, now=now)
     roots = build_trace(records)
     if as_json:
         print(json.dumps(roots, indent=2))

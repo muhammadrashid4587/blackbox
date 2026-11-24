@@ -556,7 +556,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 497 tests, all passing (`make test`).
+- 515 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1056,6 +1056,25 @@ and `max_records` counts printed steps, not skipped ones.
   Next: `--since` / `--until` time-range filters for `blackbox
   trace`, so a causal trace can be narrowed to a window the same
   way the exports can.
+- Trace time-range filters: `blackbox trace --since
+  2026-11-22T10:01:00Z --until 2026-11-22T10:01:03Z` (and
+  `--last 10m`) narrow the causal trace to an absolute or
+  relative window — the same closed window as `blackbox query
+  --since` / `--until`, through the shared `_window_records` from
+  `aggregates.py`, so a value that does not parse or carries no
+  timezone is an error, exit code 2, --since after --until is an
+  error, exit code 2, --last cannot be combined with --since or
+  --until, exit code 2, and a step whose timestamp does not parse,
+  or carries no timezone, never matches. The window applies
+  before the links are rebuilt, so a kept step whose parent fell
+  outside the window becomes a root instead of pointing at a
+  step that is not in the tree. `trace_log` in `trace.py` takes
+  the same filters as a Python API (a duration string or a
+  timedelta for --last, with `now` fixable for tests). Works on
+  `.jsonl` logs and `.db` stores, done (v0.52.0).
+  Next: `--since` / `--until` time-range filters for `blackbox
+  replay`, so a transcript can be narrowed to a window the same
+  way the trace can.
 
 ## Layout
 
@@ -1139,5 +1158,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            420 tests, all passing
+tests/            515 tests, all passing
 ```

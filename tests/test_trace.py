@@ -206,5 +206,103 @@ class TraceLogTest(unittest.TestCase):
         self.assertEqual(buf.getvalue(), "[0] model_call gpt-5\n")
 
 
+def _write_log(directory, records=None):
+    """Write records as a .jsonl log and return its path."""
+    path = os.path.join(directory, "run.jsonl")
+    with open(path, "w") as handle:
+        for record in records if records is not None else _demo_records():
+            handle.write(json.dumps(record) + "\n")
+    return path
+
+
+class TraceLogWindowTest(unittest.TestCase):
+    def test_since_until_narrows_the_tree(self):
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_log(d)
+            with redirect_stdout(buf):
+                trace_log(path, since="2026-11-22T10:02:00Z",
+                        until="2026-11-22T10:04:00Z")
+        # Steps 2-4 only; step 2's tool_call fell outside the window,
+        # so it becomes a root instead of pointing at a missing step.
+        self.assertEqual(buf.getvalue(),
+                         "[2] tool_result search\n"
+                         "  [3] model_call gpt-5\n"
+                         "    [4] tool_call fetch\n")
+
+    def test_since_until_json_is_the_windowed_tree(self):
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_log(d)
+            with redirect_stdout(buf):
+                trace_log(path, since="2026-11-22T10:03:00Z",
+                        as_json=True)
+        tree = json.loads(buf.getvalue())
+        self.assertEqual([n["seq"] for n in tree], [3])
+        self.assertEqual([n["seq"] for n in tree[0]["children"]], [4])
+
+    def test_last_keeps_only_recent_steps(self):
+        from datetime import datetime, timezone
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_log(d)
+            now = datetime(2026, 11, 22, 10, 6, tzinfo=timezone.utc)
+            with redirect_stdout(buf):
+                trace_log(path, last="3m", now=now)
+        self.assertEqual(buf.getvalue(),
+                         "[3] model_call gpt-5\n"
+                         "  [4] tool_call fetch\n"
+                         "    [5] tool_result fetch\n")
+
+    def test_step_with_unparseable_timestamp_never_matches(self):
+        records = _demo_records()
+        records.insert(3, _record(99, "tool_call", {"tool": "search"},
+                                  "not-a-time"))
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_log(d, records)
+            with redirect_stdout(buf):
+                trace_log(path, since="2026-11-22T10:00:00Z")
+        self.assertNotIn("[99]", buf.getvalue())
+        self.assertIn("[5] tool_result fetch", buf.getvalue())
+
+    def test_bad_last_value_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_log(d)
+            with self.assertRaises(ValueError):
+                trace_log(path, last="soon")
+
+    def test_since_after_until_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_log(d)
+            with self.assertRaises(ValueError):
+                trace_log(path, since="2026-11-22T10:05:00Z",
+                        until="2026-11-22T10:01:00Z")
+
+    def test_last_combined_with_since_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_log(d)
+            with self.assertRaises(ValueError):
+                trace_log(path, last="10m",
+                        since="2026-11-22T10:00:00Z")
+
+    def test_cli_trace_window_and_bad_window_exit_code(self):
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_log(d)
+            with redirect_stdout(buf):
+                self.assertEqual(main(["trace", path,
+                                       "--since", "2026-11-22T10:02:00Z",
+                                       "--until", "2026-11-22T10:04:00Z"]),
+                                 0)
+            self.assertEqual(buf.getvalue(),
+                             "[2] tool_result search\n"
+                             "  [3] model_call gpt-5\n"
+                             "    [4] tool_call fetch\n")
+            self.assertEqual(main(["trace", path, "--last", "soon"]), 2)
+            self.assertEqual(main(["trace", path, "--last", "10m",
+                                   "--since", "2026-11-22T10:00:00Z"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

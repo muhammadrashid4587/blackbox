@@ -12,7 +12,8 @@ from contextlib import redirect_stdout
 
 from blackbox import Recorder
 from blackbox.__main__ import main
-from blackbox.trace import build_trace, link_parents, trace_log
+from blackbox.trace import (build_trace, link_parents, trace_log,
+                            trace_subtree)
 
 
 def _record(seq, event_type, payload, ts="2026-11-22T10:00:00Z"):
@@ -128,6 +129,38 @@ class BuildTraceTest(unittest.TestCase):
         ]
         roots = build_trace(records)
         self.assertEqual([c["seq"] for c in roots[0]["children"]], [1, 2])
+
+
+class TraceSubtreeTest(unittest.TestCase):
+    def test_root_subtree_is_the_whole_tree(self):
+        node = trace_subtree(_demo_records(), 0)
+        self.assertEqual(node["seq"], 0)
+        chain = [node]
+        while chain[-1]["children"]:
+            chain.append(chain[-1]["children"][0])
+        self.assertEqual([n["seq"] for n in chain], [0, 1, 2, 3, 4, 5])
+
+    def test_middle_subtree_is_that_branch_only(self):
+        node = trace_subtree(_demo_records(), 2)
+        self.assertEqual(node["seq"], 2)
+        self.assertEqual(node["type"], "tool_result")
+        chain = [node]
+        while chain[-1]["children"]:
+            chain.append(chain[-1]["children"][0])
+        self.assertEqual([n["seq"] for n in chain], [2, 3, 4, 5])
+
+    def test_leaf_subtree_has_no_children(self):
+        node = trace_subtree(_demo_records(), 5)
+        self.assertEqual(node["seq"], 5)
+        self.assertEqual(node["children"], [])
+
+    def test_unknown_seq_is_none(self):
+        self.assertIsNone(trace_subtree(_demo_records(), 99))
+
+    def test_empty_session_is_none(self):
+        self.assertIsNone(trace_subtree([], 0))
+        self.assertIsNone(trace_subtree(
+            [_record(0, "summary", {"events": 0})], 0))
 
 
 class TraceLogTest(unittest.TestCase):

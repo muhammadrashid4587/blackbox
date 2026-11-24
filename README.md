@@ -161,6 +161,14 @@ other run's log path — `blackbox://session/diff/data/run-b.jsonl`
 — so the other run is named in the URI itself instead of a query
 string, and the template, the `summarize_diff` prompt and the
 resource all read the same diff, so they always agree.
+A second resource template, `blackbox://session/trace/{seq}`,
+exposes one branch of the session's causal trace: the subtree
+rooted at step seq — the same node the
+`blackbox://session/trace` resource carries for that step, with
+its children in log order — so a client can read one branch
+without the whole tree, e.g. `blackbox://session/trace/2`.
+Reading it with a step number that is not an integer, or a step
+the session does not have, is an error.
 One prompt template, `analyze_session`, hands the client a prompt
 for analysing the session, with an optional `focus` argument
 (`errors`, `cost`, `tool usage`, or anything else); the prompt
@@ -392,7 +400,7 @@ read-only.
 
 ## Measured
 
-- 297 tests, all passing (`make test`).
+- 307 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -569,6 +577,19 @@ read-only.
   Next: resource templates for the other session resources, so a
   client can discover the whole session surface from
   `resources/templates/list`.
+- MCP resource template for a trace subtree:
+  `blackbox://session/trace/{seq}`, listed by
+  `resources/templates/list`, so a client can read one branch of
+  the session's causal trace — the subtree rooted at step seq —
+  without the whole tree. It reuses the same `trace_subtree`
+  over `build_trace` as the `blackbox://session/trace`
+  resource, so the template and the resource always agree; a
+  step number that is not an integer, or a step the session
+  does not have, is an error, done (v0.31.0).
+  Next: resource templates for the remaining session
+  resources (aggregates, and the transcript / raw records),
+  so a client can discover the whole session surface from
+  `resources/templates/list`.
 
 ## Layout
 
@@ -579,8 +600,8 @@ blackbox/
   sqlite_store.py SQLite store: same records, same chain, WAL + synchronous=FULL
   costs.py        per-model cost tracking: list prices, cost math
   mcp_server.py   MCP server on stdio: record / verify / replay tools,
-                  session resources, a resource template for the
-                  diff, analyze_session,
+                  session resources, resource templates for the
+                  diff and a trace subtree, analyze_session,
                   summarize_costs, summarize_anomalies,
                   summarize_sampling, summarize_trace,
                   summarize_diff and summarize_retention prompts,
@@ -603,7 +624,8 @@ blackbox/
                   (tool_result -> tool_call, tool_call -> model_call),
                   indented tree or nested JSON; `blackbox trace` CLI;
                   `session_trace` for the blackbox://session/trace
-                  MCP resource
+                  MCP resource, `trace_subtree` for the
+                  blackbox://session/trace/{seq} template
   compact.py      retention / compaction: drop old records, anchor
                   them with a hash-chain checkpoint record (head
                   hash, removed count, cutoff); `blackbox compact` CLI
@@ -631,5 +653,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            297 tests, all passing
+tests/            307 tests, all passing
 ```

@@ -130,6 +130,27 @@ def _tree_depth(node):
     return 1 + max(_tree_depth(child) for child in node["children"])
 
 
+def trace_subtree(records, seq):
+    """The causal subtree rooted at one step, as a nested dict.
+
+    The same node `build_trace` builds for the whole session —
+    {"seq", "type", "label", "children"} — so a subtree read and
+    the `blackbox://session/trace` resource always agree. Returns
+    None when no step has that seq; the summary record is not a
+    step and never appears.
+    """
+    def _find(nodes):
+        for node in nodes:
+            if node["seq"] == seq:
+                return node
+            found = _find(node["children"])
+            if found is not None:
+                return found
+        return None
+
+    return _find(build_trace(records))
+
+
 def session_trace(records):
     """A session's reconstructed causal trace as JSON-able data.
 

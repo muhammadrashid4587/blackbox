@@ -133,13 +133,18 @@ class MCPServerTest(unittest.TestCase):
         response = self.server.handle_message(
             _request(2, "resources/templates/list"))
         templates = response["result"]["resourceTemplates"]
-        self.assertEqual(len(templates), 1)
-        template = templates[0]
-        self.assertEqual(template["uriTemplate"],
-                         "blackbox://session/diff/{other_path}")
-        self.assertEqual(template["name"], "session/diff/{other_path}")
-        self.assertEqual(template["mimeType"], "application/json")
-        self.assertIn("other run", template["description"])
+        self.assertEqual(len(templates), 2)
+        self.assertEqual(
+            [t["uriTemplate"] for t in templates],
+            ["blackbox://session/diff/{other_path}",
+             "blackbox://session/trace/{seq}"])
+        self.assertEqual(
+            [t["name"] for t in templates],
+            ["session/diff/{other_path}", "session/trace/{seq}"])
+        for template in templates:
+            self.assertEqual(template["mimeType"], "application/json")
+        self.assertIn("other run", templates[0]["description"])
+        self.assertIn("step", templates[1]["description"])
 
     def test_resources_read_session_transcript(self):
         self._init()
@@ -502,6 +507,61 @@ class MCPServerTest(unittest.TestCase):
                      {"uri": "blackbox://session/diff/"
                             + os.path.join(self.tmp.name,
                                            "nope.jsonl")}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_trace_template(self):
+        # The same node the blackbox://session/trace resource
+        # carries for step 1: the tool_call and its result and the
+        # model_call after it, but not the root model_call above.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/trace/1"}))
+        content = response["result"]["contents"][0]
+        self.assertEqual(content["uri"], "blackbox://session/trace/1")
+        self.assertEqual(content["mimeType"], "application/json")
+        node = json.loads(content["text"])
+        self.assertEqual(node["seq"], 1)
+        self.assertEqual(node["type"], "tool_call")
+        self.assertEqual(len(node["children"]), 1)
+        self.assertEqual(node["children"][0]["seq"], 2)
+        self.assertEqual(node["children"][0]["children"][0]["seq"], 3)
+
+    def test_resources_read_session_trace_template_root(self):
+        # The root's subtree is the whole tree.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/trace/0"}))
+        node = json.loads(
+            response["result"]["contents"][0]["text"])
+        chain = [node]
+        while chain[-1]["children"]:
+            chain.append(chain[-1]["children"][0])
+        self.assertEqual([n["seq"] for n in chain], [0, 1, 2, 3])
+
+    def test_resources_read_session_trace_template_unknown_seq(self):
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/trace/99"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_trace_template_bad_seq(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/trace/abc"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_trace_template_needs_seq(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/trace/"}))
         self.assertEqual(response["error"]["code"], -32602)
 
     def test_resources_read_unknown_uri_is_an_error(self):

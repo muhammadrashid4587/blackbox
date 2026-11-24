@@ -11,8 +11,8 @@ three tools:
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
 
-It also exposes the session as five resources, one resource
-template, and eight prompts:
+It also exposes the session as five resources, two resource
+templates, and eight prompts:
 
     blackbox://session        the session as a readable transcript
     blackbox://session.json   the session's records as JSON
@@ -34,6 +34,14 @@ template, and eight prompts:
                               other run's log path, so the other
                               run is named in the URI itself instead
                               of a query parameter
+    blackbox://session/trace/{seq}
+                              one branch of the session's causal
+                              trace as a resource template: the
+                              subtree rooted at step seq, the same
+                              node the blackbox://session/trace
+                              resource carries for that step, so a
+                              client can read one branch without
+                              the whole tree
     analyze_session           a prompt template for analysing the
                               session (optional focus argument)
     summarize_costs           a prompt template for summarising the
@@ -110,7 +118,7 @@ from .sampling import (Sampler, SamplingDeclinedError, SamplingError,
 from .tail_sampling import (_is_error, _span_durations_ms,
                             tail_sample_records)
 from .trace import (_label, _tree_depth, build_trace, link_parents,
-                    session_trace)
+                    session_trace, trace_subtree)
 from .verify import verify
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -267,19 +275,24 @@ RESOURCES = [
     },
 ]
 
-# Resource templates: the same diff as the blackbox://session/diff
-# resource, but with the other run named in the URI itself, so a
-# client can discover it from resources/templates/list and expand
-# the template instead of building a query string. The template
-# parameter is the other run's log path, exactly the other_path the
-# prompt takes and the query-parameter resource takes — the
-# template, the prompt and the resource all read the same diff, so
-# they always agree. The parameter is a path, so it may contain
-# slashes: blackbox://session/diff/data/run-b.jsonl names the run
+# Resource templates: the diff against a named run, and one branch
+# of the causal trace, so a client can discover them from
+# resources/templates/list and expand the template instead of
+# building a URI by hand. The diff template parameter is the other
+# run's log path, exactly the other_path the prompt takes and the
+# query-parameter resource takes — the template, the prompt and
+# the resource all read the same diff, so they always agree. The
+# parameter is a path, so it may contain slashes:
+# blackbox://session/diff/data/run-b.jsonl names the run
 # data/run-b.jsonl, and an absolute path keeps its leading slash
 # (blackbox://session/diff//tmp/run-b.jsonl). A client that needs
 # to name a path with spaces or other special characters
-# percent-encodes it, and the server decodes it on read.
+# percent-encodes it, and the server decodes it on read. The trace
+# template parameter is a step number: blackbox://session/trace/2
+# is the subtree rooted at step 2, the same node
+# blackbox://session/trace carries for that step — the template
+# and the resource both read `trace_subtree` over `build_trace`,
+# so they always agree.
 RESOURCE_TEMPLATES = [
     {
         "uriTemplate": "blackbox://session/diff/{other_path}",
@@ -295,6 +308,20 @@ RESOURCE_TEMPLATES = [
                         "with the other run's log path (.jsonl or "
                         ".db), e.g. blackbox://session/diff/"
                         "data/run-b.jsonl."),
+        "mimeType": "application/json",
+    },
+    {
+        "uriTemplate": "blackbox://session/trace/{seq}",
+        "name": "session/trace/{seq}",
+        "description": ("One branch of the recorded session's "
+                        "reconstructed causal trace as JSON: the "
+                        "subtree rooted at step seq — the same node "
+                        "the blackbox://session/trace resource "
+                        "carries for that step, with its children "
+                        "in log order — so a client can read one "
+                        "branch without the whole tree. Read it by "
+                        "expanding the template with a step number, "
+                        "e.g. blackbox://session/trace/2."),
         "mimeType": "application/json",
     },
 ]
@@ -1272,6 +1299,35 @@ class MCPServer:
             {"uri": uri, "mimeType": "application/json",
              "text": text}]})
 
+    def _read_trace_subtree(self, msg_id, uri, seq_text):
+        """One branch of the session's causal trace, as a resource
+        read.
+
+        One implementation for the blackbox://session/trace/{seq}
+        template: the subtree rooted at step seq, from
+        `trace_subtree` in trace.py — the same node
+        `build_trace` builds for the whole session — so the
+        template and the blackbox://session/trace resource always
+        agree. A step number that is not an integer, or a step the
+        session does not have, is an error.
+        """
+        try:
+            seq = int(unquote(seq_text))
+        except ValueError:
+            return _error(
+                msg_id, INVALID_PARAMS,
+                "blackbox://session/trace/{seq} needs a step number, "
+                "e.g. blackbox://session/trace/2")
+        records = load_records(self.log_path)
+        node = trace_subtree(records, seq)
+        if node is None:
+            return _error(msg_id, INVALID_PARAMS,
+                          "no step %d in this session" % seq)
+        text = json.dumps(node, indent=2, sort_keys=True)
+        return _result(msg_id, {"contents": [
+            {"uri": uri, "mimeType": "application/json",
+             "text": text}]})
+
     def _resources_read(self, msg_id, params):
         uri = params.get("uri")
         if uri == "blackbox://session":
@@ -1298,6 +1354,17 @@ class MCPServer:
             return _result(msg_id, {"contents": [
                 {"uri": uri, "mimeType": "application/json",
                  "text": text}]})
+        if uri.startswith("blackbox://session/trace/"):
+            # The resource template blackbox://session/trace/{seq}:
+            # the subtree rooted at step seq, the same node the
+            # trace resource carries for that step.
+            seq_text = uri[len("blackbox://session/trace/"):]
+            if not seq_text:
+                return _error(
+                    msg_id, INVALID_PARAMS,
+                    "blackbox://session/trace/{seq} needs a step "
+                    "number, e.g. blackbox://session/trace/2")
+            return self._read_trace_subtree(msg_id, uri, seq_text)
         if (uri == "blackbox://session/diff"
                 or uri.startswith("blackbox://session/diff?")):
             # A resource read takes no arguments, so the other

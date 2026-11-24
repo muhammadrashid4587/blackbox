@@ -47,6 +47,26 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _normalize_ts(ts):
+    """Parse an ISO 8601 timestamp and return it in UTC 'Z' form.
+
+    Raises ValueError on an unparseable timestamp, or one with no
+    timezone: a naive timestamp has no honest meaning in the log, so
+    it is an error, not a silent assumption of UTC.
+    """
+    if not isinstance(ts, str):
+        raise ValueError("ts must be an ISO 8601 timestamp string, "
+                         "e.g. 2026-11-24T01:00:00Z")
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("ts must be an ISO 8601 timestamp, "
+                         "e.g. 2026-11-24T01:00:00Z") from None
+    if dt.tzinfo is None:
+        raise ValueError("ts must carry a timezone, e.g. ...Z or +00:00")
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _hash_record(record):
     """Hash a record dict that has no 'hash' key yet."""
     canonical = json.dumps(record, sort_keys=True, separators=(",", ":"))
@@ -196,12 +216,18 @@ class Recorder:
         self._file.flush()
         os.fsync(self._file.fileno())
 
-    def record(self, event_type, payload, tokens=None):
+    def record(self, event_type, payload, tokens=None, ts=None):
         """Append one step. Payload is redacted before hashing/writing.
 
         With sampling on, a step may be dropped instead: it is counted
         in _sampled_out, never written, and record() returns None.
         A kept step returns its seq, as before.
+
+        ts is an optional ISO 8601 timestamp for the step; without it
+        the step is stamped with the current time. A supplied ts is
+        parsed and normalised to UTC 'Z' form, and a timestamp that
+        does not parse, or carries no timezone, raises ValueError —
+        a step's time is never invented.
         """
         if self._closed:
             raise RuntimeError("Recorder is closed")
@@ -210,7 +236,7 @@ class Recorder:
             return None
         record = {
             "seq": self._seq,
-            "ts": _now_iso(),
+            "ts": _normalize_ts(ts) if ts is not None else _now_iso(),
             "type": event_type,
             "payload": redact(payload),
             "tokens": tokens,

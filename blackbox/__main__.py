@@ -4,6 +4,8 @@
     python -m blackbox replay data/demo.jsonl
     python -m blackbox diff data/run-a.jsonl data/run-b.jsonl
     python -m blackbox mcp data/run.jsonl   # MCP server on stdio
+    python -m blackbox record data/run.jsonl --type tool_call \
+        --payload '{"tool": "search", "args": {"query": "mcp"}}'
     python -m blackbox span data/run.jsonl 0  # one step as an OTLP span
     python -m blackbox otel data/run.jsonl --out spans.json
     python -m blackbox metrics data/run.jsonl --out metrics.json
@@ -21,6 +23,7 @@ Any command takes a .jsonl log or a .db SQLite store.
 
 import argparse
 import json
+import os
 import sys
 
 from .aggregates import aggregates_log, cost_totals_log
@@ -29,11 +32,42 @@ from .live_export import DEFAULT_OTLP_ENDPOINT, OtlpHttpExporter
 from .mcp_server import serve_stdio
 from .otel import export_otlp, export_otlp_metrics, format_span, session_span
 from .query import query_log
+from .recorder import Recorder, _normalize_ts
 from .replay import diff, load_records, replay
 from .tail_sampling import (DEFAULT_MAX_COST_USD, DEFAULT_SLOW_MS,
                             export_tail_sampled_otlp)
 from .trace import trace_log
 from .verify import verify_cli
+
+
+def _parse_record_tokens(text):
+    """Parse a --tokens value: a JSON int, or a JSON object of
+    non-negative int counts (an input/output split).
+
+    Raises ValueError with a plain message on anything else — a
+    token count is never guessed from a bad value.
+    """
+    try:
+        tokens = json.loads(text)
+    except json.JSONDecodeError:
+        raise ValueError("--tokens must be a JSON int or object, "
+                         "e.g. 120 or '{\"input\": 1200, "
+                         "\"output\": 340}'") from None
+    if isinstance(tokens, bool):
+        raise ValueError("--tokens must be a JSON int or object")
+    if isinstance(tokens, int):
+        if tokens < 0:
+            raise ValueError("--tokens must not be negative")
+        return tokens
+    if isinstance(tokens, dict):
+        for key, value in tokens.items():
+            if (not isinstance(key, str) or isinstance(value, bool)
+                    or not isinstance(value, int) or value < 0):
+                raise ValueError(
+                    "--tokens object values must be non-negative ints")
+        return tokens
+    raise ValueError("--tokens must be a JSON int or object, "
+                     "e.g. 120 or '{\"input\": 1200, \"output\": 340}'")
 
 
 def main(argv=None):
@@ -56,6 +90,33 @@ def main(argv=None):
     p_mcp.add_argument("logfile")
     p_mcp.add_argument("--task")
     p_mcp.add_argument("--model")
+
+    p_record = sub.add_parser(
+        "record", help="append one step to a log from the shell: the "
+        "same record the Recorder writes — redacted, hash-chained, "
+        "fsynced — so a step can be recorded without the MCP server "
+        "or a Python script")
+    p_record.add_argument("logfile")
+    p_record.add_argument("--type", required=True,
+                          help="step type, e.g. model_call, tool_call, "
+                          "tool_result")
+    p_record.add_argument("--payload", default="{}",
+                          help="step payload as a JSON object "
+                          "(default: {})")
+    p_record.add_argument("--tokens",
+                          help="token count as a JSON int, or an "
+                          "input/output split as a JSON object, e.g. "
+                          "'{\"input\": 1200, \"output\": 340}'")
+    p_record.add_argument("--ts",
+                          help="ISO 8601 timestamp for the step "
+                          "(default: now); must carry a timezone, "
+                          "e.g. 2026-11-24T01:00:00Z")
+    p_record.add_argument("--task",
+                          help="task name for the session summary "
+                          "(default: the log's existing task, if any)")
+    p_record.add_argument("--model",
+                          help="default model for the session summary "
+                          "(default: the log's existing model, if any)")
 
     p_span = sub.add_parser(
         "span", help="print one step as an OTLP span: the same span "
@@ -205,6 +266,55 @@ def main(argv=None):
         return 0
     if args.command == "mcp":
         serve_stdio(args.logfile, task=args.task, model=args.model)
+        return 0
+    if args.command == "record":
+        # Validate everything before opening the log: opening a
+        # Recorder resumes it, which drops a trailing summary, so a
+        # failed record must not get that far.
+        if not args.type or args.type in ("summary", "checkpoint"):
+            print("record: --type must name a step type, not 'summary' "
+                  "or 'checkpoint'", file=sys.stderr)
+            return 2
+        try:
+            payload = json.loads(args.payload)
+        except json.JSONDecodeError:
+            print("record: --payload must be a JSON object",
+                  file=sys.stderr)
+            return 2
+        if not isinstance(payload, dict):
+            print("record: --payload must be a JSON object",
+                  file=sys.stderr)
+            return 2
+        try:
+            tokens = (_parse_record_tokens(args.tokens)
+                      if args.tokens is not None else None)
+            if args.ts is not None:
+                _normalize_ts(args.ts)
+        except ValueError as exc:
+            print("record: %s" % exc, file=sys.stderr)
+            return 2
+        # Keep the log's existing task/model in the summary the
+        # Recorder writes on close, unless the flags override them.
+        task, model = args.task, args.model
+        if (task is None or model is None) and os.path.exists(args.logfile):
+            try:
+                existing = load_records(args.logfile)
+            except (FileNotFoundError, ValueError, OSError):
+                existing = []
+            if existing and existing[-1].get("type") == "summary":
+                summary = existing[-1].get("payload") or {}
+                if task is None:
+                    task = summary.get("task")
+                if model is None:
+                    model = summary.get("model")
+        try:
+            with Recorder(args.logfile, task=task, model=model) as rec:
+                seq = rec.record(args.type, payload, tokens=tokens,
+                                 ts=args.ts)
+        except ValueError as exc:
+            print("record: %s" % exc, file=sys.stderr)
+            return 2
+        print("recorded step %d (%s)" % (seq, args.type))
         return 0
     if args.command == "span":
         try:

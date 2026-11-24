@@ -25,6 +25,10 @@ backend is the stdlib `sqlite3` module, still no server.
 # Record a run (see scripts/demo.py for a scripted example)
 make demo
 
+# Record one step from the shell (no Python script, no MCP server)
+python -m blackbox record data/run.jsonl --type tool_call \
+    --payload '{"tool": "search", "args": {"query": "mcp"}}'
+
 # Check the log: OK, or the exact seq of the first broken record
 python -m blackbox verify data/demo.jsonl
 # OK: 9 records, hash chain intact
@@ -51,6 +55,26 @@ with Recorder("data/run.jsonl", task="research topic", model="gpt-x") as rec:
 the event count, start/end time and total tokens. If the file already
 exists, recording resumes after its last record without breaking the
 chain.
+
+Record one step from the shell:
+
+```bash
+python -m blackbox record data/run.jsonl --type model_call \
+    --payload '{"model": "gpt-5", "prompt": "..."}' \
+    --tokens '{"input": 1200, "output": 340}' \
+    --ts 2026-11-24T01:00:00Z
+```
+
+It appends exactly the step the Recorder writes — same redaction,
+hash chain and fsync, so the step agrees with `blackbox span`, the
+MCP templates and the full export — and then closes the log with a
+fresh summary, so the log is always left valid. `--ts` is optional:
+without it the step is stamped with the current time, and a
+timestamp that does not parse, or carries no timezone, is an error
+instead of a guessed time. `--tokens` takes a plain int or an
+input/output split as JSON; `--task` / `--model` name the session,
+defaulting to the log's existing values. Bad input exits non-zero
+and leaves the log untouched.
 
 SQLite backend: pass a `.db` path instead of `.jsonl` and records go
 to a SQLite table instead of a text log. Same API, same records, same
@@ -413,7 +437,7 @@ read-only.
 
 ## Measured
 
-- 337 tests, all passing (`make test`).
+- 373 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -653,10 +677,22 @@ read-only.
   JSON with `--json`, so the span is readable without an MCP
   client; an unknown step, the summary record, or a step with
   no usable timestamp is an error, done (v0.36.0).
-  Next: a `blackbox record` CLI command that appends one step
-  to a log from the shell — type, payload JSON and token counts
-  as flags — so a step can be recorded without the MCP server
-  or a Python script.
+- `blackbox record` CLI command: appends one step to a log from
+  the shell — type, payload JSON and token counts as flags, an
+  optional `--ts` (taken as given, normalised to UTC, or the
+  current time when omitted; an unparseable or timezone-less
+  timestamp is an error, never a guessed time) — reusing the
+  Recorder, so the step is redacted, hash-chained and fsynced
+  exactly like a step recorded from code or the MCP server, and
+  agrees with `blackbox span`, the MCP templates and the full
+  export; it closes the log with a fresh summary (keeping the
+  log's existing task/model unless `--task` / `--model`
+  override them), works on `.jsonl` logs and `.db` stores, and
+  bad input exits non-zero without touching the log, done
+  (v0.37.0).
+  Next: record steps in bulk from stdin — pipe JSONL steps into
+  `blackbox record --stdin` so a shell pipeline can log a whole
+  run without one process per step.
 
 ## Layout
 
@@ -720,11 +756,11 @@ blackbox/
   verify.py       replay the chain, find the first broken record
   replay.py       transcript printer + run diff (`diff_records`,
                   `session_diff` as JSON, per-model token usage)
-  __main__.py     CLI: verify | replay | diff | mcp | otel | export
-                  | metrics | tail-sample | query | trace | compact
-                  | aggregates | costs | span
+  __main__.py     CLI: verify | replay | diff | mcp | record | otel
+                  | export | metrics | tail-sample | query | trace
+                  | compact | aggregates | costs | span
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            349 tests, all passing
+tests/            373 tests, all passing
 ```

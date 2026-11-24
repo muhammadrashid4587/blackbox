@@ -303,6 +303,17 @@ def main(argv=None):
     p_metrics.add_argument("logfile")
     p_metrics.add_argument("--out", help="write JSON here (default: stdout)")
     p_metrics.add_argument("--service-name", default="blackbox")
+    p_metrics.add_argument("--last", help="keep steps from the last "
+                           "this long, e.g. 10m, 2h, 1d, 1h30m "
+                           "(the same relative window as query --last)")
+    p_metrics.add_argument("--since", help="keep steps at or after "
+                           "this ISO timestamp (with a timezone, e.g. "
+                           "2026-11-24T01:00:00Z; the same window as "
+                           "query --since)")
+    p_metrics.add_argument("--until", help="keep steps at or before "
+                           "this ISO timestamp (with a timezone, e.g. "
+                           "2026-11-24T01:00:00Z; the same window as "
+                           "query --until)")
 
     p_tail = sub.add_parser(
         "tail-sample", help="export a log as tail-sampled OTLP/JSON "
@@ -611,7 +622,16 @@ def main(argv=None):
             sys.stdout.write(text)
         return 0
     if args.command == "metrics":
-        data = export_otlp_metrics(args.logfile, args.service_name)
+        try:
+            data = export_otlp_metrics(args.logfile, args.service_name,
+                                       last=args.last, since=args.since,
+                                       until=args.until)
+        except ValueError as exc:
+            # A bad --last value, a bad --since / --until value,
+            # --since after --until, or --last combined with --since /
+            # --until.
+            print("metrics: %s" % exc, file=sys.stderr)
+            return 2
         text = json.dumps(data, indent=2) + "\n"
         if args.out:
             with open(args.out, "w", encoding="utf-8") as f:

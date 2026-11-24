@@ -545,7 +545,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 458 tests, all passing (`make test`).
+- 484 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -966,9 +966,32 @@ and `max_records` counts printed steps, not skipped ones.
   not just the window. `aggregates_log` / `cost_totals_log` in
   `aggregates.py` take the same filters as a Python API. Works on
   `.jsonl` logs and `.db` stores, done (v0.48.0).
+- Metrics time-range filters: `blackbox metrics --since
+  2026-11-22T10:01:00Z --until 2026-11-22T10:04:30Z` (and
+  `--last 10m`) narrow the OTLP metrics export to an absolute or
+  relative window — the same closed window as `blackbox query
+  --since` / `--until`, through the shared `_window_records` from
+  `aggregates.py`, so a value that does not parse or carries no
+  timezone is an error, exit code 2, --since after --until is an
+  error, exit code 2, --last cannot be combined with --since or
+  --until, exit code 2, and a step whose timestamp does not parse,
+  or carries no timezone, never matches. The summary and
+  checkpoint records are kept untouched, and latency is measured
+  between kept steps, with the last kept step running to the
+  summary timestamp, as in the unwindowed export.
+  `export_otlp_metrics` / `export_otlp_metrics_file` in `otel.py`
+  take the same filters as a Python API (a duration string or a
+  timedelta for --last, with `now` fixable for tests). Works on
+  `.jsonl` logs and `.db` stores, done (v0.49.0). Along the way,
+  `records_to_metrics` stopped treating a checkpoint as a step —
+  on a compacted log its 09:00 timestamp used to end the last
+  model call's latency with a negative gap — and a step whose
+  timestamp does not parse, or carries no timezone, now
+  contributes no latency instead of crashing the export.
   Next: `--since` / `--until` time-range filters for `blackbox
-  metrics`, so the OTLP metrics export can be narrowed to an
-  absolute window the same way aggregates can.
+  otel` / `blackbox export`, so the OTLP span export can be
+  narrowed to an absolute window the same way the metrics export
+  can.
 
 ## Layout
 

@@ -1072,9 +1072,25 @@ and `max_records` counts printed steps, not skipped ones.
   the same filters as a Python API (a duration string or a
   timedelta for --last, with `now` fixable for tests). Works on
   `.jsonl` logs and `.db` stores, done (v0.52.0).
+- Replay time-range filters: `blackbox replay --since
+  2026-11-22T10:02:00Z --until 2026-11-22T10:04:00Z` (and
+  `--last 10m`) narrow the transcript to an absolute or relative
+  window — the same closed window as `blackbox query --since` /
+  `--until`, through the shared `_window_records` from
+  `aggregates.py` (deferred import in `replay.py`, which
+  `aggregates.py` already imports), so a value that does not parse
+  or carries no timezone is an error, exit code 2, --since after
+  --until is an error, exit code 2, --last cannot be combined with
+  --since or --until, exit code 2, and a step whose timestamp does
+  not parse, or carries no timezone, never matches. The summary
+  and checkpoint records are kept untouched, so the transcript
+  still ends with the whole log's totals, not just the window's.
+  `replay` in `replay.py` takes the same filters as a Python API
+  (a duration string or a timedelta for --last, with `now` fixable
+  for tests). Works on `.jsonl` logs and `.db` stores, done
+  (v0.53.0).
   Next: `--since` / `--until` time-range filters for `blackbox
-  replay`, so a transcript can be narrowed to a window the same
-  way the trace can.
+  diff`, so two runs can be compared over the same window.
 
 ## Layout
 
@@ -1158,5 +1174,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            515 tests, all passing
+tests/            523 tests, all passing
 ```

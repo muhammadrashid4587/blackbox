@@ -2,6 +2,8 @@
 
     python -m blackbox verify data/demo.jsonl
     python -m blackbox replay data/demo.jsonl
+    python -m blackbox replay data/run.jsonl --since 2026-11-24T01:00:00Z --until 2026-11-24T02:00:00Z
+    python -m blackbox replay data/run.jsonl --last 10m  # recent steps only
     python -m blackbox diff data/run-a.jsonl data/run-b.jsonl
     python -m blackbox mcp data/run.jsonl   # MCP server on stdio
     python -m blackbox record data/run.jsonl --type tool_call \
@@ -181,6 +183,17 @@ def main(argv=None):
 
     p_replay = sub.add_parser("replay", help="print a log as a transcript")
     p_replay.add_argument("logfile")
+    p_replay.add_argument("--last", help="keep steps from the last "
+                          "this long, e.g. 10m, 2h, 1d, 1h30m "
+                          "(the same relative window as query --last)")
+    p_replay.add_argument("--since", help="keep steps at or after "
+                          "this ISO timestamp (with a timezone, e.g. "
+                          "2026-11-24T01:00:00Z; the same window as "
+                          "query --since)")
+    p_replay.add_argument("--until", help="keep steps at or before "
+                          "this ISO timestamp (with a timezone, e.g. "
+                          "2026-11-24T01:00:00Z; the same window as "
+                          "query --until)")
 
     p_diff = sub.add_parser("diff", help="compare two runs of the same task")
     p_diff.add_argument("log_a")
@@ -501,7 +514,15 @@ def main(argv=None):
     if args.command == "verify":
         return verify_cli(args.logfile)
     if args.command == "replay":
-        replay(args.logfile)
+        try:
+            replay(args.logfile, last=args.last, since=args.since,
+                   until=args.until)
+        except ValueError as exc:
+            # A bad --last value, a bad --since / --until value,
+            # --since after --until, or --last combined with --since /
+            # --until.
+            print("replay: %s" % exc, file=sys.stderr)
+            return 2
         return 0
     if args.command == "diff":
         diff(args.log_a, args.log_b)

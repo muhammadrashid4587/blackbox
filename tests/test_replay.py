@@ -267,5 +267,171 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(result["errors_b"], 0)
 
 
+def _record(seq, event_type, payload, ts="2026-11-22T10:00:00Z"):
+    return {"seq": seq, "ts": ts, "type": event_type, "payload": payload,
+            "tokens": None, "prev_hash": "0" * 64, "hash": "0" * 64}
+
+
+def _demo_records():
+    return [
+        _record(0, "model_call", {"model": "gpt-5", "prompt": "plan"},
+                "2026-11-22T10:00:00Z"),
+        _record(1, "tool_call", {"tool": "search", "args": {"q": "x"}},
+                "2026-11-22T10:01:00Z"),
+        _record(2, "tool_result", {"tool": "search", "result": "ok"},
+                "2026-11-22T10:02:00Z"),
+        _record(3, "model_call", {"model": "gpt-5",
+                                  "prompt": "summarise"},
+                "2026-11-22T10:03:00Z"),
+        _record(4, "tool_call", {"tool": "fetch", "args": {"url": "u"}},
+                "2026-11-22T10:04:00Z"),
+        _record(5, "tool_result", {"tool": "fetch", "result": "page"},
+                "2026-11-22T10:05:00Z"),
+        _record(6, "summary",
+                {"events": 6, "total_tokens": 0,
+                 "started": "2026-11-22T10:00:00Z",
+                 "ended": "2026-11-22T10:06:00Z"},
+                "2026-11-22T10:06:00Z"),
+    ]
+
+
+def _write_log(directory, records=None):
+    """Write records as a .jsonl log and return its path."""
+    import json
+    path = os.path.join(directory, "run.jsonl")
+    with open(path, "w") as handle:
+        for record in records if records is not None else _demo_records():
+            handle.write(json.dumps(record) + "\n")
+    return path
+
+
+class ReplayWindowTest(unittest.TestCase):
+    def test_since_until_narrows_the_transcript(self):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_log(d)
+            with redirect_stdout(buf):
+                records = replay(path, since="2026-11-22T10:02:00Z",
+                                 until="2026-11-22T10:04:00Z")
+        # Steps 2-4 only; the summary is bookkeeping about the
+        # whole log, so it is kept even though its timestamp is
+        # outside the window.
+        self.assertEqual(buf.getvalue(),
+                         "[2] 2026-11-22T10:02:00Z tool_result  "
+                         "search -> ok\n"
+                         "[3] 2026-11-22T10:03:00Z model_call  "
+                         "model=gpt-5\n"
+                         "    prompt: summarise\n"
+                         "[4] 2026-11-22T10:04:00Z tool_call  "
+                         "fetch(url=u)\n"
+                         "[6] 2026-11-22T10:06:00Z summary\n"
+                         "    events: 6  tokens: 0  "
+                         "2026-11-22T10:00:00Z -> "
+                         "2026-11-22T10:06:00Z\n")
+        self.assertEqual([r["seq"] for r in records], [2, 3, 4, 6])
+
+    def test_last_keeps_only_recent_steps(self):
+        import io
+        from contextlib import redirect_stdout
+        from datetime import datetime, timezone
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_log(d)
+            now = datetime(2026, 11, 22, 10, 6, tzinfo=timezone.utc)
+            with redirect_stdout(buf):
+                records = replay(path, last="3m", now=now)
+        out = buf.getvalue()
+        self.assertIn("[3] 2026-11-22T10:03:00Z model_call", out)
+        self.assertIn("[4] 2026-11-22T10:04:00Z tool_call", out)
+        self.assertIn("[5] 2026-11-22T10:05:00Z tool_result", out)
+        self.assertNotIn("[0] ", out)
+        self.assertNotIn("[1] ", out)
+        self.assertNotIn("[2] ", out)
+        self.assertEqual([r["seq"] for r in records], [3, 4, 5, 6])
+
+    def test_step_with_unparseable_timestamp_never_matches(self):
+        import io
+        from contextlib import redirect_stdout
+        records = _demo_records()
+        records.insert(3, _record(99, "tool_call", {"tool": "search"},
+                                  "not-a-time"))
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_log(d, records)
+            with redirect_stdout(buf):
+                replay(path, since="2026-11-22T10:00:00Z")
+        self.assertNotIn("[99]", buf.getvalue())
+        self.assertIn("[5] 2026-11-22T10:05:00Z tool_result", buf.getvalue())
+
+    def test_bad_last_value_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_log(d)
+            with self.assertRaises(ValueError):
+                replay(path, last="soon")
+
+    def test_since_after_until_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_log(d)
+            with self.assertRaises(ValueError):
+                replay(path, since="2026-11-22T10:05:00Z",
+                       until="2026-11-22T10:01:00Z")
+
+    def test_last_combined_with_since_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_log(d)
+            with self.assertRaises(ValueError):
+                replay(path, last="10m",
+                       since="2026-11-22T10:00:00Z")
+
+    def test_window_works_on_sqlite_store(self):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "run.db")
+            with Recorder(path) as rec:
+                rec.record("model_call", {"model": "gpt-5",
+                                          "prompt": "plan"},
+                           ts="2026-11-22T10:00:00Z")
+                rec.record("tool_call", {"tool": "search",
+                                         "args": {"q": "x"}},
+                           ts="2026-11-22T10:01:00Z")
+                rec.record("tool_result", {"tool": "search",
+                                           "result": "ok"},
+                           ts="2026-11-22T10:02:00Z")
+            with redirect_stdout(buf):
+                records = replay(path, since="2026-11-22T10:01:00Z")
+        out = buf.getvalue()
+        self.assertNotIn("plan", out)
+        self.assertIn("search", out)
+        self.assertEqual([r["seq"] for r in records], [1, 2, 3])
+
+    def test_cli_replay_window_and_bad_window_exit_code(self):
+        import io
+        from contextlib import redirect_stdout
+        from blackbox.__main__ import main
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_log(d)
+            with redirect_stdout(buf):
+                self.assertEqual(main(["replay", path,
+                                       "--since", "2026-11-22T10:02:00Z",
+                                       "--until", "2026-11-22T10:04:00Z"]),
+                                 0)
+            out = buf.getvalue()
+            self.assertIn("[2] 2026-11-22T10:02:00Z tool_result", out)
+            self.assertIn("[4] 2026-11-22T10:04:00Z tool_call", out)
+            self.assertNotIn("[0] ", out)
+            self.assertNotIn("[5] ", out)
+            self.assertEqual(main(["replay", path, "--last", "soon"]), 2)
+            self.assertEqual(main(["replay", path, "--last", "10m",
+                                   "--since", "2026-11-22T10:00:00Z"]), 2)
+            self.assertEqual(main(["replay", path,
+                                   "--since", "2026-11-22T10:05:00Z",
+                                   "--until", "2026-11-22T10:01:00Z"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

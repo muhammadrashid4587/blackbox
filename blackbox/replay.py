@@ -12,6 +12,11 @@ Diff compares two runs of the same task, position by position, and
 reports changed steps (same position, different payload), steps added
 in the second run, and steps removed from the first. Token totals for
 both runs are printed at the end.
+
+`replay` takes the same --since / --until / --last window as
+`blackbox query` and `blackbox trace`, through the shared
+`_window_records` — a transcript can be narrowed to a window the
+same way the trace can.
 """
 
 import json
@@ -96,9 +101,31 @@ def format_record(record):
     return "%s  %s" % (header, _short(payload))
 
 
-def replay(path):
-    """Print the transcript of a log. Returns the records."""
-    records = load_records(path)
+def replay(path, last=None, since=None, until=None, now=None):
+    """Print the transcript of a log. Returns the records.
+
+    last is a relative window — a duration string like "10m" or a
+    timedelta — keeping only steps from the last that long, as a
+    lower bound of now minus the duration (now defaults to the
+    current UTC time, and is a parameter so tests can fix it); a
+    value that is not a duration raises ValueError. since / until
+    are ISO 8601 timestamps with a timezone, keeping only steps in
+    the closed window [since, until], the same window as `blackbox
+    query --since` / `--until`; a value that does not parse or
+    carries no timezone raises ValueError, as does --since after
+    --until, and --last cannot be combined with --since or --until.
+    The window is applied through the shared `_window_records`,
+    before anything is printed, so a step whose timestamp does not
+    parse, or carries no timezone, never matches, and the summary
+    and checkpoint records are kept untouched — they are
+    bookkeeping about the whole log, not just the window. Works on
+    .jsonl logs and .db stores.
+    """
+    # Deferred: aggregates imports load_records from this module,
+    # so importing it at the top would be circular.
+    from .aggregates import _window_records
+    records = _window_records(load_records(path), last=last,
+                              since=since, until=until, now=now)
     for record in records:
         print(format_record(record))
     return records

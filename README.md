@@ -45,6 +45,9 @@ python -m blackbox verify data/demo.jsonl
 # Read the run back as a transcript
 python -m blackbox replay data/demo.jsonl
 
+# Follow a live run as it happens
+python -m blackbox watch data/run.jsonl
+
 # Compare two runs of the same task
 python -m blackbox diff data/run-a.jsonl data/run-b.jsonl
 ```
@@ -468,6 +471,29 @@ prints the same breakdown as JSON. `cost_totals` in `aggregates.py`
 is the same computation as a pure function over a list of records,
 read-only.
 
+**Live tail.** `python -m blackbox watch data/run.jsonl` follows a
+live log and prints each new step as it lands, in the same format as
+the `blackbox replay` transcript, so a running agent's flight
+recorder can be followed in real time. By default watching starts at
+the end of the log and prints only new steps; `--from-start`
+replays the existing steps first, then follows. It works on `.jsonl`
+logs and `.db` stores, waits for a log that does not exist yet
+instead of erroring, and stops cleanly on Ctrl-C (exit 0). A log
+that shrinks while it is watched — a Recorder resuming drops the
+trailing summary, a rotation replaces the file — is re-read from the
+start, and steps already printed are skipped by record hash (a
+resumed step reuses the dropped summary's seq, so the seq alone
+cannot tell a new step from an old one), so nothing is printed twice
+and nothing new is missed. A malformed appended line is reported on
+stderr and skipped, never a crash — and a line that fails to parse
+is treated as a possible desync first (a resume that rewrites and
+re-appends between two polls leaves the file larger than the old
+offset, so the byte offset goes stale and the next read starts
+mid-line), so the log is re-read and the missed steps still land.
+`watch_log` in `watch.py` is the same tail as a Python API, with
+`stop_after` / `max_records` test hooks for stopping without a
+signal.
+
 ## What it is not
 
 - Not a hosted platform. There is nothing to sign up for and nowhere
@@ -480,7 +506,7 @@ read-only.
 
 ## Measured
 
-- 382 tests, all passing (`make test`).
+- 409 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -759,9 +785,25 @@ read-only.
   `--stdin` or the single-step flags, and a missing or unreadable
   file is an error; it works on `.jsonl` logs and `.db` stores,
   done (v0.39.0).
-  Next: `blackbox watch` — tail a live log and print new steps as
-  they land, so a running agent's flight recorder can be followed
-  in real time.
+- `blackbox watch`: tails a live log and prints each new step as it
+  lands, in the same format as the `blackbox replay` transcript —
+  `--from-start` replays the existing steps first, the default
+  starts at the end and prints only new steps — so a running
+  agent's flight recorder can be followed in real time. It works on
+  `.jsonl` logs (byte-offset tail) and `.db` stores (polling for
+  rows past the last printed seq), waits for a log that does not
+  exist yet, and stops cleanly on Ctrl-C (exit 0). A log that
+  shrinks while watched — a Recorder resuming drops the trailing
+  summary, a rotation replaces the file — is re-read from the start
+  with already-printed steps skipped by record hash (a resumed step
+  reuses the dropped summary's seq, so the seq alone cannot tell a
+  new step from an old one); a line that fails to parse is treated
+  as a possible desync first and re-read, so a rewrite between two
+  polls still lands the missed steps, and a genuinely malformed
+  appended line is reported on stderr and skipped, never a crash,
+  done (v0.40.0).
+  Next: filter flags for watch (`--type`, `--errors-only`) so a
+  busy run can be followed for just the steps you care about.
 
 ## Layout
 
@@ -827,9 +869,18 @@ blackbox/
                   `session_diff` as JSON, per-model token usage)
   __main__.py     CLI: verify | replay | diff | mcp | record | otel
                   | export | metrics | tail-sample | query | trace
-                  | compact | aggregates | costs | span
+                  | compact | aggregates | costs | span | watch
+  watch.py        live tail: follow a log and print new steps as
+                  they land, in the replay transcript format —
+                  .jsonl by byte offset, .db by polling past the
+                  last printed seq; a shrunk or replaced log is
+                  re-read from the start with already-printed steps
+                  skipped by record hash, a line that fails to
+                  parse is treated as a possible desync and
+                  re-read, and a genuinely malformed line is
+                  reported and skipped; Ctrl-C stops cleanly
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            382 tests, all passing
+tests/            409 tests, all passing
 ```

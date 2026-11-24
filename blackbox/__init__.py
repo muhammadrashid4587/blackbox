@@ -7,7 +7,7 @@ append-only log you can verify and replay.
 Pure Python 3 standard library. No dependencies.
 """
 
-__version__ = "0.39.0"
+__version__ = "0.40.0"
 
 from .compact import compact_log
 from .costs import cost_for, price_for, register_pricing
@@ -30,6 +30,7 @@ from .tail_sampling import (DEFAULT_MAX_COST_USD, DEFAULT_SLOW_MS,
 from .trace import (build_trace, link_parents, session_trace,
                     trace_log, trace_subtree)
 from .verify import verify
+from .watch import watch_log
 
 __all__ = ["DEFAULT_OTLP_ENDPOINT", "DEFAULT_MAX_COST_USD",
            "DEFAULT_SLOW_MS", "LiveExporter", "MCPServer",
@@ -46,4 +47,4 @@ __all__ = ["DEFAULT_OTLP_ENDPOINT", "DEFAULT_MAX_COST_USD",
            "records_to_spans", "register_pricing",
            "replay", "session_span", "session_trace", "spans_to_records",
            "tail_sample_records", "trace_log", "trace_subtree",
-           "verify"]
+           "verify", "watch_log"]

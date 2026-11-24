@@ -10,6 +10,7 @@
         | python -m blackbox record data/run.jsonl --stdin
     python -m blackbox record data/run.jsonl --file steps.jsonl
     python -m blackbox span data/run.jsonl 0  # one step as an OTLP span
+    python -m blackbox watch data/run.jsonl  # tail a live log
     python -m blackbox otel data/run.jsonl --out spans.json
     python -m blackbox metrics data/run.jsonl --out metrics.json
     python -m blackbox tail-sample data/run.jsonl --out spans.json
@@ -41,6 +42,7 @@ from .tail_sampling import (DEFAULT_MAX_COST_USD, DEFAULT_SLOW_MS,
                             export_tail_sampled_otlp)
 from .trace import trace_log
 from .verify import verify_cli
+from .watch import watch_log
 
 
 def _parse_record_tokens(text):
@@ -234,6 +236,19 @@ def main(argv=None):
     p_span.add_argument("--json", action="store_true", dest="as_json",
                         help="print the span as JSON instead of a "
                         "report")
+
+    p_watch = sub.add_parser(
+        "watch", help="tail a live log and print new steps as they "
+        "land, in the same format as replay: follow a running "
+        "agent's flight recorder in real time")
+    p_watch.add_argument("logfile")
+    p_watch.add_argument("--from-start", action="store_true",
+                         help="print the existing steps first, then "
+                         "follow new ones (default: start at the end "
+                         "and print only new steps)")
+    p_watch.add_argument("--poll-interval", type=float, default=0.2,
+                         help="seconds between checks for new steps "
+                         "(default: %(default)s)")
 
     p_otel = sub.add_parser("otel", help="export a log as OTLP/JSON spans")
     p_otel.add_argument("logfile")
@@ -494,6 +509,21 @@ def main(argv=None):
             sys.stdout.write(json.dumps(span, indent=2) + "\n")
         else:
             sys.stdout.write(format_span(span))
+        return 0
+    if args.command == "watch":
+        if args.poll_interval <= 0:
+            print("watch: --poll-interval must be positive",
+                  file=sys.stderr)
+            return 2
+        try:
+            watch_log(args.logfile, from_start=args.from_start,
+                      poll_interval=args.poll_interval)
+        except KeyboardInterrupt:
+            # Ctrl-C stops the tail cleanly, exit code 0.
+            return 0
+        except OSError as exc:
+            print("watch: %s" % (exc.strerror or exc), file=sys.stderr)
+            return 1
         return 0
     if args.command == "otel":
         data = export_otlp(args.logfile, args.service_name,

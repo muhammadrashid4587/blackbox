@@ -224,12 +224,18 @@ summarises; read it as
 `blackbox://session/diff?other_path=<path to the other run's
 log>` — a resource read takes no arguments, so the other run's
 path rides in the URI as a query parameter, and reading the
-resource without it is an error. The same diff is also a resource
+resource without it is an error. The same `--since` / `--until`
+/ `--last` window as `blackbox diff` rides in the query string
+too — `?other_path=<path>&since=2026-11-24T01:00:00Z&until=
+2026-11-24T02:00:00Z` — and narrows both runs before they are
+compared; a bad bound, a reversed window, or `--last` combined
+with `--since` / `--until` is an error. The same diff is also a resource
 template, `blackbox://session/diff/{other_path}`, listed by
 `resources/templates/list`: a client expands the template with the
 other run's log path — `blackbox://session/diff/data/run-b.jsonl`
 — so the other run is named in the URI itself instead of a query
-string, and the template, the `summarize_diff` prompt and the
+string, and the window rides in the query string after the path
+(`.../run-b.jsonl?since=...`); the template, the `summarize_diff` prompt and the
 resource all read the same diff, so they always agree.
 A second resource template, `blackbox://session/trace/{seq}`,
 exposes one branch of the session's causal trace: the subtree
@@ -556,7 +562,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 533 tests, all passing (`make test`).
+- 537 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1107,9 +1113,27 @@ and `max_records` counts printed steps, not skipped ones.
   as a Python API (a duration string or a timedelta for --last,
   with `now` fixable for tests). Works on `.jsonl` logs and `.db`
   stores, done (v0.54.0).
+- Diff resource time-range filters: `blackbox://session/diff`
+  takes the same `--since` / `--until` / `--last` window as
+  `blackbox diff`, as query parameters — e.g.
+  `blackbox://session/diff?other_path=<path>&since=
+  2026-11-24T01:00:00Z&until=2026-11-24T02:00:00Z`, and the
+  `blackbox://session/diff/{other_path}` template takes it the
+  same way, after the path — through the shared `_window_records`
+  from `aggregates.py`, so a value that does not parse or carries
+  no timezone is an error, --since after --until is an error, and
+  --last cannot be combined with --since or --until is an error
+  (an INVALID_PARAMS error on a resource read, exit code 2 on the
+  CLI), and a step whose timestamp does not parse, or carries no
+  timezone, never matches. The window is applied to both runs before they
+  are compared position by position, so a step outside the window
+  cannot make the runs look different. The summary and checkpoint
+  records are kept untouched, so the comparison still runs over
+  the whole log's bookkeeping, not just the window's. Works on
+  `.jsonl` logs and `.db` stores, done (v0.55.0).
   Next: `--since` / `--until` time-range filters for the
-  `blackbox://session/diff` MCP resource, so the MCP diff can be
-  narrowed to the same window as the CLI diff.
+  `blackbox://session/trace` MCP resource, so the MCP trace can
+  be narrowed to the same window as the CLI trace.
 
 ## Layout
 
@@ -1193,5 +1217,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            533 tests, all passing
+tests/            537 tests, all passing
 ```

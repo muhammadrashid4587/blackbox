@@ -503,6 +503,96 @@ class MCPServerTest(unittest.TestCase):
         self.assertEqual(diff["errors_a"], 0)
         self.assertEqual(diff["errors_b"], 1)
 
+    def test_resources_read_session_diff_window_last(self):
+        # The same --last window as `blackbox diff --last`: the
+        # session and the other run were both recorded just now,
+        # so last=1h keeps every step and the diff is the
+        # unwindowed one.
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        self._write_other_run(other, query="other",
+                              extra=True, error_result=True)
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/diff?other_path="
+                            + other + "&last=1h"}))
+        diff = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(diff["run_a"], {"steps": 4, "tokens": 1690})
+        self.assertEqual(diff["run_b"], {"steps": 5, "tokens": 1690})
+        self.assertFalse(diff["identical"])
+        self.assertEqual([c["position"] for c in diff["changed"]],
+                         [1, 2])
+        self.assertEqual(len(diff["added"]), 1)
+
+    def test_resources_read_session_diff_window_since_excludes_all(self):
+        # A --since window after every step drops both runs to
+        # zero steps, so the runs compare identical over the
+        # window — the changed steps outside it cannot make
+        # them look different.
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        self._write_other_run(other, query="other",
+                              extra=True, error_result=True)
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/diff?other_path="
+                            + other
+                            + "&since=2999-01-01T00:00:00Z"}))
+        diff = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertTrue(diff["identical"])
+        self.assertEqual(diff["run_a"], {"steps": 0, "tokens": 0})
+        self.assertEqual(diff["run_b"], {"steps": 0, "tokens": 0})
+        self.assertEqual(diff["changed"], [])
+        self.assertEqual(diff["added"], [])
+        self.assertEqual(diff["removed"], [])
+        self.assertEqual(diff["per_model"], {})
+
+    def test_resources_read_session_diff_window_bad_bounds_are_errors(self):
+        # A bad bound, a reversed window, --last combined with
+        # --since, and a bad --last are INVALID_PARAMS errors —
+        # the resource-read analogue of the CLI diff's exit
+        # code 2.
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        self._write_other_run(other)
+        base = ("blackbox://session/diff?other_path=" + other)
+        for suffix in ("&since=not-a-time",
+                       "&since=2026-11-24T02:00:00Z"
+                       "&until=2026-11-24T01:00:00Z",
+                       "&last=1h&since=2026-11-24T01:00:00Z",
+                       "&last=soon"):
+            response = self.server.handle_message(
+                _request(2, "resources/read",
+                         {"uri": base + suffix}))
+            self.assertEqual(response["error"]["code"], -32602,
+                             suffix)
+
+    def test_resources_read_session_diff_template_window(self):
+        # The window rides in the query string after the
+        # template path too: last=1h keeps every step, so the
+        # template diff is the unwindowed one.
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        self._write_other_run(other, query="other",
+                              extra=True, error_result=True)
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/diff/" + other
+                            + "?last=1h"}))
+        diff = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(diff["run_a"], {"steps": 4, "tokens": 1690})
+        self.assertEqual(diff["run_b"], {"steps": 5, "tokens": 1690})
+        self.assertFalse(diff["identical"])
+        self.assertEqual([c["position"] for c in diff["changed"]],
+                         [1, 2])
+
     def test_resources_read_session_diff_template_encoded_path(self):
         # A path with a space, percent-encoded in the URI, is
         # decoded before the log is read.

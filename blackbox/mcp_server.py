@@ -150,7 +150,8 @@ import sys
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .aggregates import cost_totals, format_aggregates, session_aggregates
+from .aggregates import (_window_records, cost_totals, format_aggregates,
+                        session_aggregates)
 from .compact import _parse_ts, compact_log
 from .costs import cost_for
 from .otel import session_span
@@ -315,7 +316,14 @@ RESOURCES = [
                         "Read it as blackbox://session/diff"
                         "?other_path=<path to the other run's log "
                         "(.jsonl or .db)>; without other_path the "
-                        "read is an error."),
+                        "read is an error. The same --since / --until "
+                        "/ --last window as `blackbox diff` rides in "
+                        "the query string too, e.g. "
+                        "?other_path=<path>&since=2026-11-24T01:00:00Z"
+                        "&until=2026-11-24T02:00:00Z, and narrows "
+                        "both runs before they are compared; a bad "
+                        "bound, a reversed window, or --last combined "
+                        "with --since / --until is an error."),
         "mimeType": "application/json",
     },
 ]
@@ -362,7 +370,14 @@ RESOURCE_TEMPLATES = [
                         "exposes. Read it by expanding the template "
                         "with the other run's log path (.jsonl or "
                         ".db), e.g. blackbox://session/diff/"
-                        "data/run-b.jsonl."),
+                        "data/run-b.jsonl. The same --since / --until "
+                        "/ --last window as `blackbox diff` rides in "
+                        "the query string after the path, e.g. "
+                        "blackbox://session/diff/data/run-b.jsonl"
+                        "?since=2026-11-24T01:00:00Z, and narrows "
+                        "both runs before they are compared; a bad "
+                        "bound, a reversed window, or --last combined "
+                        "with --since / --until is an error."),
         "mimeType": "application/json",
     },
     {
@@ -1403,7 +1418,8 @@ class MCPServer:
             return "No steps recorded yet."
         return format_aggregates(agg)
 
-    def _read_diff(self, msg_id, uri, other_path):
+    def _read_diff(self, msg_id, uri, other_path, last=None, since=None,
+                   until=None):
         """The session-vs-other-run diff as a resource read.
 
         One implementation for both ways of naming the other run:
@@ -1412,7 +1428,17 @@ class MCPServer:
         `session_diff` from replay.py — the same diff the
         summarize_diff prompt summarises — so the template, the
         prompt and the resource always agree, and an unpriced call
-        costs None, never a guessed number.
+        costs None, never a guessed number. last / since / until
+        are the same --last / --since / --until window as
+        `blackbox diff`, applied to both runs through the shared
+        `_window_records` before they are compared position by
+        position, so a step outside the window cannot make the
+        runs look different; the summary and checkpoint records
+        are kept untouched, like the CLI diff. A bad bound, a
+        reversed window, or --last combined with --since / --until
+        raises ValueError in `_window_records` and is an
+        INVALID_PARAMS error here — the resource-read analogue of
+        the CLI diff's exit code 2.
         """
         try:
             records_a = load_records(self.log_path)
@@ -1421,6 +1447,13 @@ class MCPServer:
             return _error(msg_id, INVALID_PARAMS,
                           "cannot read the other run's log %r: %s"
                           % (other_path, exc))
+        try:
+            records_a = _window_records(records_a, last=last,
+                                        since=since, until=until)
+            records_b = _window_records(records_b, last=last,
+                                        since=since, until=until)
+        except ValueError as exc:
+            return _error(msg_id, INVALID_PARAMS, str(exc))
         diff = session_diff(
             records_a, records_b,
             default_model_a=self.recorder.model)
@@ -1685,8 +1718,11 @@ class MCPServer:
             # A resource read takes no arguments, so the other
             # run's log path rides in the URI as a query
             # parameter: blackbox://session/diff?other_path=...
-            other_path = parse_qs(
-                urlparse(uri).query).get("other_path", [None])[0]
+            # The --since / --until / --last window rides there
+            # too, e.g. ?other_path=...&since=2026-11-24T01:00:00Z,
+            # and narrows both runs before they are compared.
+            query = parse_qs(urlparse(uri).query)
+            other_path = query.get("other_path", [None])[0]
             if not other_path:
                 return _error(
                     msg_id, INVALID_PARAMS,
@@ -1694,23 +1730,36 @@ class MCPServer:
                     "query parameter: the path of the second run's "
                     "log, e.g. blackbox://session/diff"
                     "?other_path=data/run-b.jsonl")
-            return self._read_diff(msg_id, uri, other_path)
+            return self._read_diff(
+                msg_id, uri, other_path,
+                last=query.get("last", [None])[0],
+                since=query.get("since", [None])[0],
+                until=query.get("until", [None])[0])
         if uri.startswith("blackbox://session/diff/"):
             # The resource template blackbox://session/diff/
             # {other_path}: the other run's log path is the URI
             # path after the prefix, percent-decoded — an absolute
             # path keeps its leading slash, so
             # blackbox://session/diff//tmp/run-b.jsonl names
-            # /tmp/run-b.jsonl.
+            # /tmp/run-b.jsonl. The --since / --until / --last
+            # window rides in the query string after the path,
+            # e.g. .../run-b.jsonl?since=2026-11-24T01:00:00Z,
+            # so it is split off before the path is decoded.
+            path_part, _, query_text = uri.partition("?")
             other_path = unquote(
-                uri[len("blackbox://session/diff/"):])
+                path_part[len("blackbox://session/diff/"):])
             if not other_path:
                 return _error(
                     msg_id, INVALID_PARAMS,
                     "blackbox://session/diff/{other_path} needs the "
                     "other run's log path in the URI, e.g. "
                     "blackbox://session/diff/data/run-b.jsonl")
-            return self._read_diff(msg_id, uri, other_path)
+            query = parse_qs(query_text)
+            return self._read_diff(
+                msg_id, uri, other_path,
+                last=query.get("last", [None])[0],
+                since=query.get("since", [None])[0],
+                until=query.get("until", [None])[0])
         return _error(msg_id, INVALID_PARAMS,
                       "unknown resource: %r" % (uri,))
 

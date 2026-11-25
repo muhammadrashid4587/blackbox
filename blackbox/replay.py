@@ -16,7 +16,9 @@ both runs are printed at the end.
 `replay` takes the same --since / --until / --last window as
 `blackbox query` and `blackbox trace`, through the shared
 `_window_records` — a transcript can be narrowed to a window the
-same way the trace can.
+same way the trace can. `diff` takes the same window too, applied
+to both runs before they are compared, so two runs can be compared
+over the same window.
 """
 
 import json
@@ -303,10 +305,35 @@ def session_diff(records_a, records_b, default_model_a=None,
             "errors_b": sum(1 for r in steps_b if _is_error(r))}
 
 
-def diff(path_a, path_b):
-    """Compare two runs. Returns a dict of findings, and prints a report."""
-    records_a = load_records(path_a)
-    records_b = load_records(path_b)
+def diff(path_a, path_b, last=None, since=None, until=None, now=None):
+    """Compare two runs. Returns a dict of findings, and prints a report.
+
+    last is a relative window — a duration string like "10m" or a
+    timedelta — keeping only steps from the last that long, as a
+    lower bound of now minus the duration (now defaults to the
+    current UTC time, and is a parameter so tests can fix it); a
+    value that is not a duration raises ValueError. since / until
+    are ISO 8601 timestamps with a timezone, keeping only steps in
+    the closed window [since, until], the same window as `blackbox
+    query --since` / `--until`; a value that does not parse or
+    carries no timezone raises ValueError, as does --since after
+    --until, and --last cannot be combined with --since or --until.
+    The window is applied to both runs through the shared
+    `_window_records`, before the runs are compared position by
+    position, so a step outside the window cannot make the runs
+    look different, and a step whose timestamp does not parse, or
+    carries no timezone, never matches. The summary and checkpoint
+    records are kept untouched — they are bookkeeping about the
+    whole log, not just the window. Works on .jsonl logs and .db
+    stores.
+    """
+    # Deferred: aggregates imports load_records from this module,
+    # so importing it at the top would be circular.
+    from .aggregates import _window_records
+    records_a = _window_records(load_records(path_a), last=last,
+                                since=since, until=until, now=now)
+    records_b = _window_records(load_records(path_b), last=last,
+                                since=since, until=until, now=now)
     findings = diff_records(records_a, records_b)
     steps_a = [r for r in records_a if r["type"] != "summary"]
     steps_b = [r for r in records_b if r["type"] != "summary"]

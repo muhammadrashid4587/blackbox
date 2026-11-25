@@ -5,6 +5,7 @@
     python -m blackbox replay data/run.jsonl --since 2026-11-24T01:00:00Z --until 2026-11-24T02:00:00Z
     python -m blackbox replay data/run.jsonl --last 10m  # recent steps only
     python -m blackbox diff data/run-a.jsonl data/run-b.jsonl
+    python -m blackbox diff data/run-a.jsonl data/run-b.jsonl --since 2026-11-24T01:00:00Z --until 2026-11-24T02:00:00Z
     python -m blackbox mcp data/run.jsonl   # MCP server on stdio
     python -m blackbox record data/run.jsonl --type tool_call \
         --payload '{"tool": "search", "args": {"query": "mcp"}}'
@@ -198,6 +199,17 @@ def main(argv=None):
     p_diff = sub.add_parser("diff", help="compare two runs of the same task")
     p_diff.add_argument("log_a")
     p_diff.add_argument("log_b")
+    p_diff.add_argument("--last", help="keep steps from the last "
+                        "this long, e.g. 10m, 2h, 1d, 1h30m "
+                        "(the same relative window as query --last)")
+    p_diff.add_argument("--since", help="keep steps at or after "
+                        "this ISO timestamp (with a timezone, e.g. "
+                        "2026-11-24T01:00:00Z; the same window as "
+                        "query --since)")
+    p_diff.add_argument("--until", help="keep steps at or before "
+                        "this ISO timestamp (with a timezone, e.g. "
+                        "2026-11-24T01:00:00Z; the same window as "
+                        "query --until)")
 
     p_mcp = sub.add_parser("mcp", help="serve blackbox over MCP on stdio")
     p_mcp.add_argument("logfile")
@@ -525,7 +537,15 @@ def main(argv=None):
             return 2
         return 0
     if args.command == "diff":
-        diff(args.log_a, args.log_b)
+        try:
+            diff(args.log_a, args.log_b, last=args.last,
+                 since=args.since, until=args.until)
+        except ValueError as exc:
+            # A bad --last value, a bad --since / --until value,
+            # --since after --until, or --last combined with --since /
+            # --until.
+            print("diff: %s" % exc, file=sys.stderr)
+            return 2
         return 0
     if args.command == "mcp":
         serve_stdio(args.logfile, task=args.task, model=args.model)

@@ -433,5 +433,223 @@ class ReplayWindowTest(unittest.TestCase):
                                    "--until", "2026-11-22T10:01:00Z"]), 2)
 
 
+def _write_named(directory, name, records):
+    """Write records as a named .jsonl log and return its path."""
+    import json
+    path = os.path.join(directory, name)
+    with open(path, "w") as handle:
+        for record in records:
+            handle.write(json.dumps(record) + "\n")
+    return path
+
+
+def _changed_records(seq, payload):
+    """The demo records with one step's payload replaced."""
+    records = _demo_records()
+    records[seq] = _record(seq, records[seq]["type"], payload,
+                           records[seq]["ts"])
+    return records
+
+
+class DiffWindowTest(unittest.TestCase):
+    def test_since_until_hides_change_outside_window(self):
+        import io
+        from contextlib import redirect_stdout
+        # Run B changes only the first step, at 10:00, outside the
+        # 10:02-10:04 window — inside the window the runs match.
+        records_b = _changed_records(
+            0, {"model": "gpt-5", "prompt": "different plan"})
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path_a = _write_log(d)
+            path_b = _write_named(d, "run-b.jsonl", records_b)
+            with redirect_stdout(buf):
+                findings = diff(path_a, path_b,
+                                since="2026-11-22T10:02:00Z",
+                                until="2026-11-22T10:04:00Z")
+        self.assertEqual(findings["changed"], [])
+        self.assertEqual(findings["added"], [])
+        self.assertEqual(findings["removed"], [])
+        self.assertIn("IDENTICAL", buf.getvalue())
+        # Without the window the same two runs do differ.
+        with tempfile.TemporaryDirectory() as d:
+            path_a = _write_log(d)
+            path_b = _write_named(d, "run-b.jsonl", records_b)
+            with redirect_stdout(io.StringIO()):
+                findings = diff(path_a, path_b)
+        self.assertEqual(findings["changed"], [0])
+
+    def test_since_until_flags_change_inside_window(self):
+        import io
+        from contextlib import redirect_stdout
+        # Run B changes the step at 10:03, inside the window: it is
+        # the second step of the windowed runs (seqs 2, 3, 4).
+        records_b = _changed_records(
+            3, {"model": "gpt-5", "prompt": "different summary"})
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path_a = _write_log(d)
+            path_b = _write_named(d, "run-b.jsonl", records_b)
+            with redirect_stdout(buf):
+                findings = diff(path_a, path_b,
+                                since="2026-11-22T10:02:00Z",
+                                until="2026-11-22T10:04:00Z")
+        self.assertEqual(findings["changed"], [1])
+        self.assertIn("CHANGED step 1:", buf.getvalue())
+        # The token totals count the windowed steps only: run B's
+        # changed step carries no tokens, same as run A's.
+        self.assertEqual(findings["tokens_a"], findings["tokens_b"])
+
+    def test_last_keeps_only_recent_steps(self):
+        import io
+        from contextlib import redirect_stdout
+        from datetime import datetime, timezone
+        # Run B changes the step at 10:01, outside the last 3m.
+        records_b = _changed_records(
+            1, {"tool": "search", "args": {"q": "other"}})
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path_a = _write_log(d)
+            path_b = _write_named(d, "run-b.jsonl", records_b)
+            now = datetime(2026, 11, 22, 10, 6, tzinfo=timezone.utc)
+            with redirect_stdout(buf):
+                findings = diff(path_a, path_b, last="3m", now=now)
+        self.assertEqual(findings["changed"], [])
+        self.assertIn("IDENTICAL", buf.getvalue())
+
+    def test_bad_last_value_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            path_a = _write_log(d)
+            path_b = _write_named(d, "run-b.jsonl", _demo_records())
+            with self.assertRaises(ValueError):
+                diff(path_a, path_b, last="soon")
+
+    def test_since_after_until_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            path_a = _write_log(d)
+            path_b = _write_named(d, "run-b.jsonl", _demo_records())
+            with self.assertRaises(ValueError):
+                diff(path_a, path_b,
+                     since="2026-11-22T10:05:00Z",
+                     until="2026-11-22T10:01:00Z")
+
+    def test_last_combined_with_since_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            path_a = _write_log(d)
+            path_b = _write_named(d, "run-b.jsonl", _demo_records())
+            with self.assertRaises(ValueError):
+                diff(path_a, path_b, last="10m",
+                     since="2026-11-22T10:00:00Z")
+
+    def test_step_with_unparseable_timestamp_never_matches(self):
+        import io
+        from contextlib import redirect_stdout
+        # Both runs carry a step with an unparseable timestamp, with
+        # different payloads — it is dropped from both, so the runs
+        # still compare identical.
+        bad_a = _record(99, "tool_call", {"tool": "search"}, "not-a-time")
+        bad_b = _record(99, "tool_call", {"tool": "other"}, "not-a-time")
+        records_a = _demo_records()
+        records_a.insert(3, bad_a)
+        records_b = _demo_records()
+        records_b.insert(3, bad_b)
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path_a = _write_named(d, "run-a.jsonl", records_a)
+            path_b = _write_named(d, "run-b.jsonl", records_b)
+            with redirect_stdout(buf):
+                findings = diff(path_a, path_b,
+                                since="2026-11-22T10:00:00Z")
+        self.assertEqual(findings["changed"], [])
+        self.assertNotIn("[99]", buf.getvalue())
+
+    def test_checkpoint_kept_outside_window(self):
+        import io
+        from contextlib import redirect_stdout
+        # An identical checkpoint at 10:00, outside the window, is
+        # kept in both runs — it still compares equal and does not
+        # shift the windowed steps out of alignment.
+        checkpoint = _record(7, "checkpoint",
+                             {"compacted_count": 2,
+                              "head_hash": "a" * 64,
+                              "kept_count": 5}, "2026-11-22T10:00:00Z")
+        records_a = _demo_records() + [checkpoint]
+        records_b = _changed_records(
+            3, {"model": "gpt-5", "prompt": "different summary"})
+        records_b = records_b + [checkpoint]
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path_a = _write_named(d, "run-a.jsonl", records_a)
+            path_b = _write_named(d, "run-b.jsonl", records_b)
+            with redirect_stdout(buf):
+                findings = diff(path_a, path_b,
+                                since="2026-11-22T10:02:00Z",
+                                until="2026-11-22T10:04:00Z")
+        # Windowed steps are seqs 2, 3, 4 plus the kept checkpoint;
+        # the changed step is still the second windowed step.
+        self.assertEqual(findings["changed"], [1])
+
+    def test_window_works_on_sqlite_store(self):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path_a = os.path.join(d, "run-a.db")
+            path_b = os.path.join(d, "run-b.db")
+            with Recorder(path_a) as rec:
+                rec.record("model_call", {"model": "gpt-5",
+                                          "prompt": "plan"},
+                           ts="2026-11-22T10:00:00Z")
+                rec.record("tool_call", {"tool": "search",
+                                         "args": {"q": "x"}},
+                           ts="2026-11-22T10:01:00Z")
+                rec.record("tool_result", {"tool": "search",
+                                           "result": "ok"},
+                           ts="2026-11-22T10:02:00Z")
+            with Recorder(path_b) as rec:
+                rec.record("model_call", {"model": "gpt-5",
+                                          "prompt": "plan"},
+                           ts="2026-11-22T10:00:00Z")
+                rec.record("tool_call", {"tool": "search",
+                                         "args": {"q": "y"}},
+                           ts="2026-11-22T10:01:00Z")
+                rec.record("tool_result", {"tool": "search",
+                                           "result": "ok"},
+                           ts="2026-11-22T10:02:00Z")
+            # The only difference is at 10:01, outside the window.
+            with redirect_stdout(buf):
+                findings = diff(path_a, path_b,
+                                since="2026-11-22T10:02:00Z")
+        self.assertEqual(findings["changed"], [])
+        self.assertIn("IDENTICAL", buf.getvalue())
+
+    def test_cli_diff_window_and_bad_window_exit_code(self):
+        import io
+        from contextlib import redirect_stdout
+        from blackbox.__main__ import main
+        records_b = _changed_records(
+            0, {"model": "gpt-5", "prompt": "different plan"})
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path_a = _write_log(d)
+            path_b = _write_named(d, "run-b.jsonl", records_b)
+            with redirect_stdout(buf):
+                self.assertEqual(main(["diff", path_a, path_b,
+                                       "--since", "2026-11-22T10:02:00Z",
+                                       "--until", "2026-11-22T10:04:00Z"]),
+                                 0)
+            self.assertIn("IDENTICAL", buf.getvalue())
+            self.assertEqual(main(["diff", path_a, path_b,
+                                   "--last", "soon"]), 2)
+            self.assertEqual(main(["diff", path_a, path_b,
+                                   "--last", "10m",
+                                   "--since", "2026-11-22T10:00:00Z"]), 2)
+            self.assertEqual(main(["diff", path_a, path_b,
+                                   "--since", "2026-11-22T10:05:00Z",
+                                   "--until", "2026-11-22T10:01:00Z"]), 2)
+            self.assertEqual(main(["diff", path_a, path_b,
+                                   "--since", "not-a-time"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

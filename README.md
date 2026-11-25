@@ -556,7 +556,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 515 tests, all passing (`make test`).
+- 533 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1089,8 +1089,27 @@ and `max_records` counts printed steps, not skipped ones.
   (a duration string or a timedelta for --last, with `now` fixable
   for tests). Works on `.jsonl` logs and `.db` stores, done
   (v0.53.0).
-  Next: `--since` / `--until` time-range filters for `blackbox
-  diff`, so two runs can be compared over the same window.
+- Diff time-range filters: `blackbox diff --since
+  2026-11-22T10:02:00Z --until 2026-11-22T10:04:00Z` (and
+  `--last 10m`) narrow the comparison to an absolute or relative
+  window — the same closed window as `blackbox query --since` /
+  `--until`, through the shared `_window_records` from
+  `aggregates.py`, so a value that does not parse or carries no
+  timezone is an error, exit code 2, --since after --until is an
+  error, exit code 2, --last cannot be combined with --since or
+  --until, exit code 2, and a step whose timestamp does not parse,
+  or carries no timezone, never matches. The window is applied to
+  both runs before they are compared position by position, so a
+  step outside the window cannot make the runs look different.
+  The summary and checkpoint records are kept untouched, so the
+  comparison still runs over the whole log's bookkeeping, not
+  just the window's. `diff` in `replay.py` takes the same filters
+  as a Python API (a duration string or a timedelta for --last,
+  with `now` fixable for tests). Works on `.jsonl` logs and `.db`
+  stores, done (v0.54.0).
+  Next: `--since` / `--until` time-range filters for the
+  `blackbox://session/diff` MCP resource, so the MCP diff can be
+  narrowed to the same window as the CLI diff.
 
 ## Layout
 
@@ -1174,5 +1193,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            523 tests, all passing
+tests/            533 tests, all passing
 ```

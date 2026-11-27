@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from blackbox import Recorder
 from blackbox.mcp_server import MCPServer
-from blackbox.otel import records_to_spans, session_span
+from blackbox.otel import records_to_spans, session_span, span_window
 from blackbox.replay import load_records
 from blackbox.verify import verify
 
@@ -2251,6 +2251,85 @@ class MCPServerTest(unittest.TestCase):
             response = self.server.handle_message(
                 _request(2, "resources/read", {"uri": uri}))
             self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_span_template_window_around_seq(self):
+        # With ?before= / ?after= the template returns a bounded
+        # window of consecutive spans around the step — the same
+        # window dict the blackbox_span tool returns and span_window
+        # builds — clamped at the session's ends, in log order.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/span/1"
+                            "?before=1&after=2"}))
+        content = response["result"]["contents"][0]
+        self.assertEqual(content["uri"],
+                         "blackbox://session/span/1?before=1&after=2")
+        window = json.loads(content["text"])
+        self.assertEqual(window["seq"], 1)
+        self.assertEqual((window["before"], window["after"]), (1, 2))
+        self.assertEqual(window["count"], 4)
+        self.assertEqual(window["total"], 4)
+        self.assertEqual([int(s["spanId"], 16) for s in window["spans"]],
+                         [0, 1, 2, 3])
+        records = load_records(self.path)
+        self.assertEqual(window,
+                         span_window(records, 1, before=1, after=2))
+        tool = self._span(7, {"seq": 1, "before": 1, "after": 2})
+        self.assertEqual(window, tool)
+        # Clamped at the start: no step before 0.
+        response = self.server.handle_message(
+            _request(8, "resources/read",
+                     {"uri": "blackbox://session/span/0?before=5"}))
+        window = json.loads(response["result"]["contents"][0]["text"])
+        self.assertEqual([int(s["spanId"], 16) for s in window["spans"]],
+                         [0])
+        self.assertEqual(window["count"], 1)
+
+    def test_resources_read_session_span_template_window_with_causal(self):
+        # ?before= / ?after= combine with ?causal=true: the window
+        # spans take their parents from the causal trace
+        # reconstruction, the same window the blackbox_span tool
+        # returns with causal true.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/span/2"
+                            "?before=1&after=1&causal=true"}))
+        window = json.loads(response["result"]["contents"][0]["text"])
+        self.assertTrue(window["causal"])
+        self.assertEqual([int(s["spanId"], 16) for s in window["spans"]],
+                         [1, 2, 3])
+        # The tool_result hangs off the tool_call it answers.
+        spans = {int(s["spanId"], 16): s for s in window["spans"]}
+        self.assertEqual(spans[2]["parentSpanId"], "%016x" % 1)
+        attrs = {a["key"]: a["value"]
+                 for a in spans[2]["attributes"]}
+        self.assertTrue(attrs["blackbox.causal_parent"]["boolValue"])
+        tool = self._span(7, {"seq": 2, "before": 1, "after": 1,
+                              "causal": True})
+        self.assertEqual(window, tool)
+
+    def test_resources_read_session_span_template_window_bad_value_is_an_error(self):
+        self._init()
+        self._record_session()
+        for uri in ("blackbox://session/span/2?before=abc",
+                    "blackbox://session/span/2?before=-1",
+                    "blackbox://session/span/2?after=1.5",
+                    "blackbox://session/span/2?before=60&after=60"):
+            response = self.server.handle_message(
+                _request(2, "resources/read", {"uri": uri}))
+            self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_span_template_window_unknown_seq_is_an_error(self):
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/span/99?before=1"}))
+        self.assertEqual(response["error"]["code"], -32602)
 
     def test_resources_read_unknown_uri_is_an_error(self):
         self._init()

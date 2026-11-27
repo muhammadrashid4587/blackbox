@@ -127,7 +127,12 @@ templates, and nine prompts:
                               exporting the whole trace; with
                               `?causal=true` the span's parent comes
                               from the causal trace reconstruction
-                              instead of the hash chain
+                              instead of the hash chain, and with
+                              `?before=` / `?after=` it returns a
+                              bounded window of consecutive spans
+                              around the step instead — the same
+                              window dict the blackbox_span tool
+                              returns
     analyze_session           a prompt template for analysing the
                               session (optional focus argument)
     summarize_costs           a prompt template for summarising the
@@ -813,10 +818,15 @@ RESOURCE_TEMPLATES = [
                         "reconstruction instead of the hash chain "
                         "— the same parent `blackbox trace` prints "
                         "for the step — and the span carries a "
-                        "`blackbox.causal_parent` attribute. Read "
-                        "it by expanding the template with a step "
-                        "number, e.g. "
-                        "blackbox://session/span/2."),
+                        "`blackbox.causal_parent` attribute. With "
+                        "`?before=` / `?after=` in the query string "
+                        "it returns a bounded window of consecutive "
+                        "spans around the step instead — the same "
+                        "window dict the `blackbox_span` tool "
+                        "returns — clamped at the session's ends "
+                        "and at most 100 spans. Read it by "
+                        "expanding the template with a step number, "
+                        "e.g. blackbox://session/span/2."),
         "mimeType": "application/json",
     },
 ]
@@ -2498,7 +2508,8 @@ class MCPServer:
             {"uri": uri, "mimeType": "text/plain",
              "text": text}]})
 
-    def _read_span(self, msg_id, uri, seq_text, causal=None):
+    def _read_span(self, msg_id, uri, seq_text, causal=None,
+                   before=None, after=None):
         """One step as a single OTLP span, as a resource read.
 
         One implementation for the blackbox://session/span/{seq}
@@ -2516,10 +2527,18 @@ class MCPServer:
         and the span carries a `blackbox.causal_parent`
         attribute, the same span the `blackbox span --causal` CLI
         command and the `blackbox_span` tool with `causal` true
-        return for that step. A step number that is not an
-        integer, a step the session does not have, a step with
-        no usable timestamp, or a `causal` value that is not
-        true/false, is an error.
+        return for that step. With `before` / `after` in the
+        query string the template returns a bounded window of
+        consecutive spans around the step instead — the same
+        window dict `span_window` in otel.py builds for the
+        `blackbox span` CLI command and the `blackbox_span`
+        tool, so the template, the tool and the command always
+        agree — clamped at the session's ends and at most 100
+        spans. A step number that is not an integer, a step the
+        session does not have, a step with no usable timestamp,
+        a `causal` value that is not true/false, or a `before` /
+        `after` value that is not a non-negative integer (or a
+        window over 100 spans), is an error.
         """
         if causal is None:
             causal_flag = False
@@ -2532,6 +2551,23 @@ class MCPServer:
                 msg_id, INVALID_PARAMS,
                 "blackbox://session/span/{seq} 'causal' must be "
                 "'true' or 'false'")
+        window_flags = {}
+        for flag, value in (("before", before), ("after", after)):
+            if value is None:
+                continue
+            try:
+                parsed = int(value)
+            except ValueError:
+                return _error(
+                    msg_id, INVALID_PARAMS,
+                    "blackbox://session/span/{seq} %r must be a "
+                    "non-negative integer" % flag)
+            if parsed < 0:
+                return _error(
+                    msg_id, INVALID_PARAMS,
+                    "blackbox://session/span/{seq} %r must be a "
+                    "non-negative integer" % flag)
+            window_flags[flag] = parsed
         try:
             seq = int(unquote(seq_text))
         except ValueError:
@@ -2540,6 +2576,16 @@ class MCPServer:
                 "blackbox://session/span/{seq} needs a step number, "
                 "e.g. blackbox://session/span/2")
         records = load_records(self.log_path)
+        if window_flags:
+            try:
+                window = span_window(
+                    records, seq, causal=causal_flag, **window_flags)
+            except ValueError as exc:
+                return _error(msg_id, INVALID_PARAMS, str(exc))
+            text = json.dumps(window, indent=2, sort_keys=True)
+            return _result(msg_id, {"contents": [
+                {"uri": uri, "mimeType": "application/json",
+                 "text": text}]})
         try:
             span = session_span(records, seq, causal=causal_flag)
         except ValueError as exc:
@@ -2714,8 +2760,14 @@ class MCPServer:
             # the step number as the span id and the step kind as
             # the span name. The `causal` flag rides in the query
             # string after the step number, e.g.
-            # blackbox://session/span/2?causal=true, so it is
-            # split off before the step number is parsed.
+            # blackbox://session/span/2?causal=true, and so do
+            # `before` / `after`, e.g.
+            # blackbox://session/span/2?before=1&after=1, which
+            # returns a bounded window of consecutive spans
+            # around the step instead of the single span — the
+            # same window dict the blackbox_span tool returns —
+            # so they are split off before the step number is
+            # parsed.
             seq_part, _, query_text = uri.partition("?")
             seq_text = seq_part[len("blackbox://session/span/"):]
             if not seq_text:
@@ -2726,7 +2778,9 @@ class MCPServer:
             query = parse_qs(query_text)
             return self._read_span(
                 msg_id, uri, seq_text,
-                causal=query.get("causal", [None])[0])
+                causal=query.get("causal", [None])[0],
+                before=query.get("before", [None])[0],
+                after=query.get("after", [None])[0])
         if uri.startswith("blackbox://session/trace/"):
             # The resource template blackbox://session/trace/{seq}:
             # the subtree rooted at step seq, the same node the

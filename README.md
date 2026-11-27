@@ -391,7 +391,12 @@ timestamps, and a USD cost attribute on a priced model_call,
 never a guessed number — with `?causal=true` the span's parent
 comes from the causal trace reconstruction instead of the hash
 chain, the same parent `blackbox trace` prints for the step, and
-the span carries a `blackbox.causal_parent` attribute). Each
+the span carries a `blackbox.causal_parent` attribute — and with
+`?before=` / `?after=` in the query string it returns a bounded
+window of consecutive spans around the step instead, the same
+window dict the `blackbox_span` tool returns, clamped at the
+session's ends and at most 100 spans, so the template, the tool
+and the `blackbox span` command always agree). Each
 reuses the same computation as the resource or report it mirrors,
 so the template and the original always agree; a step number that
 is not an integer, or a step the session does not have, is an
@@ -709,7 +714,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 652 tests, all passing (`make test`).
+- 656 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1608,10 +1613,22 @@ and `max_records` counts printed steps, not skipped ones.
   parent, unchanged, and a value that is not true/false is an
   INVALID_PARAMS error. Works on `.jsonl` logs and `.db`
   stores, done (v0.74.0).
-  Next: window flags for the `blackbox://session/span/{seq}`
-  template, so a client can read a window of spans around a
-  step — `?before=` / `?after=` in the query string — the
-  same way the CLI and the `blackbox_span` tool can.
+- Window flags for the `blackbox://session/span/{seq}`
+  template: reading `blackbox://session/span/2?before=1&after=1`
+  returns a bounded window of consecutive spans around the step —
+  the same window dict `span_window` from `otel.py` builds for the
+  `blackbox span` CLI command and the `blackbox_span` MCP tool, so
+  the template, the tool and the command always agree — in log
+  order, clamped at the session's ends and at most 100 spans,
+  combining with `?causal=true` the same way the tool does; with
+  no window flags the template still returns the single span,
+  byte for byte as before. A `before` / `after` value that is not
+  a non-negative integer, a window over 100 spans, or a step the
+  session does not have is an INVALID_PARAMS error. Works on
+  `.jsonl` logs and `.db` stores, done (v0.75.0).
+  Next: window flags for the `blackbox://session/record/{seq}`
+  template, so a client can read a window of raw records around
+  a step the same way the template serves one record.
 
 ## Layout
 
@@ -1674,7 +1691,8 @@ blackbox/
                   `blackbox span` CLI command (`format_span` prints
                   it as a readable report); `span_window` builds a
                   bounded window of spans around one step, shared by
-                  the CLI and the blackbox_span MCP tool, with
+                  the CLI, the blackbox_span MCP tool and the
+                  blackbox://session/span/{seq} template, with
                   --causal parents from the causal trace
                   reconstruction
   live_export.py  live OTLP export: POST spans to a collector over
@@ -1707,5 +1725,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            652 tests, all passing
+tests/            656 tests, all passing
 ```

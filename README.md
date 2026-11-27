@@ -203,7 +203,14 @@ exposes three tools: `blackbox_record` (append one step — same
 redaction, hash chain and fsync as the library), `blackbox_verify`
 (check the chain) and `blackbox_replay` (read the transcript back).
 The session is also readable as five resources:
-`blackbox://session` (the transcript), `blackbox://session.json`
+`blackbox://session` (the transcript — the same `--since` /
+`--until` / `--last` window as `blackbox replay` rides in the
+query string too, e.g.
+`blackbox://session?since=2026-11-24T01:00:00Z
+&until=2026-11-24T02:00:00Z`, and narrows the session before
+the transcript is built; a bad bound, a reversed window, or
+`--last` combined with `--since` / `--until` is an error),
+`blackbox://session.json`
 (the raw records, hash chain included),
 `blackbox://session/aggregates` (the session totals as JSON —
 step count and duration, per-type and per-tool counts, per-model
@@ -579,7 +586,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 546 tests, all passing (`make test`).
+- 549 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1199,6 +1206,25 @@ and `max_records` counts printed steps, not skipped ones.
   untouched, so `sampled_out` and `compacted_count` still
   describe the whole log, not just the window. Works on `.jsonl`
   logs and `.db` stores, done (v0.58.0).
+- Transcript resource time-range filters:
+  `blackbox://session` takes the same `--since` / `--until` /
+  `--last` window as `blackbox replay`, as query parameters —
+  e.g. `blackbox://session?since=2026-11-24T01:00:00Z&until=
+  2026-11-24T02:00:00Z` — through the shared `_window_records`
+  from `aggregates.py`, so a value that does not parse or carries
+  no timezone is an error, --since after --until is an error, and
+  --last cannot be combined with --since or --until is an error
+  (an INVALID_PARAMS error on a resource read, exit code 2 on the
+  CLI), and a step whose timestamp does not parse, or carries no
+  timezone, never matches. The window is applied to the session
+  before the transcript is built, so a step outside the window
+  cannot change it. The summary and checkpoint records are kept
+  untouched, so the transcript still ends with the whole log's
+  totals, not just the window's. Works on `.jsonl` logs and `.db`
+  stores, done (v0.59.0).
+  Next: the same window for the `blackbox://session.json` raw
+  records resource, so a client reading the records directly can
+  narrow them to a window too.
 
 ## Layout
 
@@ -1282,5 +1308,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            546 tests, all passing
+tests/            549 tests, all passing
 ```

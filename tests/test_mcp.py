@@ -187,6 +187,61 @@ class MCPServerTest(unittest.TestCase):
         self.assertIn("tool_call", content["text"])
         self.assertIn("search", content["text"])
 
+    def test_resources_read_session_transcript_window_last(self):
+        # The same --last window as `blackbox replay --last`: the
+        # session was recorded just now, so last=1h keeps every
+        # step and the transcript is the unwindowed one. The
+        # server is closed first, so the summary record exists
+        # and the transcript ends with the whole log's totals.
+        self._init()
+        self._record_session()
+        self.server.close()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session?last=1h"}))
+        text = response["result"]["contents"][0]["text"]
+        self.assertIn("tool_call", text)
+        self.assertIn("search", text)
+        self.assertIn("model_call", text)
+        self.assertIn("events: 4", text)
+
+    def test_resources_read_session_transcript_window_since_excludes_all(self):
+        # A --since window after every step drops the session to
+        # zero steps, so the transcript holds only the summary line
+        # — the steps outside the window cannot change it — while
+        # the summary record is kept untouched, so the transcript
+        # still ends with the whole log's totals.
+        self._init()
+        self._record_session()
+        self.server.close()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session"
+                            "?since=2999-01-01T00:00:00Z"}))
+        text = response["result"]["contents"][0]["text"]
+        self.assertNotIn("tool_call", text)
+        self.assertNotIn("model_call", text)
+        self.assertIn("events: 4", text)
+
+    def test_resources_read_session_transcript_window_bad_bounds_are_errors(self):
+        # A bad bound, a reversed window, --last combined with
+        # --since, and a bad --last are INVALID_PARAMS errors —
+        # the resource-read analogue of the CLI replay's exit
+        # code 2.
+        self._init()
+        self._record_session()
+        base = "blackbox://session"
+        for suffix in ("?since=not-a-time",
+                       "?since=2026-11-24T02:00:00Z"
+                       "&until=2026-11-24T01:00:00Z",
+                       "?last=1h&since=2026-11-24T01:00:00Z",
+                       "?last=soon"):
+            response = self.server.handle_message(
+                _request(2, "resources/read",
+                         {"uri": base + suffix}))
+            self.assertEqual(response["error"]["code"], -32602,
+                             suffix)
+
     def test_resources_read_session_json(self):
         self._init()
         _call(self.server, 2, "blackbox_record",

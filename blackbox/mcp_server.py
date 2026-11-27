@@ -14,7 +14,13 @@ three tools:
 It also exposes the session as five resources, six resource
 templates, and eight prompts:
 
-    blackbox://session        the session as a readable transcript
+    blackbox://session        the session as a readable transcript,
+                              the same transcript `blackbox replay`
+                              prints — the same --since / --until /
+                              --last window as `blackbox replay`
+                              rides in the query string too, and
+                              narrows the session before the
+                              transcript is built
     blackbox://session.json   the session's records as JSON
     blackbox://session/aggregates
                               the session's totals as JSON, the same
@@ -282,7 +288,15 @@ RESOURCES = [
         "uri": "blackbox://session",
         "name": "session",
         "description": ("The recorded session as a readable transcript, "
-                        "one step per line, like `blackbox replay`."),
+                        "one step per line, like `blackbox replay`. The "
+                        "same --since / --until / --last window as "
+                        "`blackbox replay` rides in the query string too, "
+                        "e.g. blackbox://session"
+                        "?since=2026-11-24T01:00:00Z"
+                        "&until=2026-11-24T02:00:00Z, and narrows the "
+                        "session before the transcript is built; a bad "
+                        "bound, a reversed window, or --last combined "
+                        "with --since / --until is an error."),
         "mimeType": "text/plain",
     },
     {
@@ -941,8 +955,24 @@ class MCPServer:
         })
         return self._tool_result(msg_id, result.text)
 
-    def _transcript(self):
-        records = load_records(self.log_path)
+    def _transcript(self, last=None, since=None, until=None):
+        """The session as a readable transcript, one step per line.
+
+        last / since / until are the same --last / --since /
+        --until window as `blackbox replay`, applied to the session
+        through the shared `_window_records` before the transcript
+        is built, so a step outside the window cannot change it;
+        the summary and checkpoint records are kept untouched, like
+        the CLI replay, so the transcript still ends with the whole
+        log's totals. A bad bound, a reversed window, or --last
+        combined with --since / --until raises ValueError — an
+        INVALID_PARAMS error on a resource read, the resource-read
+        analogue of the CLI replay's exit code 2. With no window
+        arguments this is the unwindowed transcript the tools and
+        prompts use.
+        """
+        records = _window_records(load_records(self.log_path),
+                                  last=last, since=since, until=until)
         return "\n".join(format_record(r) for r in records)
 
     def _model_usage(self, records, default_model=None):
@@ -1672,8 +1702,28 @@ class MCPServer:
 
     def _resources_read(self, msg_id, params):
         uri = params.get("uri")
-        if uri == "blackbox://session":
-            text = self._transcript()
+        if (uri == "blackbox://session"
+                or uri.startswith("blackbox://session?")):
+            # The --since / --until / --last window rides in the
+            # query string, e.g. blackbox://session
+            # ?since=2026-11-24T01:00:00Z, and narrows the session
+            # through the shared _window_records before the
+            # transcript is built, so a step outside the window
+            # cannot change it; the summary and checkpoint records
+            # are kept untouched, like the CLI replay, so the
+            # transcript still ends with the whole log's totals. A
+            # bad bound, a reversed window, or --last combined with
+            # --since / --until is an INVALID_PARAMS error — the
+            # resource-read analogue of the CLI replay's exit
+            # code 2.
+            query = parse_qs(urlparse(uri).query)
+            try:
+                text = self._transcript(
+                    last=query.get("last", [None])[0],
+                    since=query.get("since", [None])[0],
+                    until=query.get("until", [None])[0])
+            except ValueError as exc:
+                return _error(msg_id, INVALID_PARAMS, str(exc))
             return _result(msg_id, {"contents": [
                 {"uri": uri, "mimeType": "text/plain", "text": text}]})
         if uri == "blackbox://session.json":

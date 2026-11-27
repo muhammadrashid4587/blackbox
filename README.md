@@ -211,7 +211,15 @@ query string too, e.g.
 the transcript is built; a bad bound, a reversed window, or
 `--last` combined with `--since` / `--until` is an error),
 `blackbox://session.json`
-(the raw records, hash chain included),
+(the raw records, hash chain included), and the same `--since` /
+`--until` / `--last` window as `blackbox replay` rides in the
+query string too, e.g.
+`blackbox://session.json?since=2026-11-24T01:00:00Z
+&until=2026-11-24T02:00:00Z`, and narrows the records before
+they are returned; a bad bound, a reversed window, or `--last`
+combined with `--since` / `--until` is an error — the summary
+and checkpoint records are kept untouched, so the bookkeeping
+still describes the whole log, not just the window,
 `blackbox://session/aggregates` (the session totals as JSON —
 step count and duration, per-type and per-tool counts, per-model
 tokens and cost, error steps, the slowest step, and how many
@@ -586,7 +594,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 549 tests, all passing (`make test`).
+- 552 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1222,9 +1230,30 @@ and `max_records` counts printed steps, not skipped ones.
   untouched, so the transcript still ends with the whole log's
   totals, not just the window's. Works on `.jsonl` logs and `.db`
   stores, done (v0.59.0).
-  Next: the same window for the `blackbox://session.json` raw
-  records resource, so a client reading the records directly can
-  narrow them to a window too.
+- Raw records resource time-range filters:
+  `blackbox://session.json` takes the same `--since` / `--until`
+  / `--last` window as `blackbox replay`, as query parameters —
+  e.g. `blackbox://session.json?since=2026-11-24T01:00:00Z&until=
+  2026-11-24T02:00:00Z` — through the shared `_window_records`
+  from `aggregates.py`, so a value that does not parse or carries
+  no timezone is an error, --since after --until is an error, and
+  --last cannot be combined with --since or --until is an error
+  (an INVALID_PARAMS error on a resource read, exit code 2 on the
+  CLI), and a step whose timestamp does not parse, or carries no
+  timezone, never matches. The window is applied to the records
+  before they are returned, so a step outside the window cannot
+  change them. The summary and checkpoint records are kept
+  untouched, so the bookkeeping still describes the whole log,
+  not just the window. Works on `.jsonl` logs and `.db` stores,
+  done (v0.60.0).
+  With this, every session resource that returns a set of steps
+  takes the window — `blackbox://session`, `blackbox://
+  session.json`, `blackbox://session/aggregates`, `blackbox://
+  session/trace`, `blackbox://session/diff` and the diff and
+  trace templates. The single-slice templates (`record/{seq}`,
+  `transcript/{seq}`, `span/{seq}`, `aggregates/model/{model}`,
+  `aggregates/tool/{tool}`) return one step or one slice, so
+  there is no window to apply there.
 
 ## Layout
 

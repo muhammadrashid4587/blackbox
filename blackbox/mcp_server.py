@@ -21,7 +21,12 @@ templates, and eight prompts:
                               rides in the query string too, and
                               narrows the session before the
                               transcript is built
-    blackbox://session.json   the session's records as JSON
+    blackbox://session.json   the session's raw records as JSON,
+                              hash chain included — the same
+                              --since / --until / --last window as
+                              `blackbox replay` rides in the query
+                              string too, and narrows the records
+                              before they are returned
     blackbox://session/aggregates
                               the session's totals as JSON, the same
                               totals `blackbox aggregates` prints —
@@ -303,7 +308,18 @@ RESOURCES = [
         "uri": "blackbox://session.json",
         "name": "session.json",
         "description": ("The recorded session's raw records as a JSON "
-                        "array, hash chain included."),
+                        "array, hash chain included. The same --since / "
+                        "--until / --last window as `blackbox replay` "
+                        "rides in the query string too, e.g. "
+                        "blackbox://session.json"
+                        "?since=2026-11-24T01:00:00Z"
+                        "&until=2026-11-24T02:00:00Z, and narrows the "
+                        "records before they are returned; the summary "
+                        "and checkpoint records are kept untouched, so "
+                        "the bookkeeping still describes the whole "
+                        "log. A bad bound, a reversed window, or "
+                        "--last combined with --since / --until is an "
+                        "error."),
         "mimeType": "application/json",
     },
     {
@@ -1726,8 +1742,29 @@ class MCPServer:
                 return _error(msg_id, INVALID_PARAMS, str(exc))
             return _result(msg_id, {"contents": [
                 {"uri": uri, "mimeType": "text/plain", "text": text}]})
-        if uri == "blackbox://session.json":
+        if (uri == "blackbox://session.json"
+                or uri.startswith("blackbox://session.json?")):
+            # The --since / --until / --last window rides in the
+            # query string, e.g. blackbox://session.json
+            # ?since=2026-11-24T01:00:00Z, and narrows the records
+            # through the shared _window_records before they are
+            # returned, so a step outside the window cannot change
+            # them; the summary and checkpoint records are kept
+            # untouched, like the CLI replay, so the bookkeeping
+            # still describes the whole log. A bad bound, a reversed
+            # window, or --last combined with --since / --until is
+            # an INVALID_PARAMS error — the resource-read analogue
+            # of the CLI replay's exit code 2.
             records = load_records(self.log_path)
+            query = parse_qs(urlparse(uri).query)
+            try:
+                records = _window_records(
+                    records,
+                    last=query.get("last", [None])[0],
+                    since=query.get("since", [None])[0],
+                    until=query.get("until", [None])[0])
+            except ValueError as exc:
+                return _error(msg_id, INVALID_PARAMS, str(exc))
             text = json.dumps(records, indent=2, sort_keys=True)
             return _result(msg_id, {"contents": [
                 {"uri": uri, "mimeType": "application/json",

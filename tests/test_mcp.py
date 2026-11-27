@@ -71,7 +71,8 @@ class MCPServerTest(unittest.TestCase):
             _request(2, "tools/list"))
         names = [t["name"] for t in response["result"]["tools"]]
         self.assertEqual(names, ["blackbox_record", "blackbox_verify",
-                                 "blackbox_replay", "blackbox_sample"])
+                                 "blackbox_replay", "blackbox_query",
+                                 "blackbox_sample"])
         for tool in response["result"]["tools"]:
             self.assertIn("inputSchema", tool)
 
@@ -111,6 +112,99 @@ class MCPServerTest(unittest.TestCase):
         text = response["result"]["content"][0]["text"]
         self.assertIn("tool_call", text)
         self.assertIn("search", text)
+
+    def _query(self, msg_id, arguments):
+        response = _call(self.server, msg_id, "blackbox_query", arguments)
+        self.assertNotIn("error", response)
+        self.assertFalse(response["result"]["isError"])
+        return json.loads(response["result"]["content"][0]["text"])
+
+    def _seed_query_log(self):
+        """Three steps with timestamps an hour ago: a priced gpt-5 call,
+        an unpriced call for another model, and a failing tool result."""
+        from datetime import timedelta
+        base = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._t0 = base.isoformat().replace("+00:00", "Z")
+        self._t1 = (base + timedelta(minutes=1)).isoformat().replace(
+            "+00:00", "Z")
+        self._t2 = (base + timedelta(minutes=2)).isoformat().replace(
+            "+00:00", "Z")
+        rec = self.server.recorder
+        rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                   tokens={"input": 1200, "output": 340}, ts=self._t0)
+        rec.record("model_call", {"model": "other-model", "prompt": "hi"},
+                   tokens=50, ts=self._t1)
+        rec.record("tool_result",
+                   {"tool": "search", "result": "error: timeout"},
+                   ts=self._t2)
+
+    def test_query_tool_filters_by_model(self):
+        self._init()
+        self._seed_query_log()
+        result = self._query(2, {"model": "GPT-5"})
+        self.assertEqual(result["matched"], 1)
+        self.assertEqual(result["total"], 3)
+        self.assertEqual(result["tokens"], 1540)
+        self.assertAlmostEqual(result["cost_usd"], 0.0049, places=6)
+        self.assertEqual(result["unpriced"], 0)
+        self.assertEqual(result["records"][0]["payload"]["model"], "gpt-5")
+
+    def test_query_tool_filters_by_tool_and_errors_only(self):
+        self._init()
+        self._seed_query_log()
+        result = self._query(2, {"tool": "search", "errorsOnly": True})
+        self.assertEqual(result["matched"], 1)
+        self.assertEqual(result["records"][0]["type"], "tool_result")
+        result = self._query(3, {"errorsOnly": True})
+        self.assertEqual(result["matched"], 1)
+
+    def test_query_tool_min_cost_skips_unpriced_calls(self):
+        self._init()
+        self._seed_query_log()
+        result = self._query(2, {"minCost": 0.001})
+        self.assertEqual(result["matched"], 1)
+        self.assertEqual(result["records"][0]["payload"]["model"], "gpt-5")
+        result = self._query(3, {"minCost": 1.0})
+        self.assertEqual(result["matched"], 0)
+        self.assertEqual(result["records"], [])
+        self.assertIsNone(result["cost_usd"])
+
+    def test_query_tool_time_window(self):
+        self._init()
+        self._seed_query_log()
+        result = self._query(2, {"since": self._t1, "until": self._t2})
+        self.assertEqual(result["matched"], 2)
+        result = self._query(3, {"last": "1d"})
+        self.assertEqual(result["matched"], 3)
+
+    def test_query_tool_excludes_summary_unless_asked(self):
+        self._init()
+        self._seed_query_log()
+        self.server.close()
+        result = self._query(2, {})
+        self.assertEqual(result["matched"], 3)
+        self.assertEqual(result["total"], 3)
+        result = self._query(3, {"type": ["summary"]})
+        self.assertEqual(result["matched"], 1)
+        self.assertEqual(result["records"][0]["type"], "summary")
+
+    def test_query_tool_rejects_bad_arguments(self):
+        self._init()
+        self._seed_query_log()
+        for arguments in (
+                {"since": "2026-11-24T01:00:00"},  # no timezone
+                {"since": "2026-11-24T02:00:00Z",
+                 "until": "2026-11-24T01:00:00Z"},  # reversed
+                {"last": "10x"},  # not a duration
+                {"last": "10m", "since": "2026-11-24T01:00:00Z"},
+                {"type": "model_call"},  # must be a list
+                {"minTokens": "100"},  # must be an int
+                {"minCost": "0.01"},  # must be a number
+                {"errorsOnly": "yes"},  # must be a boolean
+        ):
+            response = _call(self.server, 2, "blackbox_query", arguments)
+            self.assertEqual(response["error"]["code"], -32602,
+                             arguments)
 
     def test_unknown_tool_is_an_error(self):
         self._init()

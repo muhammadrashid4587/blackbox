@@ -199,9 +199,17 @@ the run's cost under the summary.
 **MCP server.** `python -m blackbox mcp data/run.jsonl` starts a
 minimal MCP server on stdio (newline-delimited JSON-RPC 2.0, no
 dependencies), so any MCP client can record through blackbox. It
-exposes three tools: `blackbox_record` (append one step — same
+exposes four tools: `blackbox_record` (append one step — same
 redaction, hash chain and fsync as the library), `blackbox_verify`
-(check the chain) and `blackbox_replay` (read the transcript back).
+(check the chain), `blackbox_replay` (read the transcript back)
+and `blackbox_query` (filter the session's steps — by type, model,
+tool, minimum tokens, minimum USD cost, errors only, and time range
+— the same filter as `blackbox query`, returning the matching raw
+records as JSON with the match count, token total and priced cost
+total; a bad bound, a reversed window, `--last` combined with
+`--since` / `--until`, or a wrongly typed argument is an
+INVALID_PARAMS error, the tool-call analogue of the CLI's exit
+code 2).
 The session is also readable as five resources:
 `blackbox://session` (the transcript — the same `--since` /
 `--until` / `--last` window as `blackbox replay` rides in the
@@ -594,7 +602,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 552 tests, all passing (`make test`).
+- 558 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1254,6 +1262,21 @@ and `max_records` counts printed steps, not skipped ones.
   `transcript/{seq}`, `span/{seq}`, `aggregates/model/{model}`,
   `aggregates/tool/{tool}`) return one step or one slice, so
   there is no window to apply there.
+- MCP query tool: `blackbox_query` filters the session's steps
+  from an MCP client — by type, model, tool, minimum tokens,
+  minimum USD cost, errors only, and `--since` / `--until` /
+  `--last` — the same filter as `blackbox query`, through the
+  shared `query_records` from `query.py`, so the tool and the
+  command always agree: filters combine with AND, the summary is
+  excluded unless "summary" is in the type list, a model_call
+  with a plain int token count or an unknown model has no cost
+  and never matches `minCost`. It returns the matching raw
+  records as JSON with the match count, token total, priced cost
+  total and how many matched model calls were unpriced — the same
+  footer the CLI prints. A bad bound, a reversed window,
+  `--last` combined with `--since` / `--until`, or a wrongly
+  typed argument is an INVALID_PARAMS error, the tool-call
+  analogue of the CLI's exit code 2, done (v0.61.0).
 
 ## Layout
 
@@ -1263,8 +1286,8 @@ blackbox/
                   head-based span sampling (sample_rate, seeded RNG)
   sqlite_store.py SQLite store: same records, same chain, WAL + synchronous=FULL
   costs.py        per-model cost tracking: list prices, cost math
-  mcp_server.py   MCP server on stdio: record / verify / replay tools,
-                  session resources, resource templates for the
+  mcp_server.py   MCP server on stdio: record / verify / replay /
+                  query tools, session resources, resource templates for the
                   diff, a trace subtree, aggregates slices, one
                   step's raw record, one step's transcript line and
                   one step's OTLP span, analyze_session,
@@ -1337,5 +1360,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            549 tests, all passing
+tests/            558 tests, all passing
 ```

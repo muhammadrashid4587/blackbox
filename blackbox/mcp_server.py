@@ -5,11 +5,12 @@ A minimal MCP server over stdio, speaking newline-delimited JSON-RPC
 library, like the rest of blackbox.
 
 The server holds one Recorder open on the configured log and exposes
-three tools:
+four tools:
 
     blackbox_record   append one step to the log
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
+    blackbox_query    filter the log's steps, like `blackbox query`
 
 It also exposes the session as five resources, six resource
 templates, and eight prompts:
@@ -176,7 +177,8 @@ from .aggregates import (_window_records, cost_totals, format_aggregates,
 from .compact import _parse_ts, compact_log
 from .costs import cost_for
 from .otel import session_span
-from .recorder import Recorder
+from .query import _parse_bound, _record_cost, query_records
+from .recorder import Recorder, _tokens_total
 from .redact import REDACTED
 from .replay import (_short, diff_records, format_record, load_records,
                     model_usage, session_diff)
@@ -240,6 +242,51 @@ TOOLS = [
         "name": "blackbox_replay",
         "description": "Read the log back as a readable transcript.",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "blackbox_query",
+        "description": ("Filter the log's steps, like `blackbox query`: "
+                        "by type, model, tool, minimum tokens, minimum "
+                        "USD cost, errors only, and time range. Returns "
+                        "the matching steps as JSON, with the match "
+                        "count, token total and priced cost total."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "type": {"type": "array",
+                         "items": {"type": "string"},
+                         "description": "Step types to keep, e.g. "
+                                        "[\"model_call\", \"tool_call\"]"},
+                "model": {"type": "string",
+                          "description": "model_call steps for this "
+                                         "model (case-insensitive)"},
+                "tool": {"type": "string",
+                         "description": "tool_call / tool_result steps "
+                                        "for this tool (case-insensitive)"},
+                "minTokens": {"type": "integer",
+                              "description": "Keep steps with at least "
+                                             "this many tokens"},
+                "minCost": {"type": "number",
+                            "description": "Keep model_call steps costing "
+                                           "at least this many USD"},
+                "errorsOnly": {"type": "boolean",
+                               "description": "Keep only steps that look "
+                                              "like errors"},
+                "since": {"type": "string",
+                          "description": "Keep steps at or after this "
+                                         "ISO 8601 timestamp with a "
+                                         "timezone"},
+                "until": {"type": "string",
+                          "description": "Keep steps at or before this "
+                                         "ISO 8601 timestamp with a "
+                                         "timezone"},
+                "last": {"type": "string",
+                         "description": "Keep steps from the last this "
+                                        "long, a duration like 10m — "
+                                        "cannot be combined with since "
+                                        "or until"},
+            },
+        },
     },
     {
         "name": "blackbox_sample",
@@ -891,6 +938,8 @@ class MCPServer:
             return self._tool_verify(msg_id)
         if name == "blackbox_replay":
             return self._tool_replay(msg_id)
+        if name == "blackbox_query":
+            return self._tool_query(msg_id, arguments)
         if name == "blackbox_sample":
             return self._tool_sample(msg_id, arguments)
         return _error(msg_id, INVALID_PARAMS, "unknown tool: %r" % (name,))
@@ -928,6 +977,93 @@ class MCPServer:
 
     def _tool_replay(self, msg_id):
         return self._tool_result(msg_id, self._transcript())
+
+    def _tool_query(self, msg_id, arguments):
+        """Filter the session's steps, like `blackbox query`.
+
+        The same filter as the CLI — `query_records` from query.py —
+        so the tool and the command always agree: filters combine
+        with AND, the summary is excluded unless "summary" is in
+        type, a model_call with a plain int token count or an unknown
+        model has no cost and never matches minCost. Tool arguments
+        use the MCP wire names (camelCase); query_records takes
+        snake_case. A bad bound, a reversed window, --last combined
+        with --since / --until, or a wrongly typed argument is an
+        INVALID_PARAMS error, the tool-call analogue of the CLI's
+        exit code 2. The result is JSON: the matching raw records
+        plus the match count, token total, priced cost total and how
+        many matched model calls were unpriced — the same footer the
+        CLI prints.
+        """
+        types = arguments.get("type")
+        if types is not None:
+            if (not isinstance(types, list)
+                    or not all(isinstance(t, str) for t in types)):
+                return _error(msg_id, INVALID_PARAMS,
+                              "blackbox_query 'type' must be a list of "
+                              "strings")
+        model = arguments.get("model")
+        if model is not None and not isinstance(model, str):
+            return _error(msg_id, INVALID_PARAMS,
+                          "blackbox_query 'model' must be a string")
+        tool = arguments.get("tool")
+        if tool is not None and not isinstance(tool, str):
+            return _error(msg_id, INVALID_PARAMS,
+                          "blackbox_query 'tool' must be a string")
+        min_tokens = arguments.get("minTokens")
+        if min_tokens is not None and (isinstance(min_tokens, bool)
+                                       or not isinstance(min_tokens, int)):
+            return _error(msg_id, INVALID_PARAMS,
+                          "blackbox_query 'minTokens' must be an integer")
+        min_cost = arguments.get("minCost")
+        if min_cost is not None and (isinstance(min_cost, bool)
+                                     or not isinstance(min_cost, (int, float))):
+            return _error(msg_id, INVALID_PARAMS,
+                          "blackbox_query 'minCost' must be a number")
+        errors_only = arguments.get("errorsOnly", False)
+        if not isinstance(errors_only, bool):
+            return _error(msg_id, INVALID_PARAMS,
+                          "blackbox_query 'errorsOnly' must be a boolean")
+        since = arguments.get("since")
+        until = arguments.get("until")
+        last = arguments.get("last")
+        for flag, value in (("--since", since), ("--until", until),
+                            ("--last", last)):
+            if value is not None and not isinstance(value, str):
+                return _error(msg_id, INVALID_PARAMS,
+                              "blackbox_query %r must be a string"
+                              % flag)
+        try:
+            since_dt = (_parse_bound(since, "--since")
+                        if since is not None else None)
+            until_dt = (_parse_bound(until, "--until")
+                        if until is not None else None)
+            if (since_dt is not None and until_dt is not None
+                    and since_dt > until_dt):
+                raise ValueError("--since must not be after --until")
+            records = load_records(self.log_path)
+            matched = query_records(
+                records, types=types, model=model, tool=tool,
+                min_tokens=min_tokens, min_cost=min_cost,
+                errors_only=errors_only, since=since, until=until,
+                last=last)
+        except ValueError as exc:
+            return _error(msg_id, INVALID_PARAMS, str(exc))
+        steps = [r for r in records if r["type"] != "summary"]
+        total_tokens = sum(_tokens_total(r.get("tokens"))
+                           for r in matched)
+        costs = [_record_cost(r) for r in matched]
+        priced = [c for c in costs if c is not None]
+        unpriced = sum(1 for r, c in zip(matched, costs)
+                       if r["type"] == "model_call" and c is None)
+        return self._tool_result(msg_id, json.dumps({
+            "matched": len(matched),
+            "total": len(steps),
+            "tokens": total_tokens,
+            "cost_usd": sum(priced) if priced else None,
+            "unpriced": unpriced,
+            "records": matched,
+        }, indent=2, sort_keys=True))
 
     def _tool_sample(self, msg_id, arguments):
         messages = arguments.get("messages")

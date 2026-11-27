@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from blackbox import Recorder
 from blackbox.mcp_server import MCPServer
 from blackbox.otel import records_to_spans, session_span, span_window
-from blackbox.replay import load_records
+from blackbox.replay import load_records, show_window
 from blackbox.verify import verify
 
 
@@ -1977,6 +1977,107 @@ class MCPServerTest(unittest.TestCase):
         response = self.server.handle_message(
             _request(2, "resources/read",
                      {"uri": "blackbox://session/record/"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_record_template_window_around_seq(self):
+        # With ?before= / ?after= the template returns a bounded
+        # window of consecutive records around the step — the same
+        # window dict show_window builds for `blackbox show` —
+        # clamped at the session's ends, in log order.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/record/1"
+                            "?before=1&after=2"}))
+        content = response["result"]["contents"][0]
+        self.assertEqual(content["uri"],
+                         "blackbox://session/record/1?before=1&after=2")
+        self.assertEqual(content["mimeType"], "application/json")
+        window = json.loads(content["text"])
+        self.assertEqual(window["seq"], 1)
+        self.assertEqual((window["before"], window["after"]), (1, 2))
+        self.assertEqual(window["count"], 4)
+        records = load_records(self.path)
+        self.assertEqual(window["total"], len(records))
+        self.assertEqual([r["seq"] for r in window["records"]],
+                         [0, 1, 2, 3])
+        self.assertEqual(window,
+                         show_window(records, 1, before=1, after=2))
+        # Clamped at the start: no record before 0.
+        response = self.server.handle_message(
+            _request(8, "resources/read",
+                     {"uri": "blackbox://session/record/0?before=5"}))
+        window = json.loads(response["result"]["contents"][0]["text"])
+        self.assertEqual([r["seq"] for r in window["records"]], [0])
+        self.assertEqual(window["count"], 1)
+
+    def test_resources_read_session_record_template_window_with_since_until(self):
+        # With ?since= / ?until= the session is narrowed first
+        # through the same window as `blackbox show`, so a step
+        # the window dropped is not in the session.
+        self._init()
+        self._record_session()
+        records = load_records(self.path)
+        since = records[0]["ts"]
+        until = records[1]["ts"]
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/record/1"
+                            "?before=1&after=1&since=%s&until=%s"
+                            % (since, until)}))
+        window = json.loads(response["result"]["contents"][0]["text"])
+        self.assertEqual([r["seq"] for r in window["records"]],
+                         [0, 1])
+        self.assertEqual(window, show_window(
+            records, 1, before=1, after=1, since=since, until=until))
+        # Step 2 fell outside the window: not in the session.
+        response = self.server.handle_message(
+            _request(7, "resources/read",
+                     {"uri": "blackbox://session/record/2"
+                            "?before=1&since=%s&until=%s"
+                            % (since, until)}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_record_template_window_with_last(self):
+        # With ?last= the session is narrowed to the recent past,
+        # the same relative window as `blackbox show --last`.
+        self._init()
+        self._record_session()
+        records = load_records(self.path)
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/record/1"
+                            "?before=1&after=1&last=1d"}))
+        window = json.loads(response["result"]["contents"][0]["text"])
+        self.assertEqual([r["seq"] for r in window["records"]],
+                         [0, 1, 2])
+        self.assertEqual(window, show_window(
+            records, 1, before=1, after=1, last="1d"))
+
+    def test_resources_read_session_record_template_window_bad_value_is_an_error(self):
+        self._init()
+        self._record_session()
+        for uri in ("blackbox://session/record/2?before=abc",
+                    "blackbox://session/record/2?before=-1",
+                    "blackbox://session/record/2?after=1.5",
+                    "blackbox://session/record/2?before=60&after=60",
+                    "blackbox://session/record/2?since=not-a-time",
+                    "blackbox://session/record/2"
+                    "?since=2026-11-24T02:00:00Z"
+                    "&until=2026-11-24T01:00:00Z",
+                    "blackbox://session/record/2"
+                    "?last=1h&since=2026-11-24T01:00:00Z"):
+            response = self.server.handle_message(
+                _request(2, "resources/read", {"uri": uri}))
+            self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_record_template_window_unknown_seq_is_an_error(self):
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/record/99?before=1"}))
         self.assertEqual(response["error"]["code"], -32602)
 
     def test_resources_read_session_transcript_template(self):

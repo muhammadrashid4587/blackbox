@@ -104,7 +104,14 @@ templates, and nine prompts:
                               JSON — the same record the
                               blackbox://session.json resource
                               carries for that step, so a client can
-                              read one step without the whole log
+                              read one step without the whole log;
+                              with `?before=` / `?after=` it returns
+                              a bounded window of consecutive records
+                              around the step instead — the same
+                              window dict `blackbox show` returns —
+                              and with `?since=` / `?until=` / `?last=`
+                              the session is narrowed first, so a step
+                              the window dropped is not in the session
     blackbox://session/transcript/{seq}
                               one step's formatted transcript line
                               as a resource template: the line the
@@ -211,7 +218,8 @@ from .recorder import Recorder, _tokens_total
 from .redact import REDACTED
 from .replay import (_short, diff_records, format_record, load_records,
                     model_usage, session_diff, session_record,
-                    session_transcript_step, transcript_window)
+                    session_transcript_step, show_window,
+                    transcript_window)
 from .sampling import (Sampler, SamplingDeclinedError, SamplingError,
                        SamplingNotSupportedError, StdioTransport)
 from .tail_sampling import (_is_error, _span_durations_ms,
@@ -779,7 +787,16 @@ RESOURCE_TEMPLATES = [
                         "same record the blackbox://session.json "
                         "resource carries for that step, so a "
                         "client can read one step without the whole "
-                        "log. Read it by expanding the template "
+                        "log. With `?before=` / `?after=` in the "
+                        "query string it returns a bounded window "
+                        "of consecutive records around the step "
+                        "instead — the same window dict the "
+                        "`blackbox show` command returns — clamped "
+                        "at the session's ends and at most 100 "
+                        "records, and with `?since=` / `?until=` / "
+                        "`?last=` the session is narrowed first, so "
+                        "a step the window dropped is not in the "
+                        "session. Read it by expanding the template "
                         "with a step number, e.g. "
                         "blackbox://session/record/2."),
         "mimeType": "application/json",
@@ -2452,7 +2469,8 @@ class MCPServer:
             {"uri": uri, "mimeType": "application/json",
              "text": text}]})
 
-    def _read_record(self, msg_id, uri, seq_text):
+    def _read_record(self, msg_id, uri, seq_text, before=None,
+                     after=None, since=None, until=None, last=None):
         """One step's raw record, as a resource read.
 
         One implementation for the blackbox://session/record/{seq}
@@ -2460,9 +2478,41 @@ class MCPServer:
         the same record the blackbox://session.json resource
         carries for that step, and the same helper the `blackbox
         show` command calls, so the template, the resource and
-        the command always agree. A step number that is not an
-        integer, or a step the session does not have, is an error.
+        the command always agree. With `before` / `after` in the
+        query string the template returns a bounded window of
+        consecutive records around the step instead — the same
+        window dict `show_window` in replay.py builds for the
+        `blackbox show` command, so the template and the command
+        always agree — clamped at the session's ends and at most
+        100 records, and with `since` / `until` / `last` the
+        session is narrowed first, so a step the window dropped
+        is not in the session. A step number that is not an
+        integer, a step the session does not have, a `before` /
+        `after` value that is not a non-negative integer (or a
+        window over 100 records), a bad bound, a reversed window,
+        or --last combined with --since / --until, is an error.
         """
+        window_flags = {}
+        for flag, value in (("before", before), ("after", after)):
+            if value is None:
+                continue
+            try:
+                parsed = int(value)
+            except ValueError:
+                return _error(
+                    msg_id, INVALID_PARAMS,
+                    "blackbox://session/record/{seq} %r must be a "
+                    "non-negative integer" % flag)
+            if parsed < 0:
+                return _error(
+                    msg_id, INVALID_PARAMS,
+                    "blackbox://session/record/{seq} %r must be a "
+                    "non-negative integer" % flag)
+            window_flags[flag] = parsed
+        for flag, value in (("since", since), ("until", until),
+                            ("last", last)):
+            if value is not None:
+                window_flags[flag] = value
         try:
             seq = int(unquote(seq_text))
         except ValueError:
@@ -2471,6 +2521,15 @@ class MCPServer:
                 "blackbox://session/record/{seq} needs a step number, "
                 "e.g. blackbox://session/record/2")
         records = load_records(self.log_path)
+        if window_flags:
+            try:
+                window = show_window(records, seq, **window_flags)
+            except ValueError as exc:
+                return _error(msg_id, INVALID_PARAMS, str(exc))
+            text = json.dumps(window, indent=2, sort_keys=True)
+            return _result(msg_id, {"contents": [
+                {"uri": uri, "mimeType": "application/json",
+                 "text": text}]})
         record = session_record(records, seq)
         if record is None:
             return _error(msg_id, INVALID_PARAMS,
@@ -2733,13 +2792,29 @@ class MCPServer:
             # The resource template blackbox://session/record/{seq}:
             # one step's raw record as JSON, the same record the
             # blackbox://session.json resource carries for that step.
-            seq_text = uri[len("blackbox://session/record/"):]
+            # The window flags ride in the query string after the
+            # step number, e.g.
+            # blackbox://session/record/2?before=1&after=1, which
+            # returns a bounded window of consecutive records
+            # around the step instead of the single record — the
+            # same window dict the `blackbox show` command returns —
+            # so they are split off before the step number is
+            # parsed.
+            seq_part, _, query_text = uri.partition("?")
+            seq_text = seq_part[len("blackbox://session/record/"):]
             if not seq_text:
                 return _error(
                     msg_id, INVALID_PARAMS,
                     "blackbox://session/record/{seq} needs a step "
                     "number, e.g. blackbox://session/record/2")
-            return self._read_record(msg_id, uri, seq_text)
+            query = parse_qs(query_text)
+            return self._read_record(
+                msg_id, uri, seq_text,
+                before=query.get("before", [None])[0],
+                after=query.get("after", [None])[0],
+                since=query.get("since", [None])[0],
+                until=query.get("until", [None])[0],
+                last=query.get("last", [None])[0])
         if uri.startswith("blackbox://session/transcript/"):
             # The resource template
             # blackbox://session/transcript/{seq}: one step's

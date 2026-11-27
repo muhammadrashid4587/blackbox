@@ -383,7 +383,11 @@ templates name one slice each:
 `blackbox://session/aggregates/model/{model}` and
 `blackbox://session/aggregates/tool/{tool}` (one model's or one
 tool's totals), `blackbox://session/record/{seq}` (one step's raw
-record), `blackbox://session/transcript/{seq}` (one step's
+record — with `?before=` / `?after=` in the query string it returns
+a bounded window of consecutive records around the step instead, the
+same window dict `blackbox show` returns, and with `?since=` /
+`?until=` / `?last=` the session is narrowed first, so a step the
+window dropped is not in the session), `blackbox://session/transcript/{seq}` (one step's
 formatted line), and `blackbox://session/span/{seq}` (one step as
 a single OTLP span — the step kind as the span name, the step
 number as the span id, start/end times from the record's
@@ -714,7 +718,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 656 tests, all passing (`make test`).
+- 661 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1629,6 +1633,27 @@ and `max_records` counts printed steps, not skipped ones.
   Next: window flags for the `blackbox://session/record/{seq}`
   template, so a client can read a window of raw records around
   a step the same way the template serves one record.
+- Window flags for the `blackbox://session/record/{seq}`
+  template: reading `blackbox://session/record/2?before=1&after=1`
+  returns a bounded window of consecutive records around the step —
+  the same window dict `show_window` from `replay.py` builds for the
+  `blackbox show` CLI command, so the template and the command always
+  agree — in log order, clamped at the session's ends and at most 100
+  records, the summary record included when it falls in the window,
+  since it is a record in the log even though it is bookkeeping, not
+  a step; with `?since=` / `?until=` / `?last=` the session is
+  narrowed first through the shared `_window_records`, so a step the
+  window dropped is not in the session, the same window as
+  `blackbox show`; with no window flags the template still returns
+  the single record, byte for byte as before. A `before` / `after`
+  value that is not a non-negative integer, a window over 100
+  records, a step the session does not have, a bad bound, a reversed
+  window, or `--last` combined with `--since` / `--until` is an
+  INVALID_PARAMS error. Works on `.jsonl` logs and `.db` stores,
+  done (v0.76.0).
+  Next: window flags for the `blackbox://session/transcript/{seq}`
+  template, so a client can read a window of transcript lines
+  around a step the same way the template serves one line.
 
 ## Layout
 
@@ -1706,7 +1731,10 @@ blackbox/
                   for the transcript template and tool;
                   `session_record` finds one step's raw record for
                   the record template and the `blackbox show`
-                  command)
+                  command; `show_window` builds a bounded window
+                  of records around one step, shared by the
+                  `blackbox show` command and the
+                  blackbox://session/record/{seq} template)
   __main__.py     CLI: verify | replay | diff | mcp | record | otel
                   | export | metrics | tail-sample | query | trace
                   | compact | aggregates | costs | span | watch | show
@@ -1725,5 +1753,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            656 tests, all passing
+tests/            661 tests, all passing
 ```

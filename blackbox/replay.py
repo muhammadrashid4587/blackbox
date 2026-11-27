@@ -103,6 +103,25 @@ def format_record(record):
     return "%s  %s" % (header, _short(payload))
 
 
+def session_transcript_step(records, seq):
+    """One step's formatted transcript line, or None if the session
+    has no record with that seq.
+
+    The line the blackbox://session/transcript/{seq} MCP resource
+    template serves: `format_record` over the record — the same
+    line the blackbox://session resource carries for that step
+    and `blackbox replay` prints for it — so the template, the
+    resource and the replay always agree. A model_call line
+    includes its prompt line; a tool_call line its arguments;
+    a tool_result line its result. Returns None when no record
+    has that seq.
+    """
+    record = next((r for r in records if r["seq"] == seq), None)
+    if record is None:
+        return None
+    return format_record(record)
+
+
 def replay(path, last=None, since=None, until=None, now=None):
     """Print the transcript of a log. Returns the records.
 

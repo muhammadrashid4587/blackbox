@@ -199,7 +199,7 @@ the run's cost under the summary.
 **MCP server.** `python -m blackbox mcp data/run.jsonl` starts a
 minimal MCP server on stdio (newline-delimited JSON-RPC 2.0, no
 dependencies), so any MCP client can record through blackbox. It
-exposes ten tools: `blackbox_record` (append one step — same
+exposes eleven tools: `blackbox_record` (append one step — same
 redaction, hash chain and fsync as the library), `blackbox_verify`
 (check the chain), `blackbox_replay` (read the transcript back),
 `blackbox_query` (filter the session's steps — by type, model,
@@ -276,6 +276,22 @@ summary record, which is bookkeeping, not a step — a negative
 `before` / `after`, a window over 100 spans, a bad bound, a
 reversed window, `--last` combined with `--since` / `--until`, a
 wrongly typed argument, or a step with no usable timestamp is an
+INVALID_PARAMS error, the tool-call analogue of the CLI's exit
+code 2; read-only, it removes or changes nothing), and
+`blackbox_transcript` (one step's formatted transcript line —
+the same line the `blackbox://session/transcript/{seq}` template
+serves, through the shared `session_transcript_step` from
+`replay.py`, so the tool and the template always agree — or with
+`before` / `after` a bounded window of consecutive lines around
+it, in log order, clamped at the session's ends and at most 100
+lines; with `since` / `until` / `last` only the steps in that
+window, the same window as `blackbox replay` and the transcript
+resource, so a step the window dropped is not in the session; a
+missing `seq`, a `seq` that is not an integer, a step the session
+does not have — including the summary record, which is
+bookkeeping, not a step — a negative `before` / `after`, a window
+over 100 steps, a bad bound, a reversed window, `--last` combined
+with `--since` / `--until`, or a wrongly typed argument is an
 INVALID_PARAMS error, the tool-call analogue of the CLI's exit
 code 2; read-only, it removes or changes nothing).
 The session is also readable as five resources:
@@ -679,7 +695,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 591 tests, all passing (`make test`).
+- 599 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1454,9 +1470,26 @@ and `max_records` counts printed steps, not skipped ones.
   `--since` / `--until`, a wrongly typed argument, or a step with
   no usable timestamp is an INVALID_PARAMS error. Read-only: it
   removes or changes nothing, done (v0.67.0).
-  Next: an MCP transcript tool, so a client can read one step's
-  formatted line as a tool call the same way the
-  `blackbox://session/transcript/{seq}` template serves it.
+- MCP transcript tool: `blackbox_transcript` returns one step's
+  formatted transcript line as JSON — the same line
+  `session_transcript_step` from `replay.py` builds for the
+  `blackbox://session/transcript/{seq}` template, so the tool
+  and the template always agree (the line `blackbox replay`
+  prints for that step, including the prompt line of a
+  model_call) — or with `before` / `after` a bounded window of
+  consecutive lines around it, in log order, clamped at the
+  session's ends and at most 100 lines; with `since` / `until` /
+  `last` only the steps in that window, through the shared
+  `_window_records` from `aggregates.py`, the same window as
+  `blackbox replay` and the transcript resource, so a step the
+  window dropped is not in the session. A missing `seq`, a `seq`
+  that is not an integer, a step the session does not have —
+  including the summary record, which is bookkeeping, not a
+  step — a negative `before` / `after`, a window over 100
+  steps, a bad bound, a reversed window, `--last` combined with
+  `--since` / `--until`, or a wrongly typed argument is an
+  INVALID_PARAMS error. Read-only: it removes or changes
+  nothing, done (v0.68.0).
 
 ## Layout
 
@@ -1467,8 +1500,8 @@ blackbox/
   sqlite_store.py SQLite store: same records, same chain, WAL + synchronous=FULL
   costs.py        per-model cost tracking: list prices, cost math
   mcp_server.py   MCP server on stdio: record / verify / replay /
-                  query / cost / aggregates / trace / diff / span
-                  tools, session resources, resource
+                  query / cost / aggregates / trace / diff / span /
+                  transcript tools, session resources, resource
                   templates for the
                   diff, a trace subtree, aggregates slices, one
                   step's raw record, one step's transcript line and
@@ -1524,7 +1557,9 @@ blackbox/
   redact.py       redaction before write
   verify.py       replay the chain, find the first broken record
   replay.py       transcript printer + run diff (`diff_records`,
-                  `session_diff` as JSON, per-model token usage)
+                  `session_diff` as JSON, per-model token usage;
+                  `session_transcript_step` renders one step's line
+                  for the transcript template and tool)
   __main__.py     CLI: verify | replay | diff | mcp | record | otel
                   | export | metrics | tail-sample | query | trace
                   | compact | aggregates | costs | span | watch
@@ -1543,5 +1578,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            591 tests, all passing
+tests/            599 tests, all passing
 ```

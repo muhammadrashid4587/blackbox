@@ -7,7 +7,8 @@ import unittest
 
 from blackbox import Recorder
 from blackbox.replay import (diff, diff_records, load_records,
-                             model_usage, replay, session_diff)
+                             model_usage, replay, session_diff,
+                             session_transcript_step)
 
 
 def _write_run(path, tool="search", query="first", tokens=100):
@@ -41,6 +42,18 @@ class ReplayTest(unittest.TestCase):
             self.assertIn(needle, out)
         self.assertLess(out.index("plan"), out.index("search"))
         self.assertLess(out.index("search"), out.index("summarise"))
+
+    def test_session_transcript_step_returns_one_lines(self):
+        _write_run(self.path)
+        records = load_records(self.path)
+        line = session_transcript_step(records, 1)
+        self.assertIn("tool_call", line)
+        self.assertIn("search(query=first)", line)
+        # The model_call line carries its prompt line, like the
+        # transcript does.
+        self.assertIn("prompt: plan",
+                      session_transcript_step(records, 0))
+        self.assertIsNone(session_transcript_step(records, 99))
 
     def test_diff_flags_changed_tool_call(self):
         path_a = os.path.join(self.tmp.name, "a.jsonl")

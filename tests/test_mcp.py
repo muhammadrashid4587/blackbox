@@ -72,7 +72,7 @@ class MCPServerTest(unittest.TestCase):
         names = [t["name"] for t in response["result"]["tools"]]
         self.assertEqual(names, ["blackbox_record", "blackbox_verify",
                                  "blackbox_replay", "blackbox_query",
-                                 "blackbox_sample"])
+                                 "blackbox_cost", "blackbox_sample"])
         for tool in response["result"]["tools"]:
             self.assertIn("inputSchema", tool)
 
@@ -210,6 +210,82 @@ class MCPServerTest(unittest.TestCase):
         self._init()
         response = _call(self.server, 2, "blackbox_nope", {})
         self.assertEqual(response["error"]["code"], -32602)
+
+    def _cost(self, msg_id, arguments):
+        response = _call(self.server, msg_id, "blackbox_cost", arguments)
+        self.assertNotIn("error", response)
+        self.assertFalse(response["result"]["isError"])
+        return json.loads(response["result"]["content"][0]["text"])
+
+    def _seed_cost_log(self):
+        """A priced gpt-5 call invoking search, and an unpriced
+        unknown-model call invoking fetch."""
+        rec = self.server.recorder
+        rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                   tokens={"input": 1200, "output": 340})
+        rec.record("tool_call", {"tool": "search", "args": {}})
+        rec.record("model_call", {"model": "other-model", "prompt": "hi"},
+                   tokens={"input": 100, "output": 50})
+        rec.record("tool_call", {"tool": "fetch", "args": {}})
+
+    def test_cost_tool_returns_whole_breakdown(self):
+        self._init()
+        self._seed_cost_log()
+        result = self._cost(2, {})
+        self.assertAlmostEqual(result["total_cost_usd"], 0.0049,
+                               places=6)
+        self.assertEqual(result["unpriced_model_calls"], 1)
+        gpt5 = result["per_model"]["gpt-5"]
+        self.assertEqual(gpt5["calls"], 1)
+        self.assertEqual((gpt5["input_tokens"], gpt5["output_tokens"]),
+                         (1200, 340))
+        self.assertAlmostEqual(gpt5["cost_usd"], 0.0049, places=6)
+        other = result["per_model"]["other-model"]
+        self.assertIsNone(other["cost_usd"])
+        search = result["per_tool"]["search"]
+        self.assertEqual(search["calls"], 1)
+        self.assertAlmostEqual(search["cost_usd"], 0.0049, places=6)
+        self.assertEqual(search["unpriced_calls"], 0)
+        fetch = result["per_tool"]["fetch"]
+        self.assertIsNone(fetch["cost_usd"])
+        self.assertEqual(fetch["unpriced_calls"], 1)
+
+    def test_cost_tool_model_slice_matches_template(self):
+        self._init()
+        self._seed_cost_log()
+        result = self._cost(2, {"model": "gpt-5"})
+        self.assertEqual(result["model"]["model"], "gpt-5")
+        self.assertAlmostEqual(result["model"]["cost_usd"], 0.0049,
+                               places=6)
+        result = self._cost(3, {"model": "other-model"})
+        self.assertIsNone(result["model"]["cost_usd"])
+
+    def test_cost_tool_tool_slice_and_both_slices(self):
+        self._init()
+        self._seed_cost_log()
+        result = self._cost(2, {"tool": "search"})
+        self.assertEqual(result["tool"]["tool"], "search")
+        self.assertAlmostEqual(result["tool"]["cost_usd"], 0.0049,
+                               places=6)
+        result = self._cost(3, {"model": "gpt-5", "tool": "fetch"})
+        self.assertAlmostEqual(result["model"]["cost_usd"], 0.0049,
+                               places=6)
+        self.assertIsNone(result["tool"]["cost_usd"])
+
+    def test_cost_tool_rejects_unknown_and_bad_arguments(self):
+        self._init()
+        self._seed_cost_log()
+        for arguments in (
+                {"model": "no-such-model"},
+                {"tool": "no-such-tool"},
+                {"model": ""},
+                {"tool": ""},
+                {"model": 5},
+                {"tool": ["search"]},
+        ):
+            response = _call(self.server, 2, "blackbox_cost", arguments)
+            self.assertEqual(response["error"]["code"], -32602,
+                             arguments)
 
     def test_initialize_advertises_resources_and_prompts(self):
         response = self._init()

@@ -5,12 +5,14 @@ A minimal MCP server over stdio, speaking newline-delimited JSON-RPC
 library, like the rest of blackbox.
 
 The server holds one Recorder open on the configured log and exposes
-four tools:
+six tools:
 
     blackbox_record   append one step to the log
     blackbox_verify   check the log's hash chain
     blackbox_replay   read the log back as a transcript
     blackbox_query    filter the log's steps, like `blackbox query`
+    blackbox_cost     cost totals per model and per tool, like
+                      `blackbox costs`
 
 It also exposes the session as five resources, six resource
 templates, and nine prompts:
@@ -289,6 +291,25 @@ TOOLS = [
                                         "long, a duration like 10m — "
                                         "cannot be combined with since "
                                         "or until"},
+            },
+        },
+    },
+    {
+        "name": "blackbox_cost",
+        "description": ("Cost totals for the session, like `blackbox "
+                        "costs`: per-model and per-tool calls, tokens "
+                        "and USD cost. With no arguments returns the "
+                        "whole breakdown; with 'model' or 'tool' "
+                        "returns just that model's or tool's slice."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "model": {"type": "string",
+                          "description": "One model's totals only, "
+                                         "e.g. \"gpt-5\""},
+                "tool": {"type": "string",
+                         "description": "One tool's totals only, "
+                                        "e.g. \"search\""},
             },
         },
     },
@@ -977,6 +998,8 @@ class MCPServer:
             return self._tool_replay(msg_id)
         if name == "blackbox_query":
             return self._tool_query(msg_id, arguments)
+        if name == "blackbox_cost":
+            return self._tool_cost(msg_id, arguments)
         if name == "blackbox_sample":
             return self._tool_sample(msg_id, arguments)
         return _error(msg_id, INVALID_PARAMS, "unknown tool: %r" % (name,))
@@ -1101,6 +1124,59 @@ class MCPServer:
             "unpriced": unpriced,
             "records": matched,
         }, indent=2, sort_keys=True))
+
+    def _tool_cost(self, msg_id, arguments):
+        """Cost totals for the session, like `blackbox costs`.
+
+        The same computation — `cost_totals` from aggregates.py —
+        so the tool, the CLI report and the aggregates templates
+        always agree: per model the shared `model_usage` and
+        `cost_for`, so an unpriced call costs None, never a
+        guessed number; per tool the cost of the model call that
+        invoked it, by the same causal rule as `link_parents`.
+        With no arguments the whole breakdown is returned, the
+        same dict `blackbox costs --json` prints. With 'model'
+        or 'tool' only that model's or tool's slice is returned,
+        the same entry the aggregates/model and aggregates/tool
+        templates serve (`{"model": name, ...entry}`). A model or
+        tool the session does not have, an empty name, or a
+        wrongly typed argument is an INVALID_PARAMS error, the
+        tool-call analogue of the CLI's exit code 2.
+        """
+        model = arguments.get("model")
+        if model is not None and not isinstance(model, str):
+            return _error(msg_id, INVALID_PARAMS,
+                          "blackbox_cost 'model' must be a string")
+        tool = arguments.get("tool")
+        if tool is not None and not isinstance(tool, str):
+            return _error(msg_id, INVALID_PARAMS,
+                          "blackbox_cost 'tool' must be a string")
+        totals = cost_totals(load_records(self.log_path))
+        result = {}
+        if model is not None:
+            if not model:
+                return _error(msg_id, INVALID_PARAMS,
+                              "blackbox_cost 'model' must not be empty")
+            entry = totals["per_model"].get(model)
+            if entry is None:
+                return _error(msg_id, INVALID_PARAMS,
+                              "no model %r in this session" % model)
+            result["model"] = {"model": model}
+            result["model"].update(entry)
+        if tool is not None:
+            if not tool:
+                return _error(msg_id, INVALID_PARAMS,
+                              "blackbox_cost 'tool' must not be empty")
+            entry = totals["per_tool"].get(tool)
+            if entry is None:
+                return _error(msg_id, INVALID_PARAMS,
+                              "no tool %r in this session" % tool)
+            result["tool"] = {"tool": tool}
+            result["tool"].update(entry)
+        if not result:
+            result = totals
+        return self._tool_result(msg_id, json.dumps(
+            result, indent=2, sort_keys=True))
 
     def _tool_sample(self, msg_id, arguments):
         messages = arguments.get("messages")

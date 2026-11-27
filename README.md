@@ -199,17 +199,25 @@ the run's cost under the summary.
 **MCP server.** `python -m blackbox mcp data/run.jsonl` starts a
 minimal MCP server on stdio (newline-delimited JSON-RPC 2.0, no
 dependencies), so any MCP client can record through blackbox. It
-exposes four tools: `blackbox_record` (append one step — same
+exposes six tools: `blackbox_record` (append one step — same
 redaction, hash chain and fsync as the library), `blackbox_verify`
-(check the chain), `blackbox_replay` (read the transcript back)
-and `blackbox_query` (filter the session's steps — by type, model,
+(check the chain), `blackbox_replay` (read the transcript back),
+`blackbox_query` (filter the session's steps — by type, model,
 tool, minimum tokens, minimum USD cost, errors only, and time range
 — the same filter as `blackbox query`, returning the matching raw
 records as JSON with the match count, token total and priced cost
 total; a bad bound, a reversed window, `--last` combined with
 `--since` / `--until`, or a wrongly typed argument is an
 INVALID_PARAMS error, the tool-call analogue of the CLI's exit
-code 2).
+code 2), and `blackbox_cost` (cost totals per model and per tool —
+the same breakdown `blackbox costs` prints, through the shared
+`cost_totals` from `aggregates.py`, so the tool and the command
+always agree; with no arguments the whole breakdown, with
+`model` or `tool` just that model's or tool's slice, the same
+entry the aggregates/model and aggregates/tool templates serve;
+a model or tool the session does not have, an empty name, or a
+wrongly typed argument is an INVALID_PARAMS error, and an
+unpriced call costs `None`, never a guessed number).
 The session is also readable as five resources:
 `blackbox://session` (the transcript — the same `--since` /
 `--until` / `--last` window as `blackbox replay` rides in the
@@ -611,7 +619,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 563 tests, all passing (`make test`).
+- 567 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1301,6 +1309,20 @@ and `max_records` counts printed steps, not skipped ones.
   were left out; the prompt says the groups are leads, not
   verdicts, and includes the transcript so the client can see
   the failures in context, done (v0.62.0).
+- MCP cost tool: `blackbox_cost` returns the session's cost
+  totals as JSON — the whole per-model / per-tool breakdown
+  `blackbox costs` prints, or just one model's or one tool's
+  slice with a `model` / `tool` argument, the same entry the
+  aggregates/model and aggregates/tool templates serve —
+  through the shared `cost_totals` from `aggregates.py`, so
+  the tool, the command and the templates always agree (an
+  unpriced call costs None, never a guessed number); a model
+  or tool the session does not have, an empty name, or a
+  wrongly typed argument is an INVALID_PARAMS error, done
+  (v0.63.0).
+  Next: an MCP aggregates tool, so a client can read the
+  session totals as a tool call the same way `blackbox_cost`
+  serves the cost totals.
 
 ## Layout
 
@@ -1311,7 +1333,8 @@ blackbox/
   sqlite_store.py SQLite store: same records, same chain, WAL + synchronous=FULL
   costs.py        per-model cost tracking: list prices, cost math
   mcp_server.py   MCP server on stdio: record / verify / replay /
-                  query tools, session resources, resource templates for the
+                  query / cost tools, session resources, resource
+                  templates for the
                   diff, a trace subtree, aggregates slices, one
                   step's raw record, one step's transcript line and
                   one step's OTLP span, analyze_session,
@@ -1385,5 +1408,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            563 tests, all passing
+tests/            567 tests, all passing
 ```

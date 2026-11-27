@@ -199,7 +199,7 @@ the run's cost under the summary.
 **MCP server.** `python -m blackbox mcp data/run.jsonl` starts a
 minimal MCP server on stdio (newline-delimited JSON-RPC 2.0, no
 dependencies), so any MCP client can record through blackbox. It
-exposes six tools: `blackbox_record` (append one step — same
+exposes seven tools: `blackbox_record` (append one step — same
 redaction, hash chain and fsync as the library), `blackbox_verify`
 (check the chain), `blackbox_replay` (read the transcript back),
 `blackbox_query` (filter the session's steps — by type, model,
@@ -209,7 +209,7 @@ records as JSON with the match count, token total and priced cost
 total; a bad bound, a reversed window, `--last` combined with
 `--since` / `--until`, or a wrongly typed argument is an
 INVALID_PARAMS error, the tool-call analogue of the CLI's exit
-code 2), and `blackbox_cost` (cost totals per model and per tool —
+code 2), `blackbox_cost` (cost totals per model and per tool —
 the same breakdown `blackbox costs` prints, through the shared
 `cost_totals` from `aggregates.py`, so the tool and the command
 always agree; with no arguments the whole breakdown, with
@@ -217,7 +217,21 @@ always agree; with no arguments the whole breakdown, with
 entry the aggregates/model and aggregates/tool templates serve;
 a model or tool the session does not have, an empty name, or a
 wrongly typed argument is an INVALID_PARAMS error, and an
-unpriced call costs `None`, never a guessed number).
+unpriced call costs `None`, never a guessed number), and
+`blackbox_aggregates` (session totals — step count and duration,
+per-type and per-tool counts, per-model tokens and cost, error
+steps, the slowest step, and how many records an earlier
+compaction removed or sampling dropped, the same totals
+`blackbox aggregates` prints, through the shared
+`session_aggregates` over `_window_records` from
+`aggregates.py`, so the tool, the command and the
+`blackbox://session/aggregates` resource always agree; with no
+arguments the whole session, with `since` / `until` / `last`
+only the steps in that window, the same window as
+`blackbox aggregates`; a bad bound, a reversed window, `--last`
+combined with `--since` / `--until`, or a wrongly typed
+argument is an INVALID_PARAMS error, the tool-call analogue of
+the CLI's exit code 2).
 The session is also readable as five resources:
 `blackbox://session` (the transcript — the same `--since` /
 `--until` / `--last` window as `blackbox replay` rides in the
@@ -1320,9 +1334,24 @@ and `max_records` counts printed steps, not skipped ones.
   or tool the session does not have, an empty name, or a
   wrongly typed argument is an INVALID_PARAMS error, done
   (v0.63.0).
-  Next: an MCP aggregates tool, so a client can read the
-  session totals as a tool call the same way `blackbox_cost`
-  serves the cost totals.
+- MCP aggregates tool: `blackbox_aggregates` returns the session
+  totals as JSON — the same dict `blackbox aggregates --json`
+  prints, through the shared `session_aggregates` over
+  `_window_records` from `aggregates.py`, so the tool, the
+  command and the `blackbox://session/aggregates` resource always
+  agree (step count and duration, per-type and per-tool counts,
+  per-model tokens and cost, error steps, the slowest step, and
+  how many records an earlier compaction removed or sampling
+  dropped; an unpriced call costs None, never a guessed number);
+  with no arguments the whole session, with `since` / `until` /
+  `last` only the steps in that window, the same window as
+  `blackbox aggregates` and the resource. A bad bound, a reversed
+  window, `--last` combined with `--since` / `--until`, an empty
+  bound, or a wrongly typed argument is an INVALID_PARAMS error.
+  Read-only: it removes or changes nothing, done (v0.64.0).
+  Next: an MCP trace tool, so a client can read the session's
+  causal trace as a tool call the same way `blackbox_aggregates`
+  serves the session totals.
 
 ## Layout
 
@@ -1333,7 +1362,7 @@ blackbox/
   sqlite_store.py SQLite store: same records, same chain, WAL + synchronous=FULL
   costs.py        per-model cost tracking: list prices, cost math
   mcp_server.py   MCP server on stdio: record / verify / replay /
-                  query / cost tools, session resources, resource
+                  query / cost / aggregates tools, session resources, resource
                   templates for the
                   diff, a trace subtree, aggregates slices, one
                   step's raw record, one step's transcript line and

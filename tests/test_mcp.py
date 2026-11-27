@@ -72,7 +72,8 @@ class MCPServerTest(unittest.TestCase):
         names = [t["name"] for t in response["result"]["tools"]]
         self.assertEqual(names, ["blackbox_record", "blackbox_verify",
                                  "blackbox_replay", "blackbox_query",
-                                 "blackbox_cost", "blackbox_sample"])
+                                 "blackbox_cost", "blackbox_aggregates",
+                                 "blackbox_sample"])
         for tool in response["result"]["tools"]:
             self.assertIn("inputSchema", tool)
 
@@ -284,6 +285,104 @@ class MCPServerTest(unittest.TestCase):
                 {"tool": ["search"]},
         ):
             response = _call(self.server, 2, "blackbox_cost", arguments)
+            self.assertEqual(response["error"]["code"], -32602,
+                             arguments)
+
+    def _aggregates(self, msg_id, arguments):
+        response = _call(self.server, msg_id, "blackbox_aggregates",
+                         arguments)
+        self.assertNotIn("error", response)
+        self.assertFalse(response["result"]["isError"])
+        return json.loads(response["result"]["content"][0]["text"])
+
+    def _seed_aggregates_log(self):
+        """A priced gpt-5 call invoking search, an unpriced
+        unknown-model call invoking fetch, and a fetch result that
+        errored."""
+        rec = self.server.recorder
+        rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                   tokens={"input": 1200, "output": 340})
+        rec.record("tool_call", {"tool": "search", "args": {}})
+        rec.record("tool_result", {"tool": "search", "result": "ok"})
+        rec.record("model_call", {"model": "other-model", "prompt": "hi"},
+                   tokens={"input": 100, "output": 50})
+        rec.record("tool_call", {"tool": "fetch", "args": {}})
+        rec.record("tool_result",
+                   {"tool": "fetch", "error": "connection refused"})
+
+    def test_aggregates_tool_returns_session_totals(self):
+        self._init()
+        self._seed_aggregates_log()
+        result = self._aggregates(2, {})
+        self.assertEqual(result["steps"], 6)
+        self.assertEqual(result["total_tokens"], 1690)
+        self.assertAlmostEqual(result["total_cost_usd"], 0.0049,
+                               places=6)
+        self.assertEqual(result["unpriced_model_calls"], 1)
+        self.assertEqual(result["by_type"],
+                         {"model_call": 2, "tool_call": 2,
+                          "tool_result": 2})
+        self.assertEqual(result["by_tool"], {"search": 1, "fetch": 1})
+        gpt5 = result["by_model"]["gpt-5"]
+        self.assertEqual(gpt5["calls"], 1)
+        self.assertEqual((gpt5["input_tokens"], gpt5["output_tokens"]),
+                         (1200, 340))
+        self.assertAlmostEqual(gpt5["cost_usd"], 0.0049, places=6)
+        self.assertIsNone(result["by_model"]["other-model"]["cost_usd"])
+        self.assertEqual(result["errors"], 1)
+        self.assertEqual(result["error_seqs"], [5])
+        self.assertEqual(set(result["slowest_step"]),
+                         {"seq", "type", "latency_seconds"})
+
+    def test_aggregates_tool_agrees_with_cli_and_resource(self):
+        self._init()
+        self._seed_aggregates_log()
+        from blackbox.aggregates import session_aggregates
+        expected = session_aggregates(load_records(self.path))
+        self.assertEqual(self._aggregates(2, {}), expected)
+        response = self.server.handle_message(_request(
+            3, "resources/read",
+            {"uri": "blackbox://session/aggregates"}))
+        resource = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(self._aggregates(4, {}), resource)
+
+    def test_aggregates_tool_window_narrows_the_session(self):
+        self._init()
+        self._seed_aggregates_log()
+        # Every step was recorded just now, so a window starting in
+        # 2020 keeps the whole session and one ending in 2020 keeps
+        # none of it.
+        result = self._aggregates(
+            2, {"since": "2020-01-01T00:00:00Z"})
+        self.assertEqual(result["steps"], 6)
+        result = self._aggregates(
+            3, {"until": "2020-01-01T00:00:00Z"})
+        self.assertEqual(result["steps"], 0)
+        self.assertIsNone(result["started"])
+        self.assertIsNone(result["ended"])
+        result = self._aggregates(4, {"last": "1h"})
+        self.assertEqual(result["steps"], 6)
+
+    def test_aggregates_tool_rejects_bad_arguments(self):
+        self._init()
+        self._seed_aggregates_log()
+        for arguments in (
+                {"since": 5},  # must be a string
+                {"until": ["2020-01-01T00:00:00Z"]},
+                {"last": 10},
+                {"since": ""},  # empty is not a timestamp
+                {"until": ""},
+                {"last": ""},
+                {"since": "2026-11-24T01:00:00"},  # no timezone
+                {"last": "10x"},  # not a duration
+                {"since": "2026-11-24T02:00:00Z",
+                 "until": "2026-11-24T01:00:00Z"},  # reversed
+                {"last": "10m", "since": "2026-11-24T01:00:00Z"},
+                {"last": "10m", "until": "2026-11-24T01:00:00Z"},
+        ):
+            response = _call(self.server, 2, "blackbox_aggregates",
+                             arguments)
             self.assertEqual(response["error"]["code"], -32602,
                              arguments)
 

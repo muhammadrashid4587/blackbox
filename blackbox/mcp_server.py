@@ -5,7 +5,7 @@ A minimal MCP server over stdio, speaking newline-delimited JSON-RPC
 library, like the rest of blackbox.
 
 The server holds one Recorder open on the configured log and exposes
-six tools:
+seven tools:
 
     blackbox_record   append one step to the log
     blackbox_verify   check the log's hash chain
@@ -13,8 +13,10 @@ six tools:
     blackbox_query    filter the log's steps, like `blackbox query`
     blackbox_cost     cost totals per model and per tool, like
                       `blackbox costs`
+    blackbox_aggregates
+                      session totals, like `blackbox aggregates`
 
-It also exposes the session as five resources, six resource
+It also exposes the session as five resources, seven resource
 templates, and nine prompts:
 
     blackbox://session        the session as a readable transcript,
@@ -310,6 +312,36 @@ TOOLS = [
                 "tool": {"type": "string",
                          "description": "One tool's totals only, "
                                         "e.g. \"search\""},
+            },
+        },
+    },
+    {
+        "name": "blackbox_aggregates",
+        "description": ("Session totals for the session, like `blackbox "
+                        "aggregates`: step count and duration, "
+                        "per-type and per-tool counts, per-model "
+                        "tokens and USD cost, error steps, the "
+                        "slowest step, and how many records an "
+                        "earlier compaction removed or sampling "
+                        "dropped. With no arguments the whole "
+                        "session; with 'since' / 'until' / 'last' "
+                        "only the steps in that window."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since": {"type": "string",
+                          "description": "Keep steps at or after this "
+                                         "ISO 8601 timestamp with a "
+                                         "timezone"},
+                "until": {"type": "string",
+                          "description": "Keep steps at or before this "
+                                         "ISO 8601 timestamp with a "
+                                         "timezone"},
+                "last": {"type": "string",
+                         "description": "Keep steps from the last this "
+                                        "long, a duration like 10m — "
+                                        "cannot be combined with since "
+                                        "or until"},
             },
         },
     },
@@ -1000,6 +1032,8 @@ class MCPServer:
             return self._tool_query(msg_id, arguments)
         if name == "blackbox_cost":
             return self._tool_cost(msg_id, arguments)
+        if name == "blackbox_aggregates":
+            return self._tool_aggregates(msg_id, arguments)
         if name == "blackbox_sample":
             return self._tool_sample(msg_id, arguments)
         return _error(msg_id, INVALID_PARAMS, "unknown tool: %r" % (name,))
@@ -1177,6 +1211,46 @@ class MCPServer:
             result = totals
         return self._tool_result(msg_id, json.dumps(
             result, indent=2, sort_keys=True))
+
+    def _tool_aggregates(self, msg_id, arguments):
+        """Session totals for the session, like `blackbox aggregates`.
+
+        The same computation — `session_aggregates` over
+        `_window_records` from aggregates.py — so the tool, the CLI
+        report and the aggregates resource always agree: step count
+        and duration, per-type and per-tool counts, per-model
+        calls/tokens/cost, error steps, the slowest step, and how
+        many records an earlier compaction removed or sampling
+        dropped. With no arguments the whole session is returned,
+        the same dict `blackbox aggregates --json` prints. With
+        'since' / 'until' / 'last' only the steps in that window
+        are aggregated, the same window as `blackbox aggregates`
+        and the blackbox://session/aggregates resource; the
+        summary and checkpoint records are kept untouched, so the
+        bookkeeping still describes the whole log, not just the
+        window. A bad bound, a reversed window, --last combined
+        with --since / --until, or a wrongly typed argument is an
+        INVALID_PARAMS error, the tool-call analogue of the CLI's
+        exit code 2. Read-only: it removes or changes nothing.
+        """
+        since = arguments.get("since")
+        until = arguments.get("until")
+        last = arguments.get("last")
+        for flag, value in (("--since", since), ("--until", until),
+                            ("--last", last)):
+            if value is not None and not isinstance(value, str):
+                return _error(msg_id, INVALID_PARAMS,
+                              "blackbox_aggregates %r must be a string"
+                              % flag)
+        try:
+            records = _window_records(
+                load_records(self.log_path),
+                last=last, since=since, until=until)
+        except ValueError as exc:
+            return _error(msg_id, INVALID_PARAMS, str(exc))
+        agg = session_aggregates(records)
+        return self._tool_result(msg_id, json.dumps(
+            agg, indent=2, sort_keys=True))
 
     def _tool_sample(self, msg_id, arguments):
         messages = arguments.get("messages")

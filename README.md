@@ -199,7 +199,7 @@ the run's cost under the summary.
 **MCP server.** `python -m blackbox mcp data/run.jsonl` starts a
 minimal MCP server on stdio (newline-delimited JSON-RPC 2.0, no
 dependencies), so any MCP client can record through blackbox. It
-exposes eight tools: `blackbox_record` (append one step — same
+exposes nine tools: `blackbox_record` (append one step — same
 redaction, hash chain and fsync as the library), `blackbox_verify`
 (check the chain), `blackbox_replay` (read the transcript back),
 `blackbox_query` (filter the session's steps — by type, model,
@@ -244,6 +244,21 @@ a `seq` that is not an integer, a step the session does not
 have — including the summary record, which is bookkeeping, not
 a step — a negative `before` / `after`, a window over 100
 steps, a bad bound, a reversed window, `--last` combined with
+`--since` / `--until`, or a wrongly typed argument is an
+INVALID_PARAMS error, the tool-call analogue of the CLI's exit
+code 2; read-only, it removes or changes nothing), and
+`blackbox_diff` (what changed between this session and another
+run — changed, added and removed steps position by position,
+per-model token and cost deltas, and new vs fixed errors, the
+same diff `blackbox diff` prints and the
+`blackbox://session/diff` resource serves, through the shared
+`session_diff` from `replay.py`, so the tool, the command, the
+resource and the template always agree; with `since` / `until` /
+`last` only the steps in that window are compared, the same
+window as `blackbox diff`, applied to both runs, so two windows
+of one session can be compared by naming the same log as the
+other run; a missing or empty `otherPath`, a run that cannot be
+read, a bad bound, a reversed window, `--last` combined with
 `--since` / `--until`, or a wrongly typed argument is an
 INVALID_PARAMS error, the tool-call analogue of the CLI's exit
 code 2; read-only, it removes or changes nothing).
@@ -1382,8 +1397,27 @@ and `max_records` counts printed steps, not skipped ones.
   with `--since` / `--until`, or a wrongly typed argument is
   an INVALID_PARAMS error. Read-only: it removes or changes
   nothing, done (v0.65.0).
-  Next: an MCP diff tool, so a client can compare two runs as a
-  tool call the same way `blackbox_trace` reads one run.
+- MCP diff tool: `blackbox_diff` returns what changed between
+  this session and another run as JSON — the same dict
+  `session_diff` from `replay.py` computes for `blackbox diff`,
+  the `blackbox://session/diff` resource and the
+  `blackbox://session/diff/{other_path}` template, through a
+  shared `_diff_data` helper, so the tool, the command, the
+  resource and the template always agree (changed, added and
+  removed steps position by position, the token totals of both
+  runs, per-model token and cost deltas, and new vs fixed
+  errors; an unpriced call costs None, never a guessed number);
+  with `since` / `until` / `last` only the steps in that window
+  are compared, the same window as `blackbox diff`, applied to
+  both runs, so two windows of one session can be compared by
+  naming the same log as the other run. A missing or empty
+  `otherPath`, a run that cannot be read, a bad bound, a
+  reversed window, `--last` combined with `--since` / `--until`,
+  or a wrongly typed argument is an INVALID_PARAMS error.
+  Read-only: it removes or changes nothing, done (v0.66.0).
+  Next: an MCP span tool, so a client can read one step as a
+  single OTLP span as a tool call the same way the
+  `blackbox://session/span/{seq}` template serves it.
 
 ## Layout
 
@@ -1394,7 +1428,7 @@ blackbox/
   sqlite_store.py SQLite store: same records, same chain, WAL + synchronous=FULL
   costs.py        per-model cost tracking: list prices, cost math
   mcp_server.py   MCP server on stdio: record / verify / replay /
-                  query / cost / aggregates / trace tools, session resources, resource
+                  query / cost / aggregates / trace / diff tools, session resources, resource
                   templates for the
                   diff, a trace subtree, aggregates slices, one
                   step's raw record, one step's transcript line and

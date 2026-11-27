@@ -5,7 +5,7 @@ A minimal MCP server over stdio, speaking newline-delimited JSON-RPC
 library, like the rest of blackbox.
 
 The server holds one Recorder open on the configured log and exposes
-eight tools:
+nine tools:
 
     blackbox_record   append one step to the log
     blackbox_verify   check the log's hash chain
@@ -18,6 +18,8 @@ eight tools:
     blackbox_trace    one step's full record, or a bounded window of
                       consecutive steps around it, like the
                       blackbox://session/record/{seq} template
+    blackbox_diff     what changed between this session and another
+                      run, like `blackbox diff`
 
 It also exposes the session as five resources, seven resource
 templates, and nine prompts:
@@ -386,6 +388,37 @@ TOOLS = [
                                         "or until"},
             },
             "required": ["seq"],
+        },
+    },
+    {
+        "name": "blackbox_diff",
+        "description": ("What changed between this session and another "
+                        "run, like `blackbox diff`: changed, added and "
+                        "removed steps (position by position), per-model "
+                        "token and cost deltas, and new vs fixed errors. "
+                        "With 'since' / 'until' / 'last' only the steps "
+                        "in that window are compared."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "otherPath": {"type": "string",
+                              "description": "Path to the other run's "
+                                             "log (.jsonl or .db)"},
+                "since": {"type": "string",
+                          "description": "Keep steps at or after this "
+                                         "ISO 8601 timestamp with a "
+                                         "timezone"},
+                "until": {"type": "string",
+                          "description": "Keep steps at or before this "
+                                         "ISO 8601 timestamp with a "
+                                         "timezone"},
+                "last": {"type": "string",
+                         "description": "Keep steps from the last this "
+                                        "long, a duration like 10m — "
+                                        "cannot be combined with since "
+                                        "or until"},
+            },
+            "required": ["otherPath"],
         },
     },
     {
@@ -1079,6 +1112,8 @@ class MCPServer:
             return self._tool_aggregates(msg_id, arguments)
         if name == "blackbox_trace":
             return self._tool_trace(msg_id, arguments)
+        if name == "blackbox_diff":
+            return self._tool_diff(msg_id, arguments)
         if name == "blackbox_sample":
             return self._tool_sample(msg_id, arguments)
         return _error(msg_id, INVALID_PARAMS, "unknown tool: %r" % (name,))
@@ -1369,6 +1404,77 @@ class MCPServer:
             "total": len(steps),
             "records": window,
         }, indent=2, sort_keys=True))
+
+    def _diff_data(self, other_path, last=None, since=None, until=None):
+        """The session-vs-other-run diff, as JSON-able data.
+
+        Shared by the `blackbox_diff` tool and the diff resource
+        reads, so the tool, the resource and the template always
+        agree: the same `session_diff` from replay.py, over the
+        same `_window_records` window, with the same pricing
+        rules — an unpriced call costs None, never a guessed
+        number. Returns (diff, None) on success, or (None, error
+        message) when the other run cannot be read or the window
+        is bad.
+        """
+        try:
+            records_a = load_records(self.log_path)
+            records_b = load_records(other_path)
+        except (OSError, ValueError) as exc:
+            return None, ("cannot read the other run's log %r: %s"
+                          % (other_path, exc))
+        try:
+            records_a = _window_records(records_a, last=last,
+                                        since=since, until=until)
+            records_b = _window_records(records_b, last=last,
+                                        since=since, until=until)
+        except ValueError as exc:
+            return None, str(exc)
+        return session_diff(records_a, records_b,
+                            default_model_a=self.recorder.model), None
+
+    def _tool_diff(self, msg_id, arguments):
+        """What changed between this session and another run, as
+        JSON.
+
+        The same diff `blackbox diff` prints and the
+        blackbox://session/diff resource serves — the shared
+        `session_diff` from replay.py, through `_diff_data`, so
+        the tool, the command, the resource and the template
+        always agree: changed, added and removed steps (position
+        by position), the token totals of both runs, per-model
+        token and cost deltas, and new vs fixed errors. With
+        `since` / `until` / `last` only the steps in that window
+        are compared — the same window as `blackbox diff`,
+        applied to both runs, so two windows of one session can
+        be compared by naming the same log as the other run. A
+        missing or empty `otherPath`, a run that cannot be read,
+        a bad bound, a reversed window, --last combined with
+        --since / --until, or a wrongly typed argument is an
+        INVALID_PARAMS error, the tool-call analogue of the CLI's
+        exit code 2. Read-only: it removes or changes nothing.
+        """
+        other_path = arguments.get("otherPath")
+        if not isinstance(other_path, str) or not other_path:
+            return _error(msg_id, INVALID_PARAMS,
+                          "blackbox_diff needs a non-empty string "
+                          "'otherPath': the path to the other run's "
+                          "log (.jsonl or .db)")
+        since = arguments.get("since")
+        until = arguments.get("until")
+        last = arguments.get("last")
+        for flag, value in (("--since", since), ("--until", until),
+                            ("--last", last)):
+            if value is not None and not isinstance(value, str):
+                return _error(msg_id, INVALID_PARAMS,
+                              "blackbox_diff %r must be a string"
+                              % flag)
+        diff, error = self._diff_data(other_path, last=last,
+                                      since=since, until=until)
+        if error is not None:
+            return _error(msg_id, INVALID_PARAMS, error)
+        return self._tool_result(msg_id, json.dumps(
+            diff, indent=2, sort_keys=True))
 
     def _tool_sample(self, msg_id, arguments):
         messages = arguments.get("messages")
@@ -1997,38 +2103,26 @@ class MCPServer:
         One implementation for both ways of naming the other run:
         the blackbox://session/diff?other_path=... resource and the
         blackbox://session/diff/{other_path} template. Both reuse
-        `session_diff` from replay.py — the same diff the
-        summarize_diff prompt summarises — so the template, the
-        prompt and the resource always agree, and an unpriced call
-        costs None, never a guessed number. last / since / until
-        are the same --last / --since / --until window as
-        `blackbox diff`, applied to both runs through the shared
-        `_window_records` before they are compared position by
-        position, so a step outside the window cannot make the
-        runs look different; the summary and checkpoint records
-        are kept untouched, like the CLI diff. A bad bound, a
-        reversed window, or --last combined with --since / --until
-        raises ValueError in `_window_records` and is an
-        INVALID_PARAMS error here — the resource-read analogue of
-        the CLI diff's exit code 2.
+        `_diff_data` — the shared `session_diff` from replay.py —
+        the same diff the `blackbox_diff` tool returns and the
+        summarize_diff prompt summarises, so the template, the
+        prompt, the tool and the resource always agree, and an
+        unpriced call costs None, never a guessed number. last /
+        since / until are the same --last / --since / --until
+        window as `blackbox diff`, applied to both runs through
+        the shared `_window_records` before they are compared
+        position by position, so a step outside the window cannot
+        make the runs look different; the summary and checkpoint
+        records are kept untouched, like the CLI diff. A bad
+        bound, a reversed window, or --last combined with --since
+        / --until raises ValueError in `_window_records` and is
+        an INVALID_PARAMS error here — the resource-read analogue
+        of the CLI diff's exit code 2.
         """
-        try:
-            records_a = load_records(self.log_path)
-            records_b = load_records(other_path)
-        except (OSError, ValueError) as exc:
-            return _error(msg_id, INVALID_PARAMS,
-                          "cannot read the other run's log %r: %s"
-                          % (other_path, exc))
-        try:
-            records_a = _window_records(records_a, last=last,
-                                        since=since, until=until)
-            records_b = _window_records(records_b, last=last,
-                                        since=since, until=until)
-        except ValueError as exc:
-            return _error(msg_id, INVALID_PARAMS, str(exc))
-        diff = session_diff(
-            records_a, records_b,
-            default_model_a=self.recorder.model)
+        diff, error = self._diff_data(other_path, last=last,
+                                      since=since, until=until)
+        if error is not None:
+            return _error(msg_id, INVALID_PARAMS, error)
         text = json.dumps(diff, indent=2, sort_keys=True)
         return _result(msg_id, {"contents": [
             {"uri": uri, "mimeType": "application/json",

@@ -73,7 +73,8 @@ class MCPServerTest(unittest.TestCase):
         self.assertEqual(names, ["blackbox_record", "blackbox_verify",
                                  "blackbox_replay", "blackbox_query",
                                  "blackbox_cost", "blackbox_aggregates",
-                                 "blackbox_trace", "blackbox_sample"])
+                                 "blackbox_trace", "blackbox_diff",
+                                 "blackbox_sample"])
         for tool in response["result"]["tools"]:
             self.assertIn("inputSchema", tool)
 
@@ -495,6 +496,152 @@ class MCPServerTest(unittest.TestCase):
         response = _call(self.server, 2, "blackbox_trace",
                          {"seq": 6})
         self.assertEqual(response["error"]["code"], -32602)
+
+    def _diff(self, msg_id, arguments):
+        response = _call(self.server, msg_id, "blackbox_diff",
+                         arguments)
+        self.assertNotIn("error", response)
+        self.assertFalse(response["result"]["isError"])
+        return json.loads(response["result"]["content"][0]["text"])
+
+    def test_diff_tool_returns_the_diff(self):
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        self._write_other_run(other, query="other",
+                              extra=True, error_result=True)
+        result = self._diff(2, {"otherPath": other})
+        # Same diff `blackbox diff` prints for these runs: steps
+        # 1-2 changed (query, then an error result), one extra
+        # fetch call, same 1690 tokens on both sides.
+        self.assertEqual(result["run_a"], {"steps": 4, "tokens": 1690})
+        self.assertEqual(result["run_b"], {"steps": 5, "tokens": 1690})
+        self.assertEqual(result["tokens_diff"], 0)
+        self.assertFalse(result["identical"])
+        self.assertEqual([c["position"] for c in result["changed"]],
+                         [1, 2])
+        self.assertEqual(len(result["added"]), 1)
+        self.assertEqual(result["added"][0]["payload"]["tool"], "fetch")
+        self.assertEqual(result["removed"], [])
+        gpt5 = result["per_model"]["gpt-5"]
+        self.assertEqual(gpt5["tokens_a"], 1690)
+        self.assertEqual(gpt5["tokens_b"], 1690)
+        self.assertEqual(gpt5["tokens_delta"], 0)
+        self.assertEqual(gpt5["cost_usd_a"], 0.005525)
+        self.assertEqual(gpt5["cost_usd_b"], 0.005525)
+        self.assertEqual(gpt5["cost_usd_delta"], 0)
+        self.assertEqual(len(result["new_errors"]), 1)
+        self.assertEqual(result["new_errors"][0]["payload"],
+                         {"tool": "search", "error": "timed out"})
+        self.assertEqual(result["fixed_errors"], [])
+        self.assertEqual(result["errors_a"], 0)
+        self.assertEqual(result["errors_b"], 1)
+
+    def test_diff_tool_agrees_with_resource_and_template(self):
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        self._write_other_run(other, query="other",
+                              extra=True, error_result=True)
+        result = self._diff(2, {"otherPath": other})
+        response = self.server.handle_message(_request(
+            3, "resources/read",
+            {"uri": "blackbox://session/diff?other_path=" + other}))
+        resource = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(result, resource)
+        response = self.server.handle_message(_request(
+            4, "resources/read",
+            {"uri": "blackbox://session/diff/" + other}))
+        template = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(result, template)
+
+    def test_diff_tool_identical_runs(self):
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        self._write_other_run(other)
+        result = self._diff(2, {"otherPath": other})
+        self.assertTrue(result["identical"])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["tokens_diff"], 0)
+
+    def test_diff_tool_window_narrows_both_runs(self):
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        self._write_other_run(other, query="other",
+                              extra=True, error_result=True)
+        # Every step was recorded just now, so a window starting
+        # in 2020 keeps both runs whole and one ending in 2020
+        # keeps neither — two empty runs are identical.
+        result = self._diff(2, {"otherPath": other,
+                                "since": "2020-01-01T00:00:00Z"})
+        self.assertFalse(result["identical"])
+        self.assertEqual(result["run_a"]["steps"], 4)
+        result = self._diff(3, {"otherPath": other,
+                                "until": "2020-01-01T00:00:00Z"})
+        self.assertTrue(result["identical"])
+        self.assertEqual(result["run_a"], {"steps": 0, "tokens": 0})
+        self.assertEqual(result["run_b"], {"steps": 0, "tokens": 0})
+        result = self._diff(4, {"otherPath": other, "last": "1h"})
+        self.assertFalse(result["identical"])
+        self.assertEqual(result["run_a"]["steps"], 4)
+        # Two windows of one session: the same log as the other
+        # run, narrowed to a window that keeps nothing, is
+        # identical to itself.
+        result = self._diff(5, {"otherPath": self.path,
+                                "until": "2020-01-01T00:00:00Z"})
+        self.assertTrue(result["identical"])
+        self.assertEqual(result["run_a"]["steps"], 0)
+
+    def test_diff_tool_rejects_bad_arguments(self):
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        self._write_other_run(other)
+        missing = os.path.join(self.tmp.name, "nope.jsonl")
+        for arguments in (
+                {},  # otherPath is required
+                {"otherPath": 5},  # must be a string
+                {"otherPath": ""},  # must not be empty
+                {"otherPath": missing},  # no such log
+                {"otherPath": other, "since": 5},
+                {"otherPath": other, "until": ["2020-01-01T00:00:00Z"]},
+                {"otherPath": other, "last": 10},
+                {"otherPath": other, "since": ""},
+                {"otherPath": other, "until": ""},
+                {"otherPath": other, "last": ""},
+                {"otherPath": other,
+                 "since": "2026-11-24T01:00:00"},  # no timezone
+                {"otherPath": other, "last": "10x"},  # not a duration
+                {"otherPath": other,
+                 "since": "2026-11-24T02:00:00Z",
+                 "until": "2026-11-24T01:00:00Z"},  # reversed
+                {"otherPath": other, "last": "10m",
+                 "since": "2026-11-24T01:00:00Z"},
+                {"otherPath": other, "last": "10m",
+                 "until": "2026-11-24T01:00:00Z"},
+        ):
+            response = _call(self.server, 2, "blackbox_diff",
+                             arguments)
+            self.assertEqual(response["error"]["code"], -32602,
+                             arguments)
+
+    def test_diff_tool_is_read_only(self):
+        self._init()
+        self._record_session()
+        other = os.path.join(self.tmp.name, "other.jsonl")
+        self._write_other_run(other, query="other",
+                              extra=True, error_result=True)
+        with open(self.path, "rb") as f:
+            before = f.read()
+        self._diff(2, {"otherPath": other})
+        with open(self.path, "rb") as f:
+            self.assertEqual(f.read(), before)
 
     def test_initialize_advertises_resources_and_prompts(self):
         response = self._init()

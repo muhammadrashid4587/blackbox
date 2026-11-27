@@ -283,6 +283,76 @@ class MCPServerTest(unittest.TestCase):
         self.assertEqual(agg["by_type"], {})
         self.assertIsNone(agg["slowest_step"])
 
+    def test_resources_read_session_aggregates_window_last(self):
+        # The same --last window as `blackbox aggregates --last`:
+        # the session was recorded just now, so last=1h keeps every
+        # step and the totals are the unwindowed ones.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/aggregates?last=1h"}))
+        agg = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(agg["steps"], 4)
+        self.assertEqual(agg["total_tokens"], 1690)
+        self.assertEqual(agg["total_cost_usd"], 0.005525)
+        self.assertEqual(agg["by_type"],
+                         {"model_call": 2, "tool_call": 1,
+                          "tool_result": 1})
+        self.assertEqual(agg["by_tool"], {"search": 1})
+        self.assertEqual(agg["by_model"]["gpt-5"]["calls"], 2)
+        self.assertEqual(agg["errors"], 0)
+        self.assertIsNotNone(agg["slowest_step"])
+        self.assertEqual(agg["compacted_count"], 0)
+        self.assertEqual(agg["sampled_out"], 0)
+
+    def test_resources_read_session_aggregates_window_since_excludes_all(self):
+        # A --since window after every step drops the session to
+        # zero steps, so the totals are the empty ones — the steps
+        # outside the window cannot change them — while the
+        # summary record is kept untouched.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/aggregates"
+                            "?since=2999-01-01T00:00:00Z"}))
+        agg = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(agg["steps"], 0)
+        self.assertIsNone(agg["started"])
+        self.assertIsNone(agg["ended"])
+        self.assertIsNone(agg["duration_seconds"])
+        self.assertEqual(agg["total_tokens"], 0)
+        self.assertEqual(agg["total_cost_usd"], 0.0)
+        self.assertEqual(agg["by_type"], {})
+        self.assertEqual(agg["by_tool"], {})
+        self.assertEqual(agg["by_model"], {})
+        self.assertEqual(agg["errors"], 0)
+        self.assertIsNone(agg["slowest_step"])
+        self.assertEqual(agg["compacted_count"], 0)
+        self.assertEqual(agg["sampled_out"], 0)
+
+    def test_resources_read_session_aggregates_window_bad_bounds_are_errors(self):
+        # A bad bound, a reversed window, --last combined with
+        # --since, and a bad --last are INVALID_PARAMS errors —
+        # the resource-read analogue of the CLI aggregates' exit
+        # code 2.
+        self._init()
+        self._record_session()
+        base = "blackbox://session/aggregates"
+        for suffix in ("?since=not-a-time",
+                       "?since=2026-11-24T02:00:00Z"
+                       "&until=2026-11-24T01:00:00Z",
+                       "?last=1h&since=2026-11-24T01:00:00Z",
+                       "?last=soon"):
+            response = self.server.handle_message(
+                _request(2, "resources/read",
+                         {"uri": base + suffix}))
+            self.assertEqual(response["error"]["code"], -32602,
+                             suffix)
+
     def test_resources_read_session_trace(self):
         self._init()
         self._record_session()

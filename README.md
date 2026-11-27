@@ -209,7 +209,13 @@ The session is also readable as five resources:
 step count and duration, per-type and per-tool counts, per-model
 tokens and cost, error steps, the slowest step, and how many
 records an earlier compaction removed or sampling dropped, the
-same totals `blackbox aggregates` prints), and
+same totals `blackbox aggregates` prints — the same `--since` /
+`--until` / `--last` window as `blackbox aggregates` rides in
+the query string too, e.g.
+`blackbox://session/aggregates?since=2026-11-24T01:00:00Z
+&until=2026-11-24T02:00:00Z`, and narrows the session before
+the totals are computed; a bad bound, a reversed window, or
+`--last` combined with `--since` / `--until` is an error), and
 `blackbox://session/trace` (the reconstructed causal trace as
 JSON — step count, span-type breakdown, the slowest steps, error
 steps, parent gaps, and the parent-child tree, the same trace
@@ -573,7 +579,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 543 tests, all passing (`make test`).
+- 546 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1176,9 +1182,23 @@ and `max_records` counts printed steps, not skipped ones.
   untouched, so the trace still runs over the whole log's
   bookkeeping, not just the window's. Works on `.jsonl` logs and
   `.db` stores, done (v0.57.0).
-  Next: the same window for the `blackbox://session/aggregates`
-  resource, so the session totals can be narrowed to a window
-  too.
+- Aggregates resource time-range filters:
+  `blackbox://session/aggregates` takes the same `--since` /
+  `--until` / `--last` window as `blackbox aggregates`, as query
+  parameters — e.g.
+  `blackbox://session/aggregates?since=2026-11-24T01:00:00Z&until=
+  2026-11-24T02:00:00Z` — through the shared `_window_records`
+  from `aggregates.py`, so a value that does not parse or carries
+  no timezone is an error, --since after --until is an error, and
+  --last cannot be combined with --since or --until is an error
+  (an INVALID_PARAMS error on a resource read, exit code 2 on the
+  CLI), and a step whose timestamp does not parse, or carries no
+  timezone, never matches. The window is applied to the session
+  before the totals are computed, so a step outside the window
+  cannot change them. The summary and checkpoint records are kept
+  untouched, so `sampled_out` and `compacted_count` still
+  describe the whole log, not just the window. Works on `.jsonl`
+  logs and `.db` stores, done (v0.58.0).
 
 ## Layout
 
@@ -1262,5 +1282,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            543 tests, all passing
+tests/            546 tests, all passing
 ```

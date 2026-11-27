@@ -18,7 +18,12 @@ templates, and eight prompts:
     blackbox://session.json   the session's records as JSON
     blackbox://session/aggregates
                               the session's totals as JSON, the same
-                              totals `blackbox aggregates` prints
+                              totals `blackbox aggregates` prints —
+                              the same --since / --until / --last
+                              window as `blackbox aggregates` rides
+                              in the query string too, and narrows
+                              the session before the totals are
+                              computed
     blackbox://session/trace  the session's reconstructed causal
                               trace as JSON, the same trace
                               `blackbox trace` prints
@@ -296,7 +301,16 @@ RESOURCES = [
                         "steps, the slowest step, and how many "
                         "records an earlier compaction removed or "
                         "sampling dropped — the same totals "
-                        "`blackbox aggregates` prints."),
+                        "`blackbox aggregates` prints. The same "
+                        "--since / --until / --last window as "
+                        "`blackbox aggregates` rides in the query "
+                        "string too, e.g. blackbox://session"
+                        "/aggregates?since=2026-11-24T01:00:00Z"
+                        "&until=2026-11-24T02:00:00Z, and narrows "
+                        "the session before the totals are computed; "
+                        "a bad bound, a reversed window, or --last "
+                        "combined with --since / --until is an "
+                        "error."),
         "mimeType": "application/json",
     },
     {
@@ -1668,8 +1682,29 @@ class MCPServer:
             return _result(msg_id, {"contents": [
                 {"uri": uri, "mimeType": "application/json",
                  "text": text}]})
-        if uri == "blackbox://session/aggregates":
+        if (uri == "blackbox://session/aggregates"
+                or uri.startswith("blackbox://session/aggregates?")):
+            # The --since / --until / --last window rides in the
+            # query string, e.g. blackbox://session/aggregates
+            # ?since=2026-11-24T01:00:00Z, and narrows the session
+            # through the shared _window_records before the totals
+            # are computed, so a step outside the window cannot
+            # change them; the summary and checkpoint records are
+            # kept untouched, like the CLI aggregates. A bad bound,
+            # a reversed window, or --last combined with --since /
+            # --until is an INVALID_PARAMS error — the
+            # resource-read analogue of the CLI aggregates' exit
+            # code 2.
             records = load_records(self.log_path)
+            query = parse_qs(urlparse(uri).query)
+            try:
+                records = _window_records(
+                    records,
+                    last=query.get("last", [None])[0],
+                    since=query.get("since", [None])[0],
+                    until=query.get("until", [None])[0])
+            except ValueError as exc:
+                return _error(msg_id, INVALID_PARAMS, str(exc))
             agg = session_aggregates(records)
             text = json.dumps(agg, indent=2, sort_keys=True)
             return _result(msg_id, {"contents": [

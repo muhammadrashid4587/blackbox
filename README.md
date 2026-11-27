@@ -213,9 +213,14 @@ same totals `blackbox aggregates` prints), and
 `blackbox://session/trace` (the reconstructed causal trace as
 JSON — step count, span-type breakdown, the slowest steps, error
 steps, parent gaps, and the parent-child tree, the same trace
-`blackbox trace` prints) — all read from the
-same log the tools write to, so a client always sees the current
-session. A fifth resource, `blackbox://session/diff`, exposes
+`blackbox trace` prints) — the same `--since` / `--until` /
+`--last` window as `blackbox trace` rides in the query string
+too, e.g. `blackbox://session/trace?since=2026-11-24T01:00:00Z
+&until=2026-11-24T02:00:00Z`, and narrows the session before
+the trace is built; a bad bound, a reversed window, or `--last`
+combined with `--since` / `--until` is an error — all read from
+the same log the tools write to, so a client always sees the
+current session. A fifth resource, `blackbox://session/diff`, exposes
 what changed between this session and another run as JSON —
 changed, added and removed steps (position by position, like
 `blackbox diff`), per-model token and cost deltas, and new vs
@@ -562,7 +567,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 537 tests, all passing (`make test`).
+- 540 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1131,9 +1136,25 @@ and `max_records` counts printed steps, not skipped ones.
   records are kept untouched, so the comparison still runs over
   the whole log's bookkeeping, not just the window's. Works on
   `.jsonl` logs and `.db` stores, done (v0.55.0).
-  Next: `--since` / `--until` time-range filters for the
-  `blackbox://session/trace` MCP resource, so the MCP trace can
-  be narrowed to the same window as the CLI trace.
+- Trace resource time-range filters: `blackbox://session/trace`
+  takes the same `--since` / `--until` / `--last` window as
+  `blackbox trace`, as query parameters — e.g.
+  `blackbox://session/trace?since=2026-11-24T01:00:00Z&until=
+  2026-11-24T02:00:00Z` — through the shared `_window_records`
+  from `aggregates.py`, so a value that does not parse or carries
+  no timezone is an error, --since after --until is an error, and
+  --last cannot be combined with --since or --until is an error
+  (an INVALID_PARAMS error on a resource read, exit code 2 on the
+  CLI), and a step whose timestamp does not parse, or carries no
+  timezone, never matches. The window is applied to the session
+  before the trace is built, so a step outside the window cannot
+  change the tree. The summary and checkpoint records are kept
+  untouched, so the trace still runs over the whole log's
+  bookkeeping, not just the window's. Works on `.jsonl` logs and
+  `.db` stores, done (v0.56.0).
+  Next: the same window for the `blackbox://session/trace/{seq}`
+  template, so one branch of the trace can be narrowed to a
+  window too.
 
 ## Layout
 
@@ -1217,5 +1238,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            537 tests, all passing
+tests/            540 tests, all passing
 ```

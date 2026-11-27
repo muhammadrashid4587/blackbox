@@ -301,7 +301,16 @@ RESOURCES = [
                         "trace as JSON: step count, span-type "
                         "breakdown, the slowest steps, error steps, "
                         "parent gaps, and the parent-child tree — "
-                        "the same trace `blackbox trace` prints."),
+                        "the same trace `blackbox trace` prints. "
+                        "The same --since / --until / --last window "
+                        "as `blackbox trace` rides in the query "
+                        "string too, e.g. blackbox://session/trace"
+                        "?since=2026-11-24T01:00:00Z"
+                        "&until=2026-11-24T02:00:00Z, and narrows "
+                        "the session before the trace is built; a "
+                        "bad bound, a reversed window, or --last "
+                        "combined with --since / --until is an "
+                        "error."),
         "mimeType": "application/json",
     },
     {
@@ -1636,8 +1645,29 @@ class MCPServer:
             return _result(msg_id, {"contents": [
                 {"uri": uri, "mimeType": "application/json",
                  "text": text}]})
-        if uri == "blackbox://session/trace":
+        if (uri == "blackbox://session/trace"
+                or uri.startswith("blackbox://session/trace?")):
+            # The --since / --until / --last window rides in the
+            # query string, e.g. blackbox://session/trace
+            # ?since=2026-11-24T01:00:00Z, and narrows the session
+            # through the shared _window_records before the trace
+            # is built, so a step outside the window cannot change
+            # the tree; the summary and checkpoint records are
+            # kept untouched, like the CLI trace. A bad bound, a
+            # reversed window, or --last combined with --since /
+            # --until is an INVALID_PARAMS error — the
+            # resource-read analogue of the CLI trace's exit
+            # code 2.
             records = load_records(self.log_path)
+            query = parse_qs(urlparse(uri).query)
+            try:
+                records = _window_records(
+                    records,
+                    last=query.get("last", [None])[0],
+                    since=query.get("since", [None])[0],
+                    until=query.get("until", [None])[0])
+            except ValueError as exc:
+                return _error(msg_id, INVALID_PARAMS, str(exc))
             trace = session_trace(records)
             text = json.dumps(trace, indent=2, sort_keys=True)
             return _result(msg_id, {"contents": [

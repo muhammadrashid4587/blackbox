@@ -124,7 +124,10 @@ templates, and nine prompts:
                               (an unpriced call carries no cost,
                               never a guessed number) — so a client
                               can read one step as a span without
-                              exporting the whole trace
+                              exporting the whole trace; with
+                              `?causal=true` the span's parent comes
+                              from the causal trace reconstruction
+                              instead of the hash chain
     analyze_session           a prompt template for analysing the
                               session (optional focus argument)
     summarize_costs           a prompt template for summarising the
@@ -805,8 +808,14 @@ RESOURCE_TEMPLATES = [
                         "with an input/output token split and a "
                         "known price carries its USD cost; an "
                         "unpriced call carries none, never a "
-                        "guessed number. Read it by expanding the "
-                        "template with a step number, e.g. "
+                        "guessed number. With `?causal=true` the "
+                        "span's parent comes from the causal trace "
+                        "reconstruction instead of the hash chain "
+                        "— the same parent `blackbox trace` prints "
+                        "for the step — and the span carries a "
+                        "`blackbox.causal_parent` attribute. Read "
+                        "it by expanding the template with a step "
+                        "number, e.g. "
                         "blackbox://session/span/2."),
         "mimeType": "application/json",
     },
@@ -2489,7 +2498,7 @@ class MCPServer:
             {"uri": uri, "mimeType": "text/plain",
              "text": text}]})
 
-    def _read_span(self, msg_id, uri, seq_text):
+    def _read_span(self, msg_id, uri, seq_text, causal=None):
         """One step as a single OTLP span, as a resource read.
 
         One implementation for the blackbox://session/span/{seq}
@@ -2501,10 +2510,28 @@ class MCPServer:
         times come from the record's timestamps, and a model_call
         with an input/output split and a known price carries its
         USD cost — an unpriced call carries none, never a guessed
-        number. A step number that is not an integer, a step the
-        session does not have, or a step with no usable timestamp,
-        is an error.
+        number. With `causal` true the span's parent comes from
+        the causal trace reconstruction instead of the hash chain
+        — the same parent `blackbox trace` prints for the step —
+        and the span carries a `blackbox.causal_parent`
+        attribute, the same span the `blackbox span --causal` CLI
+        command and the `blackbox_span` tool with `causal` true
+        return for that step. A step number that is not an
+        integer, a step the session does not have, a step with
+        no usable timestamp, or a `causal` value that is not
+        true/false, is an error.
         """
+        if causal is None:
+            causal_flag = False
+        elif causal in ("true", "1"):
+            causal_flag = True
+        elif causal in ("false", "0"):
+            causal_flag = False
+        else:
+            return _error(
+                msg_id, INVALID_PARAMS,
+                "blackbox://session/span/{seq} 'causal' must be "
+                "'true' or 'false'")
         try:
             seq = int(unquote(seq_text))
         except ValueError:
@@ -2514,7 +2541,7 @@ class MCPServer:
                 "e.g. blackbox://session/span/2")
         records = load_records(self.log_path)
         try:
-            span = session_span(records, seq)
+            span = session_span(records, seq, causal=causal_flag)
         except ValueError as exc:
             return _error(msg_id, INVALID_PARAMS, str(exc))
         if span is None:
@@ -2685,14 +2712,21 @@ class MCPServer:
             # one step as a single OTLP span — the same span the
             # `blackbox otel` export carries for that step, with
             # the step number as the span id and the step kind as
-            # the span name.
-            seq_text = uri[len("blackbox://session/span/"):]
+            # the span name. The `causal` flag rides in the query
+            # string after the step number, e.g.
+            # blackbox://session/span/2?causal=true, so it is
+            # split off before the step number is parsed.
+            seq_part, _, query_text = uri.partition("?")
+            seq_text = seq_part[len("blackbox://session/span/"):]
             if not seq_text:
                 return _error(
                     msg_id, INVALID_PARAMS,
                     "blackbox://session/span/{seq} needs a step "
                     "number, e.g. blackbox://session/span/2")
-            return self._read_span(msg_id, uri, seq_text)
+            query = parse_qs(query_text)
+            return self._read_span(
+                msg_id, uri, seq_text,
+                causal=query.get("causal", [None])[0])
         if uri.startswith("blackbox://session/trace/"):
             # The resource template blackbox://session/trace/{seq}:
             # the subtree rooted at step seq, the same node the

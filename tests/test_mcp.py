@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from blackbox import Recorder
 from blackbox.mcp_server import MCPServer
-from blackbox.otel import records_to_spans
+from blackbox.otel import records_to_spans, session_span
 from blackbox.replay import load_records
 from blackbox.verify import verify
 
@@ -2180,6 +2180,77 @@ class MCPServerTest(unittest.TestCase):
             _request(2, "resources/read",
                      {"uri": "blackbox://session/span/4"}))
         self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_span_template_causal_parent(self):
+        # With ?causal=true the span's parent comes from the causal
+        # trace reconstruction, not the hash chain: the tool_result
+        # hangs off the tool_call it answers, and the span carries
+        # a blackbox.causal_parent attribute. It agrees with the
+        # blackbox_span tool with causal true and with session_span
+        # called with causal=True.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/span/2?causal=true"}))
+        content = response["result"]["contents"][0]
+        self.assertEqual(content["uri"],
+                         "blackbox://session/span/2?causal=true")
+        span = json.loads(content["text"])
+        self.assertEqual(span["parentSpanId"], "%016x" % 1)
+        attrs = {a["key"]: a["value"] for a in span["attributes"]}
+        self.assertTrue(attrs["blackbox.causal_parent"]["boolValue"])
+        records = load_records(self.path)
+        self.assertEqual(span,
+                         session_span(records, 2, causal=True))
+        tool = self._span(7, {"seq": 2, "causal": True})
+        self.assertEqual(span, tool["spans"][0])
+        # The tool_call hangs off the model_call that decided it.
+        response = self.server.handle_message(
+            _request(8, "resources/read",
+                     {"uri": "blackbox://session/span/1?causal=true"}))
+        span = json.loads(response["result"]["contents"][0]["text"])
+        self.assertEqual(span["parentSpanId"], "%016x" % 0)
+
+    def test_resources_read_session_span_template_causal_false_is_the_chain_parent(self):
+        # ?causal=false is the default: the parent is the previous
+        # record's hash prefix, and the span carries no causal
+        # attribute.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/span/2?causal=false"}))
+        span = json.loads(response["result"]["contents"][0]["text"])
+        records = load_records(self.path)
+        self.assertEqual(span["parentSpanId"],
+                         records[1]["hash"][:16])
+        keys = [a["key"] for a in span["attributes"]]
+        self.assertNotIn("blackbox.causal_parent", keys)
+        self.assertEqual(span, session_span(records, 2))
+
+    def test_resources_read_session_span_template_causal_root_has_no_parent(self):
+        # The first step is a root in the causal tree too: no
+        # parentSpanId — but the span is still marked as causal,
+        # since its (absent) parent was reconstructed, not chained.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/span/0?causal=true"}))
+        span = json.loads(response["result"]["contents"][0]["text"])
+        self.assertNotIn("parentSpanId", span)
+        attrs = {a["key"]: a["value"] for a in span["attributes"]}
+        self.assertTrue(attrs["blackbox.causal_parent"]["boolValue"])
+
+    def test_resources_read_session_span_template_causal_bad_value_is_an_error(self):
+        self._init()
+        self._record_session()
+        for uri in ("blackbox://session/span/2?causal=maybe",
+                    "blackbox://session/span/2?causal=yes"):
+            response = self.server.handle_message(
+                _request(2, "resources/read", {"uri": uri}))
+            self.assertEqual(response["error"]["code"], -32602)
 
     def test_resources_read_unknown_uri_is_an_error(self):
         self._init()

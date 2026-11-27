@@ -388,10 +388,14 @@ formatted line), and `blackbox://session/span/{seq}` (one step as
 a single OTLP span — the step kind as the span name, the step
 number as the span id, start/end times from the record's
 timestamps, and a USD cost attribute on a priced model_call,
-never a guessed number). Each reuses the same computation as the
-resource or report it mirrors, so the template and the original
-always agree; a step number that is not an integer, or a step the
-session does not have, is an error.
+never a guessed number — with `?causal=true` the span's parent
+comes from the causal trace reconstruction instead of the hash
+chain, the same parent `blackbox trace` prints for the step, and
+the span carries a `blackbox.causal_parent` attribute). Each
+reuses the same computation as the resource or report it mirrors,
+so the template and the original always agree; a step number that
+is not an integer, or a step the session does not have, is an
+error.
 One prompt template, `analyze_session`, hands the client a prompt
 for analysing the session, with an optional `focus` argument
 (`errors`, `cost`, `tool usage`, or anything else); the prompt
@@ -705,7 +709,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 648 tests, all passing (`make test`).
+- 652 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1589,6 +1593,25 @@ and `max_records` counts printed steps, not skipped ones.
   `blackbox://session/span/{seq}` template, so a client can
   read one step's span with its causal parent the same way
   the CLI can.
+- `--causal` flag for the `blackbox://session/span/{seq}`
+  template: reading `blackbox://session/span/2?causal=true`
+  returns the same span the `blackbox span 2 --causal` CLI
+  command and the `blackbox_span` tool with `causal` true
+  return for that step — the span's parent from the causal
+  trace reconstruction (`link_parents`) instead of the hash
+  chain, so a tool_result hangs off the tool_call it answers
+  and a tool_call off the model_call that decided it, with a
+  `blackbox.causal_parent` attribute marking the parent as
+  reconstructed — reusing the shared `session_span` from
+  `otel.py`, so the template, the tool and the command always
+  agree; `?causal=false` (or no flag) is the default chain
+  parent, unchanged, and a value that is not true/false is an
+  INVALID_PARAMS error. Works on `.jsonl` logs and `.db`
+  stores, done (v0.74.0).
+  Next: window flags for the `blackbox://session/span/{seq}`
+  template, so a client can read a window of spans around a
+  step — `?before=` / `?after=` in the query string — the
+  same way the CLI and the `blackbox_span` tool can.
 
 ## Layout
 
@@ -1684,5 +1707,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            648 tests, all passing
+tests/            652 tests, all passing
 ```

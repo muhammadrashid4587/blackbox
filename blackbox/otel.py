@@ -280,7 +280,7 @@ def records_to_spans(records, service_name=SERVICE_NAME, causal=False,
     return spans
 
 
-def session_span(records, seq):
+def session_span(records, seq, causal=False, parents=None):
     """One step as a single OTLP span dict, or None if the session has
     no step with that seq.
 
@@ -301,6 +301,19 @@ def session_span(records, seq):
     `blackbox.hash`, so it ties to exactly one tamper-evident
     record, and its parentSpanId is the chain parent, as in the
     export.
+
+    With causal=True the parent comes from the causal trace
+    reconstruction (`trace.link_parents`) instead of the hash chain
+    — the same parent `blackbox trace` prints for the step, as a
+    seq-based span id — and the span carries a
+    `blackbox.causal_parent` attribute marking the parent as
+    reconstructed. `parents` is an optional seq -> parent-seq map
+    computed from a fuller log than `records` (a caller passing
+    the full log's map): with causal=True it is used as-is instead
+    of recomputing parents from the records given. A causal parent
+    seq absent from the steps given yields a root span marked with
+    a `blackbox.parent_sampled_out` attribute, the same gap rule
+    as the causal full export.
 
     Start time is the record's timestamp; end time is the next
     step's timestamp, or the summary's for the last step — the same
@@ -331,7 +344,22 @@ def session_span(records, seq):
             end = None
     except (KeyError, ValueError):
         raise ValueError("step %d has no usable end timestamp" % seq)
-    span = record_to_span(record, steps[0]["hash"][:32], end=end)
+    if causal:
+        if parents is None:
+            parents = link_parents(records)
+        parent_seq = parents.get(seq)
+        step_seqs = {r["seq"] for r in steps
+                     if r["type"] != "checkpoint"}
+        parent_span_id = ("%016x" % parent_seq
+                          if parent_seq is not None
+                          and parent_seq in step_seqs else None)
+        span = record_to_span(
+            record, steps[0]["hash"][:32], end=end,
+            parent_span_id=parent_span_id, causal=True,
+            parent_sampled_out=(parent_seq is not None
+                                and parent_seq not in step_seqs))
+    else:
+        span = record_to_span(record, steps[0]["hash"][:32], end=end)
     span["spanId"] = "%016x" % seq
     span["name"] = record["type"]
     payload = record.get("payload") or {}
@@ -350,7 +378,7 @@ MAX_SPAN_WINDOW = 100
 
 
 def span_window(records, seq, before=0, after=0, last=None,
-                since=None, until=None, now=None):
+                since=None, until=None, now=None, causal=False):
     """One step as a single OTLP span, or a bounded window of
     consecutive spans around it.
 
@@ -363,9 +391,14 @@ def span_window(records, seq, before=0, after=0, last=None,
     the session is narrowed first through the shared
     `_window_records`, the same window as `blackbox trace` and
     the trace resource, so a step the window dropped is not in
-    the session. Returns the window as a dict — `seq`, `before`,
-    `after`, `count`, `total` (steps in the session) and `spans`
-    (each a `session_span` dict) — the same shape the
+    the session. With causal=True each span's parent comes from
+    the causal trace reconstruction (`trace.link_parents`,
+    computed on the windowed session) instead of the hash chain
+    — the same parent-child tree `blackbox trace` prints for the
+    window — and each span carries a `blackbox.causal_parent`
+    attribute. Returns the window as a dict — `seq`, `before`,
+    `after`, `causal`, `count`, `total` (steps in the session)
+    and `spans` (each a `session_span` dict) — the same shape the
     `blackbox_span` MCP tool returns, so the tool and the CLI
     agree field for field. The summary and checkpoint records
     are bookkeeping, not steps, so they have no span and are
@@ -390,10 +423,13 @@ def span_window(records, seq, before=0, after=0, last=None,
     if index is None:
         raise ValueError("no step %d in this session" % seq)
     window = steps[max(0, index - before):index + after + 1]
-    spans = [session_span(records, r["seq"]) for r in window]
+    parents = link_parents(records) if causal else None
+    spans = [session_span(records, r["seq"], causal=causal,
+                          parents=parents) for r in window]
     return {"seq": seq,
             "before": before,
             "after": after,
+            "causal": causal,
             "count": len(spans),
             "total": len(steps),
             "spans": spans}

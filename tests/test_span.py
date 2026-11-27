@@ -364,6 +364,169 @@ class SpanWindowCliTest(unittest.TestCase):
         self.assertIn("no step 3", err)
 
 
+class SpanCausalCliTest(unittest.TestCase):
+    """`blackbox span --causal`: each span's parent comes from the
+    causal trace reconstruction instead of the hash chain — the same
+    parent-child tree `blackbox trace` prints. One model_call
+    invoking search twice, then both results, is where the trees
+    differ: the chain hangs each step off the previous one, the
+    causal tree hangs both calls off the model_call and pairs each
+    result with its call, first-in first-out."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "run.jsonl")
+        with Recorder(self.path, task="t", model="gpt-5") as rec:
+            rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                       tokens={"input": 1200, "output": 340})
+            rec.record("tool_call", {"tool": "search",
+                                     "args": {"query": "one"}})
+            rec.record("tool_call", {"tool": "search",
+                                     "args": {"query": "two"}})
+            rec.record("tool_result", {"tool": "search",
+                                       "result": "first"})
+            rec.record("tool_result", {"tool": "search",
+                                       "result": "second"})
+            rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                       tokens={"input": 100, "output": 50})
+        self.records = load_records(self.path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["span", self.path] + [str(a) for a in argv])
+        return code, out.getvalue(), err.getvalue()
+
+    @staticmethod
+    def _attrs(span):
+        return {a["key"]: a["value"] for a in span["attributes"]}
+
+    @staticmethod
+    def _parent_seq(span):
+        parent = span.get("parentSpanId")
+        return int(parent, 16) if parent is not None else None
+
+    def test_causal_single_span_parent_is_causal_not_chain(self):
+        # The second search call hangs off the model_call that
+        # decided it (seq 0), not off the first call (seq 1).
+        code, out, err = self._run(2, "--causal", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        window = json.loads(out)
+        self.assertTrue(window["causal"])
+        self.assertEqual(window["count"], 1)
+        span = window["spans"][0]
+        self.assertEqual(self._parent_seq(span), 0)
+        self.assertTrue(self._attrs(span)["blackbox.causal_parent"]
+                        ["boolValue"])
+        # The second result pairs with the second call (FIFO), not
+        # the step before it.
+        code, out, err = self._run(4, "--causal", "--json")
+        self.assertEqual(code, 0)
+        span = json.loads(out)["spans"][0]
+        self.assertEqual(self._parent_seq(span), 2)
+
+    def test_default_span_still_uses_chain_parent(self):
+        # Without --causal nothing changes: the second call hangs
+        # off the first call, the step before it in the chain — the
+        # chain parent is a hash prefix, not a seq.
+        code, out, err = self._run(2, "--json")
+        self.assertEqual(code, 0)
+        span = json.loads(out)
+        self.assertEqual(span.get("parentSpanId"),
+                         self.records[1]["hash"][:16])
+        self.assertNotIn("blackbox.causal_parent", self._attrs(span))
+
+    def test_causal_window_parents_match_link_parents(self):
+        from blackbox.trace import link_parents
+        code, out, err = self._run(2, "--before", 2, "--after", 3,
+                                   "--causal", "--json")
+        self.assertEqual(code, 0)
+        window = json.loads(out)
+        self.assertTrue(window["causal"])
+        self.assertEqual(window["count"], 6)
+        parents = link_parents(self.records)
+        for span in window["spans"]:
+            seq = int(span["spanId"], 16)
+            self.assertEqual(self._parent_seq(span), parents[seq],
+                             seq)
+            self.assertTrue(
+                self._attrs(span)["blackbox.causal_parent"]
+                ["boolValue"], seq)
+
+    def test_causal_report_marks_spans(self):
+        code, out, err = self._run(2, "--before", 1, "--after", 1,
+                                   "--causal")
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count("blackbox.causal_parent: true"), 3)
+
+    def test_causal_window_narrows_session_first(self):
+        # The same steps at fixed timestamps, so the --since window
+        # is deterministic: the model_call falls outside it, so the
+        # links are rebuilt on the windowed session, the same way
+        # `blackbox trace --since` rebuilds them.
+        from blackbox.otel import span_window
+        from blackbox.trace import link_parents
+        path = os.path.join(self.tmp.name, "fixed.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            steps = (
+                ("model_call", {"model": "gpt-5"},
+                 "2026-11-22T10:00:00Z"),
+                ("tool_call", {"tool": "search"},
+                 "2026-11-22T10:01:00Z"),
+                ("tool_call", {"tool": "search"},
+                 "2026-11-22T10:02:00Z"),
+                ("tool_result", {"tool": "search"},
+                 "2026-11-22T10:03:00Z"),
+            )
+            for seq, (kind, payload, ts) in enumerate(steps):
+                f.write(json.dumps({
+                    "seq": seq, "ts": ts, "type": kind,
+                    "payload": payload, "tokens": None,
+                    "prev_hash": "0" * 64,
+                    "hash": "%064x" % (seq + 1)}) + "\n")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["span", path, "2", "--before", "1", "--after",
+                         "1", "--causal", "--json",
+                         "--since", "2026-11-22T10:01:00Z"])
+        self.assertEqual(code, 0)
+        window = json.loads(out.getvalue())
+        self.assertEqual(window["total"], 3)
+        records = load_records(path)
+        windowed = [r for r in records
+                    if r["ts"] >= "2026-11-22T10:01:00Z"]
+        parents = link_parents(windowed)
+        for span in window["spans"]:
+            seq = int(span["spanId"], 16)
+            self.assertEqual(self._parent_seq(span), parents[seq],
+                             seq)
+        # The first kept tool_call has no model_call before it in
+        # the window, so it is a root.
+        first = window["spans"][0]
+        self.assertEqual(int(first["spanId"], 16), 1)
+        self.assertNotIn("parentSpanId", first)
+        self.assertEqual(
+            span_window(records, 2, before=1, after=1, causal=True,
+                        since="2026-11-22T10:01:00Z"), window)
+
+    def test_session_span_absent_causal_parent_is_marked_gap(self):
+        # A caller passing a parents map from a fuller log: a
+        # parent seq not among the steps given yields a root span
+        # marked with blackbox.parent_sampled_out, the same gap
+        # rule as the causal full export.
+        span = session_span(self.records, 1, causal=True,
+                            parents={1: 99})
+        self.assertNotIn("parentSpanId", span)
+        attrs = self._attrs(span)
+        self.assertTrue(attrs["blackbox.causal_parent"]["boolValue"])
+        self.assertTrue(attrs["blackbox.parent_sampled_out"]
+                        ["boolValue"])
+
+
 def _nanos(ts):
     from datetime import datetime, timezone
     dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))

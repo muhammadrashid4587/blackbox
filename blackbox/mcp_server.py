@@ -438,7 +438,10 @@ TOOLS = [
                         "/ 'after' a bounded window of consecutive "
                         "spans around it, in log order. With 'since' "
                         "/ 'until' / 'last' only the steps in that "
-                        "window."),
+                        "window. With 'causal' true each span's "
+                        "parent comes from the causal trace "
+                        "reconstruction instead of the hash chain, "
+                        "the same tree blackbox trace prints."),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -463,6 +466,12 @@ TOOLS = [
                                         "long, a duration like 10m — "
                                         "cannot be combined with since "
                                         "or until"},
+                "causal": {"type": "boolean",
+                           "description": "Take each span's parent "
+                                          "from the causal trace "
+                                          "reconstruction instead of "
+                                          "the hash chain (default "
+                                          "false)"},
             },
             "required": ["seq"],
         },
@@ -1577,12 +1586,17 @@ class MCPServer:
         / `until` / `last` the session is narrowed first through
         the shared `_window_records`, the same window as `blackbox
         trace` and the trace resource, so a step the window dropped
-        is not in the session. A missing `seq`, a `seq` that is
-        not an integer, a step the session does not have
-        (including the summary record, which is bookkeeping,
-        not a step), a negative `before` / `after`, a window
-        over 100 steps, a bad bound, a reversed window, --last
-        combined with --since / --until, a wrongly typed
+        is not in the session. With `causal` true each span's
+        parent comes from the causal trace reconstruction
+        (`trace.link_parents`, computed on the windowed session)
+        instead of the hash chain — the same parent-child tree
+        `blackbox trace` prints for the window — and each span
+        carries a `blackbox.causal_parent` attribute. A missing
+        `seq`, a `seq` that is not an integer, a step the session
+        does not have (including the summary record, which is
+        bookkeeping, not a step), a negative `before` / `after`, a
+        window over 100 steps, a bad bound, a reversed window,
+        --last combined with --since / --until, a wrongly typed
         argument, or a step with no usable timestamp is an
         INVALID_PARAMS error, the tool-call analogue of the
         CLI's exit code 2. Read-only: it removes or changes
@@ -1614,11 +1628,16 @@ class MCPServer:
                 return _error(msg_id, INVALID_PARAMS,
                               "blackbox_span %r must be a string"
                               % flag)
+        causal = arguments.get("causal", False)
+        if not isinstance(causal, bool):
+            return _error(msg_id, INVALID_PARAMS,
+                          "blackbox_span 'causal' must be a boolean")
         try:
             window = span_window(
                 load_records(self.log_path), seq,
                 before=before, after=after,
-                last=last, since=since, until=until)
+                last=last, since=since, until=until,
+                causal=causal)
         except ValueError as exc:
             return _error(msg_id, INVALID_PARAMS, str(exc))
         return self._tool_result(msg_id, json.dumps(

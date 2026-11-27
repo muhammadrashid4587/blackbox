@@ -721,6 +721,47 @@ class MCPServerTest(unittest.TestCase):
         result = self._span(4, {"seq": 5, "last": "1h"})
         self.assertEqual(result["total"], 6)
 
+    def test_span_tool_causal_parents(self):
+        self._init()
+        # One model_call invoking search twice, then both results:
+        # the chain hangs each step off the previous one, the causal
+        # tree hangs both calls off the model_call and pairs each
+        # result with its call, first-in first-out.
+        rec = self.server.recorder
+        rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                   tokens={"input": 1200, "output": 340})
+        rec.record("tool_call", {"tool": "search", "args": {}})
+        rec.record("tool_call", {"tool": "search", "args": {}})
+        rec.record("tool_result", {"tool": "search", "result": "one"})
+        rec.record("tool_result", {"tool": "search", "result": "two"})
+        result = self._span(2, {"seq": 2, "before": 2, "after": 2,
+                                "causal": True})
+        self.assertTrue(result["causal"])
+        self.assertEqual(result["count"], 5)
+        parents = {int(span["spanId"], 16):
+                   (int(span["parentSpanId"], 16)
+                    if "parentSpanId" in span else None)
+                   for span in result["spans"]}
+        self.assertEqual(parents, {0: None, 1: 0, 2: 0, 3: 1, 4: 2})
+        for span in result["spans"]:
+            attrs = {a["key"]: a["value"] for a in span["attributes"]}
+            self.assertTrue(attrs["blackbox.causal_parent"]
+                            ["boolValue"])
+        # Without causal the same window keeps the chain parents:
+        # each span's parent is the previous record's hash prefix.
+        result = self._span(3, {"seq": 2, "before": 2, "after": 2})
+        self.assertFalse(result["causal"])
+        records = load_records(self.path)
+        parents = {int(span["spanId"], 16): span.get("parentSpanId")
+                   for span in result["spans"]}
+        self.assertEqual(parents, {
+            0: None,
+            1: records[0]["hash"][:16],
+            2: records[1]["hash"][:16],
+            3: records[2]["hash"][:16],
+            4: records[3]["hash"][:16],
+        })
+
     def test_span_tool_rejects_bad_arguments(self):
         self._init()
         self._seed_aggregates_log()
@@ -749,6 +790,8 @@ class MCPServerTest(unittest.TestCase):
                  "since": "2026-11-24T01:00:00Z"},
                 {"seq": 0, "last": "10m",
                  "until": "2026-11-24T01:00:00Z"},
+                {"seq": 0, "causal": "yes"},  # must be a boolean
+                {"seq": 0, "causal": 1},
         ):
             response = _call(self.server, 2, "blackbox_span",
                              arguments)

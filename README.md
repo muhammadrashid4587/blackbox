@@ -276,14 +276,18 @@ window of consecutive spans around it, in log order, clamped at
 the session's ends and at most 100 spans; with `since` / `until` /
 `last` only the steps in that window, the same window as
 `blackbox trace` and the trace resource, so a step the window
-dropped is not in the session; a missing `seq`, a `seq` that is
-not an integer, a step the session does not have — including the
-summary record, which is bookkeeping, not a step — a negative
-`before` / `after`, a window over 100 spans, a bad bound, a
-reversed window, `--last` combined with `--since` / `--until`, a
-wrongly typed argument, or a step with no usable timestamp is an
-INVALID_PARAMS error, the tool-call analogue of the CLI's exit
-code 2; read-only, it removes or changes nothing), and
+dropped is not in the session; with `causal` true each span's
+parent comes from the causal trace reconstruction instead of the
+hash chain, the same tree `blackbox trace` prints, and each span
+carries a `blackbox.causal_parent` attribute; a missing `seq`, a
+`seq` that is not an integer, a step the session does not have —
+including the summary record, which is bookkeeping, not a step —
+a negative `before` / `after`, a window over 100 spans, a bad
+bound, a reversed window, `--last` combined with `--since` /
+`--until`, a wrongly typed argument, or a step with no usable
+timestamp is an INVALID_PARAMS error, the tool-call analogue of
+the CLI's exit code 2; read-only, it removes or changes
+nothing), and
 `blackbox_transcript` (one step's formatted transcript line —
 the same line the `blackbox://session/transcript/{seq}` template
 serves, through the shared `session_transcript_step` from
@@ -701,7 +705,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 641 tests, all passing (`make test`).
+- 648 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1560,6 +1564,31 @@ and `max_records` counts printed steps, not skipped ones.
   spans takes its parents from the causal trace reconstruction
   instead of the hash chain, the same tree `blackbox trace`
   prints.
+- `--causal` flag for `blackbox span`: prints a bounded window of
+  OTLP spans around a step — or a single span — with each span's
+  parent from the causal trace reconstruction (`link_parents`,
+  computed on the windowed session) instead of the hash chain,
+  so the window is the same parent-child tree `blackbox trace`
+  prints for it: a tool_result hangs off the tool_call it
+  answers (FIFO per tool), a tool_call off the model_call that
+  decided it. Each causal span carries a
+  `blackbox.causal_parent` attribute and its parent as a
+  seq-based span id; a causal parent outside the windowed
+  session yields a root span marked
+  `blackbox.parent_sampled_out`, the same gap rule as the causal
+  full export. The window dict carries `"causal": true`, and
+  `--json` with `--causal` prints the window dict even for a
+  single span, so the bare span JSON stays the span the
+  `blackbox://session/span/{seq}` template serves. The
+  `blackbox_span` MCP tool takes the same `causal` argument
+  (a boolean, anything else an INVALID_PARAMS error), reusing
+  the shared `span_window` from `otel.py`, so the command and
+  the tool always agree; the default export is unchanged, done
+  (v0.73.0).
+  Next: a `--causal` flag for the
+  `blackbox://session/span/{seq}` template, so a client can
+  read one step's span with its causal parent the same way
+  the CLI can.
 
 ## Layout
 
@@ -1622,7 +1651,9 @@ blackbox/
                   `blackbox span` CLI command (`format_span` prints
                   it as a readable report); `span_window` builds a
                   bounded window of spans around one step, shared by
-                  the CLI and the blackbox_span MCP tool
+                  the CLI and the blackbox_span MCP tool, with
+                  --causal parents from the causal trace
+                  reconstruction
   live_export.py  live OTLP export: POST spans to a collector over
                   HTTP with retry/backoff, background batching
                   thread, Recorder integration, `export --live` CLI
@@ -1653,5 +1684,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            599 tests, all passing
+tests/            648 tests, all passing
 ```

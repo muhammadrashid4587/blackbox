@@ -276,6 +276,10 @@ def main(argv=None):
                         help="print the span as JSON instead of a "
                         "report (with --before / --after / --since / "
                         "--until / --last, the window as JSON)")
+    p_span.add_argument("--causal", action="store_true",
+                        help="take each span's parent from the causal "
+                        "trace reconstruction instead of the hash "
+                        "chain, the same tree `blackbox trace` prints")
     p_span.add_argument("--last", help="keep steps from the last "
                         "this long, e.g. 10m, 2h, 1d, 1h30m "
                         "(the same relative window as query --last)")
@@ -742,7 +746,8 @@ def main(argv=None):
                                  after=args.after,
                                  last=args.last,
                                  since=args.since,
-                                 until=args.until)
+                                 until=args.until,
+                                 causal=args.causal)
         except ValueError as exc:
             # A missing step, a negative --before / --after, a
             # window over 100 spans, a bad --since / --until /
@@ -754,7 +759,7 @@ def main(argv=None):
         if args.as_json:
             if (args.before == 0 and args.after == 0
                     and args.last is None and args.since is None
-                    and args.until is None):
+                    and args.until is None and not args.causal):
                 # The same JSON the
                 # blackbox://session/span/{seq} template serves,
                 # so the command and the template always agree.

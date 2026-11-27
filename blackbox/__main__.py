@@ -44,7 +44,7 @@ from .aggregates import aggregates_log, cost_totals_log
 from .compact import compact_log
 from .live_export import DEFAULT_OTLP_ENDPOINT, OtlpHttpExporter
 from .mcp_server import serve_stdio
-from .otel import export_otlp, export_otlp_metrics, format_span, session_span
+from .otel import export_otlp, export_otlp_metrics, format_span, span_window
 from .query import query_log
 from .recorder import Recorder, _normalize_ts
 from .replay import (diff, format_record, load_records, replay,
@@ -261,14 +261,32 @@ def main(argv=None):
                           "(default: the log's existing model, if any)")
 
     p_span = sub.add_parser(
-        "span", help="print one step as an OTLP span: the same span "
-        "the blackbox://session/span/{seq} MCP resource template "
-        "serves, so the span is readable without an MCP client")
+        "span", help="print one step as an OTLP span, or a window of "
+        "spans around it: the same spans the blackbox_span MCP tool "
+        "returns, so the span window is readable without an MCP client")
     p_span.add_argument("logfile")
     p_span.add_argument("seq", type=int, help="step number to print")
+    p_span.add_argument("--before", type=int, default=0,
+                        help="print this many steps before the "
+                        "step (default: %(default)s)")
+    p_span.add_argument("--after", type=int, default=0,
+                        help="print this many steps after the "
+                        "step (default: %(default)s)")
     p_span.add_argument("--json", action="store_true", dest="as_json",
                         help="print the span as JSON instead of a "
-                        "report")
+                        "report (with --before / --after / --since / "
+                        "--until / --last, the window as JSON)")
+    p_span.add_argument("--last", help="keep steps from the last "
+                        "this long, e.g. 10m, 2h, 1d, 1h30m "
+                        "(the same relative window as query --last)")
+    p_span.add_argument("--since", help="keep steps at or after "
+                        "this ISO timestamp (with a timezone, e.g. "
+                        "2026-11-24T01:00:00Z; the same window as "
+                        "query --since)")
+    p_span.add_argument("--until", help="keep steps at or before "
+                        "this ISO timestamp (with a timezone, e.g. "
+                        "2026-11-24T01:00:00Z; the same window as "
+                        "query --until)")
 
     p_transcript = sub.add_parser(
         "transcript", help="print one step's transcript line, or a "
@@ -719,18 +737,36 @@ def main(argv=None):
                   file=sys.stderr)
             return 1
         try:
-            span = session_span(records, args.seq)
+            window = span_window(records, args.seq,
+                                 before=args.before,
+                                 after=args.after,
+                                 last=args.last,
+                                 since=args.since,
+                                 until=args.until)
         except ValueError as exc:
+            # A missing step, a negative --before / --after, a
+            # window over 100 spans, a bad --since / --until /
+            # --last value, --since after --until, --last combined
+            # with --since / --until, or a step with no usable
+            # timestamp.
             print("span: %s" % exc, file=sys.stderr)
             return 2
-        if span is None:
-            print("span: no step %d in %s" % (args.seq, args.logfile),
-                  file=sys.stderr)
-            return 2
         if args.as_json:
-            sys.stdout.write(json.dumps(span, indent=2) + "\n")
+            if (args.before == 0 and args.after == 0
+                    and args.last is None and args.since is None
+                    and args.until is None):
+                # The same JSON the
+                # blackbox://session/span/{seq} template serves,
+                # so the command and the template always agree.
+                sys.stdout.write(json.dumps(window["spans"][0],
+                                            indent=2) + "\n")
+            else:
+                sys.stdout.write(json.dumps(window, indent=2) + "\n")
         else:
-            sys.stdout.write(format_span(span))
+            # One readable report per span, in log order — the
+            # same report `blackbox span` prints for one step.
+            sys.stdout.write("\n".join(format_span(span)
+                                       for span in window["spans"]))
         return 0
     if args.command == "transcript":
         try:

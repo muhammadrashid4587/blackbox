@@ -197,7 +197,7 @@ from .aggregates import (_window_records, cost_totals, format_aggregates,
                         session_aggregates)
 from .compact import _parse_ts, compact_log
 from .costs import cost_for
-from .otel import session_span
+from .otel import session_span, span_window
 from .query import _parse_bound, _record_cost, query_records
 from .recorder import Recorder, _tokens_total
 from .redact import REDACTED
@@ -1569,17 +1569,15 @@ class MCPServer:
         """One step as a single OTLP span, or a bounded window of
         consecutive spans around it.
 
-        The span for step `seq` — the same span the
-        blackbox://session/span/{seq} template serves, built by
-        the same `session_span` from otel.py, so the tool and the
-        template always agree — plus, with `before` / `after`,
-        the consecutive spans around it, in log order, clamped
-        at the session's ends. With no `before` / `after` that
-        is just the one span. With `since` / `until` / `last`
-        the session is narrowed first through the shared
-        `_window_records`, the same window as `blackbox trace`
-        and the trace resource, so a step the window dropped is
-        not in the session. A missing `seq`, a `seq` that is
+        Built by the shared `span_window` from otel.py — the same
+        window the `blackbox span` CLI command prints and the
+        blackbox://session/span/{seq} template serves one span of,
+        so the tool, the CLI and the template always agree. With no
+        `before` / `after` that is just the one span. With `since`
+        / `until` / `last` the session is narrowed first through
+        the shared `_window_records`, the same window as `blackbox
+        trace` and the trace resource, so a step the window dropped
+        is not in the session. A missing `seq`, a `seq` that is
         not an integer, a step the session does not have
         (including the summary record, which is bookkeeping,
         not a step), a negative `before` / `after`, a window
@@ -1617,31 +1615,14 @@ class MCPServer:
                               "blackbox_span %r must be a string"
                               % flag)
         try:
-            records = _window_records(
-                load_records(self.log_path),
+            window = span_window(
+                load_records(self.log_path), seq,
+                before=before, after=after,
                 last=last, since=since, until=until)
         except ValueError as exc:
             return _error(msg_id, INVALID_PARAMS, str(exc))
-        steps = [r for r in records
-                 if r["type"] not in ("summary", "checkpoint")]
-        index = next((i for i, r in enumerate(steps)
-                      if r["seq"] == seq), None)
-        if index is None:
-            return _error(msg_id, INVALID_PARAMS,
-                          "no step %d in this session" % seq)
-        window = steps[max(0, index - before):index + after + 1]
-        try:
-            spans = [session_span(records, r["seq"]) for r in window]
-        except ValueError as exc:
-            return _error(msg_id, INVALID_PARAMS, str(exc))
-        return self._tool_result(msg_id, json.dumps({
-            "seq": seq,
-            "before": before,
-            "after": after,
-            "count": len(spans),
-            "total": len(steps),
-            "spans": spans,
-        }, indent=2, sort_keys=True))
+        return self._tool_result(msg_id, json.dumps(
+            window, indent=2, sort_keys=True))
 
     def _tool_transcript(self, msg_id, arguments):
         """One step's formatted transcript line, or a bounded window

@@ -346,6 +346,59 @@ def session_span(records, seq):
     return span
 
 
+MAX_SPAN_WINDOW = 100
+
+
+def span_window(records, seq, before=0, after=0, last=None,
+                since=None, until=None, now=None):
+    """One step as a single OTLP span, or a bounded window of
+    consecutive spans around it.
+
+    The span for step `seq` — the same span `session_span` builds
+    for the blackbox://session/span/{seq} template, so the tool,
+    the template and the CLI always agree — plus, with `before` /
+    `after`, the consecutive spans around it, in log order,
+    clamped at the session's ends. With no `before` / `after`
+    that is just the one span. With `since` / `until` / `last`
+    the session is narrowed first through the shared
+    `_window_records`, the same window as `blackbox trace` and
+    the trace resource, so a step the window dropped is not in
+    the session. Returns the window as a dict — `seq`, `before`,
+    `after`, `count`, `total` (steps in the session) and `spans`
+    (each a `session_span` dict) — the same shape the
+    `blackbox_span` MCP tool returns, so the tool and the CLI
+    agree field for field. The summary and checkpoint records
+    are bookkeeping, not steps, so they have no span and are
+    never in a window. A negative `before` / `after`, a window
+    over 100 spans, a step the session does not have, a bad
+    bound, a reversed window, --last combined with --since /
+    --until, or a step with no usable timestamp raises
+    ValueError.
+    """
+    for flag, value in (("before", before), ("after", after)):
+        if value < 0:
+            raise ValueError("%s must be a non-negative integer" % flag)
+    if before + after + 1 > MAX_SPAN_WINDOW:
+        raise ValueError("span window is at most %d steps "
+                         "(before + after + 1)" % MAX_SPAN_WINDOW)
+    records = _window_records(records, last=last, since=since,
+                              until=until, now=now)
+    steps = [r for r in records
+             if r["type"] not in ("summary", "checkpoint")]
+    index = next((i for i, r in enumerate(steps)
+                  if r["seq"] == seq), None)
+    if index is None:
+        raise ValueError("no step %d in this session" % seq)
+    window = steps[max(0, index - before):index + after + 1]
+    spans = [session_span(records, r["seq"]) for r in window]
+    return {"seq": seq,
+            "before": before,
+            "after": after,
+            "count": len(spans),
+            "total": len(steps),
+            "spans": spans}
+
+
 def _iso_from_nanos(nanos):
     """Unix nanoseconds back to a blackbox ISO timestamp (trailing Z)."""
     seconds, ns = divmod(int(nanos), 1_000_000_000)

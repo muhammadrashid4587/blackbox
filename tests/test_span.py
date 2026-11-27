@@ -182,6 +182,188 @@ class SpanCliTest(unittest.TestCase):
         self.assertIn("no usable timestamp", err.getvalue())
 
 
+class SpanWindowCliTest(unittest.TestCase):
+    """Window flags for `blackbox span`: --before / --after around
+    a step, --since / --until / --last narrowing the session first
+    — the same window the blackbox_span MCP tool returns, through
+    the shared span_window, so the CLI and the tool always agree."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "run.jsonl")
+        with Recorder(self.path, task="t", model="gpt-5") as rec:
+            rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                       tokens={"input": 1200, "output": 340})
+            rec.record("tool_call", {"tool": "search",
+                                     "args": {"query": "mcp"}})
+            rec.record("tool_result", {"tool": "search",
+                                       "result": "3 results"})
+        self.records = load_records(self.path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["span", self.path] + [str(a) for a in argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def _fixed_log(self):
+        # Three steps at fixed timestamps, so --since / --until /
+        # --last windows are deterministic.
+        path = os.path.join(self.tmp.name, "fixed.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for seq, ts in enumerate(("2026-11-22T10:00:00Z",
+                                      "2026-11-22T10:01:00Z",
+                                      "2026-11-22T10:02:00Z")):
+                f.write(json.dumps({
+                    "seq": seq, "ts": ts, "type": "tool_call",
+                    "payload": {"tool": "search"},
+                    "tokens": None, "prev_hash": "0" * 64,
+                    "hash": "%064x" % (seq + 1)}) + "\n")
+        return path
+
+    def _run_fixed(self, path, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["span", path] + [str(a) for a in argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_report_window_around_seq(self):
+        code, out, err = self._run(1, "--before", 1, "--after", 1)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        headers = [line for line in out.splitlines()
+                   if line.endswith(")") and "(span " in line]
+        self.assertEqual(headers, [
+            "model_call (span 0000000000000000)",
+            "tool_call (span 0000000000000001)",
+            "tool_result (span 0000000000000002)",
+        ])
+
+    def test_window_clamps_at_session_ends(self):
+        code, out, err = self._run(0, "--before", 5)
+        self.assertEqual(code, 0)
+        self.assertIn("model_call (span 0000000000000000)", out)
+        self.assertNotIn("tool_call", out)
+        code, out, err = self._run(2, "--after", 5)
+        self.assertEqual(code, 0)
+        self.assertIn("tool_result (span 0000000000000002)", out)
+        self.assertNotIn("tool_call", out)
+
+    def test_json_window_matches_span_window(self):
+        from blackbox.otel import span_window
+        code, out, err = self._run(1, "--before", 1, "--after", 1,
+                                   "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out),
+                         span_window(self.records, 1, before=1, after=1))
+
+    def test_json_window_shape(self):
+        code, out, err = self._run(1, "--before", 1, "--after", 1,
+                                   "--json")
+        self.assertEqual(code, 0)
+        window = json.loads(out)
+        self.assertEqual(window["seq"], 1)
+        self.assertEqual((window["before"], window["after"]), (1, 1))
+        self.assertEqual(window["count"], 3)
+        self.assertEqual(window["total"], 3)
+        self.assertEqual([int(s["spanId"], 16)
+                          for s in window["spans"]], [0, 1, 2])
+
+    def test_since_narrows_the_session(self):
+        path = self._fixed_log()
+        # Step 0 is before the bound, so it is not in the session.
+        code, out, err = self._run_fixed(
+            path, 0, "--since", "2026-11-22T10:01:00Z")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("no step 0", err)
+        code, out, err = self._run_fixed(
+            path, 1, "--since", "2026-11-22T10:01:00Z", "--json")
+        self.assertEqual(code, 0)
+        window = json.loads(out)
+        self.assertEqual(window["total"], 2)
+        self.assertEqual([int(s["spanId"], 16)
+                          for s in window["spans"]], [1])
+
+    def test_until_narrows_the_session(self):
+        path = self._fixed_log()
+        code, out, err = self._run_fixed(
+            path, 2, "--until", "2026-11-22T10:01:00Z")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("no step 2", err)
+        # The window clamps at the narrowed session's end: step 2
+        # is dropped, so --after 1 past step 1 adds nothing.
+        code, out, err = self._run_fixed(
+            path, 1, "--until", "2026-11-22T10:01:00Z", "--after", 1,
+            "--json")
+        self.assertEqual(code, 0)
+        window = json.loads(out)
+        self.assertEqual(window["count"], 1)
+        self.assertEqual(window["total"], 2)
+
+    def test_last_narrows_the_session(self):
+        path = self._fixed_log()
+        # Every step is days old, so --last 10m keeps none of them.
+        code, out, err = self._run_fixed(path, 0, "--last", "10m")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("no step 0", err)
+        # The setUp log was recorded just now, so --last 1h keeps
+        # the whole session.
+        code, out, err = self._run(1, "--last", "1h", "--json")
+        self.assertEqual(code, 0)
+        window = json.loads(out)
+        self.assertEqual(window["total"], 3)
+
+    def test_negative_before_or_after_is_an_error(self):
+        for argv in ((1, "--before", -1), (1, "--after", -1)):
+            code, out, err = self._run(*argv)
+            self.assertEqual(code, 2, argv)
+            self.assertEqual(out, "")
+            self.assertIn("non-negative", err)
+
+    def test_window_over_100_is_an_error(self):
+        code, out, err = self._run(1, "--before", 60, "--after", 50)
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("at most 100", err)
+
+    def test_window_of_exactly_100_is_allowed(self):
+        code, out, err = self._run(1, "--before", 50, "--after", 49,
+                                   "--json")
+        self.assertEqual(code, 0)
+        window = json.loads(out)
+        self.assertEqual(window["count"], 3)
+
+    def test_bad_bounds_are_an_error(self):
+        cases = (
+            (1, "--since", "2026-11-24T01:00:00"),  # no timezone
+            (1, "--last", "10x"),  # not a duration
+            (1, "--since", "2026-11-24T02:00:00Z",
+             "--until", "2026-11-24T01:00:00Z"),  # reversed
+            (1, "--last", "10m",
+             "--since", "2026-11-24T01:00:00Z"),  # --last + --since
+            (1, "--last", "10m",
+             "--until", "2026-11-24T01:00:00Z"),  # --last + --until
+        )
+        for argv in cases:
+            code, out, err = self._run(*argv)
+            self.assertEqual(code, 2, argv)
+            self.assertEqual(out, "")
+
+    def test_summary_seq_in_window_is_an_error(self):
+        with Recorder(self.path, task="t", model="gpt-5"):
+            pass  # closing writes the summary record (seq 3)
+        code, out, err = self._run(3, "--before", 1)
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("no step 3", err)
+
+
 def _nanos(ts):
     from datetime import datetime, timezone
     dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))

@@ -701,7 +701,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 629 tests, all passing (`make test`).
+- 641 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1539,10 +1539,27 @@ and `max_records` counts printed steps, not skipped ones.
   a window over 100 records, a bad bound, a reversed window, or
   `--last` combined with `--since` / `--until` is an error, exit
   code 2, done (v0.71.0).
-  Next: `--before` / `--after` / `--since` / `--until` / `--last`
-  window flags for `blackbox span`, so a window of spans is
-  readable without an MCP client, the same rule as
-  `blackbox transcript`.
+- Window flags for `blackbox span`: prints a bounded window of
+  OTLP spans around a step — `--before` / `--after` consecutive
+  spans around it, in log order, clamped at the session's ends
+  and at most 100 spans; `--since` / `--until` / `--last` narrows
+  the session first, so a step the window dropped is not in the
+  session — as readable reports (one `format_span` report per
+  span) or as JSON with `--json` (the window as a dict; with no
+  window flags, the single span, byte for byte the span the
+  `blackbox://session/span/{seq}` template serves), reusing the
+  shared `span_window` from `otel.py` (the `blackbox_span` MCP
+  tool now calls it too), so the command, the tool and the
+  template always agree; the summary record has no span, so it
+  cannot be spanned, even in a window; an unknown step, a
+  negative `--before` / `--after`, a window over 100 spans, a
+  bad bound, a reversed window, `--last` combined with `--since`
+  / `--until`, or a step with no usable timestamp is an error,
+  exit code 2, done (v0.72.0).
+  Next: a `--causal` flag for `blackbox span`, so a window of
+  spans takes its parents from the causal trace reconstruction
+  instead of the hash chain, the same tree `blackbox trace`
+  prints.
 
 ## Layout
 
@@ -1603,7 +1620,9 @@ blackbox/
                   one step as a single span for the
                   blackbox://session/span/{seq} template and the
                   `blackbox span` CLI command (`format_span` prints
-                  it as a readable report)
+                  it as a readable report); `span_window` builds a
+                  bounded window of spans around one step, shared by
+                  the CLI and the blackbox_span MCP tool
   live_export.py  live OTLP export: POST spans to a collector over
                   HTTP with retry/backoff, background batching
                   thread, Recorder integration, `export --live` CLI

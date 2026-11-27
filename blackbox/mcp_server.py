@@ -202,7 +202,8 @@ from .query import _parse_bound, _record_cost, query_records
 from .recorder import Recorder, _tokens_total
 from .redact import REDACTED
 from .replay import (_short, diff_records, format_record, load_records,
-                    model_usage, session_diff, session_transcript_step)
+                    model_usage, session_diff, session_transcript_step,
+                    transcript_window)
 from .sampling import (Sampler, SamplingDeclinedError, SamplingError,
                        SamplingNotSupportedError, StdioTransport)
 from .tail_sampling import (_is_error, _span_durations_ms,
@@ -1646,25 +1647,23 @@ class MCPServer:
         """One step's formatted transcript line, or a bounded window
         of consecutive lines around it.
 
-        The line for step `seq` — the same line the
-        blackbox://session/transcript/{seq} template serves, built
-        by the same `session_transcript_step` from replay.py, so
-        the tool and the template always agree — plus, with
-        `before` / `after`, the consecutive lines around it, in
-        log order, clamped at the session's ends. With no
-        `before` / `after` that is just the one line. With `since`
-        / `until` / `last` the session is narrowed first through
-        the shared `_window_records`, the same window as
-        `blackbox replay` and the transcript resource, so a step
-        the window dropped is not in the session. A missing `seq`,
-        a `seq` that is not an integer, a step the session does
-        not have (including the summary record, which is
-        bookkeeping, not a step), a negative `before` / `after`,
-        a window over 100 steps, a bad bound, a reversed window,
-        --last combined with --since / --until, or a wrongly typed
-        argument is an INVALID_PARAMS error, the tool-call
-        analogue of the CLI's exit code 2. Read-only: it removes
-        or changes nothing.
+        Built by the shared `transcript_window` from replay.py —
+        the same window the `blackbox transcript` CLI command
+        prints and the blackbox://session/transcript/{seq}
+        template serves, so the tool, the CLI and the template
+        always agree. With no `before` / `after` that is just the
+        one line. With `since` / `until` / `last` the session is
+        narrowed first through the shared `_window_records`, the
+        same window as `blackbox replay` and the transcript
+        resource, so a step the window dropped is not in the
+        session. A missing `seq`, a `seq` that is not an integer,
+        a step the session does not have (including the summary
+        record, which is bookkeeping, not a step), a negative
+        `before` / `after`, a window over 100 steps, a bad bound,
+        a reversed window, --last combined with --since /
+        --until, or a wrongly typed argument is an INVALID_PARAMS
+        error, the tool-call analogue of the CLI's exit code 2.
+        Read-only: it removes or changes nothing.
         """
         seq = arguments.get("seq")
         if (seq is None or isinstance(seq, bool)
@@ -1693,30 +1692,14 @@ class MCPServer:
                               "blackbox_transcript %r must be a string"
                               % flag)
         try:
-            records = _window_records(
-                load_records(self.log_path),
+            window = transcript_window(
+                load_records(self.log_path), seq,
+                before=before, after=after,
                 last=last, since=since, until=until)
         except ValueError as exc:
             return _error(msg_id, INVALID_PARAMS, str(exc))
-        steps = [r for r in records
-                 if r["type"] not in ("summary", "checkpoint")]
-        index = next((i for i, r in enumerate(steps)
-                      if r["seq"] == seq), None)
-        if index is None:
-            return _error(msg_id, INVALID_PARAMS,
-                          "no step %d in this session" % seq)
-        window = steps[max(0, index - before):index + after + 1]
-        lines = [{"seq": r["seq"],
-                  "line": session_transcript_step(records, r["seq"])}
-                 for r in window]
-        return self._tool_result(msg_id, json.dumps({
-            "seq": seq,
-            "before": before,
-            "after": after,
-            "count": len(lines),
-            "total": len(steps),
-            "lines": lines,
-        }, indent=2, sort_keys=True))
+        return self._tool_result(msg_id, json.dumps(
+            window, indent=2, sort_keys=True))
 
     def _tool_sample(self, msg_id, arguments):
         messages = arguments.get("messages")

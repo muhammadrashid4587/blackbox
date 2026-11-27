@@ -7,7 +7,7 @@ append-only log you can verify and replay.
 Pure Python 3 standard library. No dependencies.
 """
 
-__version__ = "0.68.0"
+__version__ = "0.69.0"
 
 from .compact import compact_log
 from .costs import cost_for, price_for, register_pricing
@@ -20,7 +20,7 @@ from .otel import (export_otlp, export_otlp_file, export_otlp_metrics,
 from .query import query_log, query_records
 from .recorder import Recorder
 from .replay import (diff, diff_records, load_records, replay,
-                     session_transcript_step)
+                     session_transcript_step, transcript_window)
 from .sampling import (Sampler, SamplingDeclinedError, SamplingError,
                        SamplingNotSupportedError, SamplingResult,
                        StdioTransport)
@@ -49,4 +49,4 @@ __all__ = ["DEFAULT_OTLP_ENDPOINT", "DEFAULT_MAX_COST_USD",
            "replay", "session_span", "session_trace",
            "session_transcript_step", "spans_to_records",
            "tail_sample_records", "trace_log", "trace_subtree",
-           "verify", "watch_log"]
+           "transcript_window", "verify", "watch_log"]

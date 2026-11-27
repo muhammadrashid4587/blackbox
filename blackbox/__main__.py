@@ -13,6 +13,8 @@
         | python -m blackbox record data/run.jsonl --stdin
     python -m blackbox record data/run.jsonl --file steps.jsonl
     python -m blackbox span data/run.jsonl 0  # one step as an OTLP span
+    python -m blackbox transcript data/run.jsonl 1  # one step's transcript line
+    python -m blackbox transcript data/run.jsonl 1 --before 1 --after 1
     python -m blackbox watch data/run.jsonl  # tail a live log
     python -m blackbox watch data/run.jsonl --type tool_call --errors-only
     python -m blackbox watch data/run.jsonl --since 2026-11-24T01:00:00Z --until 2026-11-24T02:00:00Z
@@ -44,7 +46,7 @@ from .mcp_server import serve_stdio
 from .otel import export_otlp, export_otlp_metrics, format_span, session_span
 from .query import query_log
 from .recorder import Recorder, _normalize_ts
-from .replay import diff, load_records, replay
+from .replay import diff, load_records, replay, transcript_window
 from .tail_sampling import (DEFAULT_MAX_COST_USD, DEFAULT_SLOW_MS,
                             export_tail_sampled_otlp)
 from .trace import trace_log
@@ -265,6 +267,34 @@ def main(argv=None):
     p_span.add_argument("--json", action="store_true", dest="as_json",
                         help="print the span as JSON instead of a "
                         "report")
+
+    p_transcript = sub.add_parser(
+        "transcript", help="print one step's transcript line, or a "
+        "window of lines around it: the same lines the "
+        "blackbox_transcript MCP tool returns, so the transcript "
+        "window is readable without an MCP client")
+    p_transcript.add_argument("logfile")
+    p_transcript.add_argument("seq", type=int, help="step number to print")
+    p_transcript.add_argument("--before", type=int, default=0,
+                              help="print this many steps before the "
+                              "step (default: %(default)s)")
+    p_transcript.add_argument("--after", type=int, default=0,
+                              help="print this many steps after the "
+                              "step (default: %(default)s)")
+    p_transcript.add_argument("--json", action="store_true", dest="as_json",
+                              help="print the window as JSON instead of "
+                              "transcript lines")
+    p_transcript.add_argument("--last", help="keep steps from the last "
+                              "this long, e.g. 10m, 2h, 1d, 1h30m "
+                              "(the same relative window as query --last)")
+    p_transcript.add_argument("--since", help="keep steps at or after "
+                              "this ISO timestamp (with a timezone, e.g. "
+                              "2026-11-24T01:00:00Z; the same window as "
+                              "query --since)")
+    p_transcript.add_argument("--until", help="keep steps at or before "
+                              "this ISO timestamp (with a timezone, e.g. "
+                              "2026-11-24T01:00:00Z; the same window as "
+                              "query --until)")
 
     p_watch = sub.add_parser(
         "watch", help="tail a live log and print new steps as they "
@@ -670,6 +700,34 @@ def main(argv=None):
             sys.stdout.write(json.dumps(span, indent=2) + "\n")
         else:
             sys.stdout.write(format_span(span))
+        return 0
+    if args.command == "transcript":
+        try:
+            records = load_records(args.logfile)
+        except FileNotFoundError:
+            print("transcript: file not found: %s" % args.logfile,
+                  file=sys.stderr)
+            return 1
+        try:
+            window = transcript_window(records, args.seq,
+                                       before=args.before,
+                                       after=args.after,
+                                       last=args.last,
+                                       since=args.since,
+                                       until=args.until)
+        except ValueError as exc:
+            # A missing step, a negative --before / --after, a
+            # window over 100 lines, a bad --since / --until /
+            # --last value, --since after --until, or --last
+            # combined with --since / --until.
+            print("transcript: %s" % exc, file=sys.stderr)
+            return 2
+        if args.as_json:
+            sys.stdout.write(json.dumps(window, indent=2) + "\n")
+        else:
+            sys.stdout.write("\n".join(line["line"]
+                                       for line in window["lines"])
+                             + "\n")
         return 0
     if args.command == "watch":
         if args.poll_interval <= 0:

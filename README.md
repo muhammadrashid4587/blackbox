@@ -695,7 +695,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 599 tests, all passing (`make test`).
+- 614 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1490,6 +1490,23 @@ and `max_records` counts printed steps, not skipped ones.
   `--since` / `--until`, or a wrongly typed argument is an
   INVALID_PARAMS error. Read-only: it removes or changes
   nothing, done (v0.68.0).
+- `blackbox transcript` CLI command: prints one step's
+  transcript line — or with `--before` / `--after` a bounded
+  window of consecutive lines around it, in log order, clamped
+  at the session's ends and at most 100 lines; with `--since` /
+  `--until` / `--last` only the steps in that window — as
+  transcript lines, or as JSON with `--json`, reusing the shared
+  `transcript_window` from `replay.py` (the same `_window_records`
+  and `session_transcript_step` the `blackbox_transcript` MCP
+  tool now calls too), so the command, the tool and the
+  `blackbox://session/transcript/{seq}` template always agree;
+  an unknown step, the summary record, a negative `--before` /
+  `--after`, a window over 100 lines, a bad bound, a reversed
+  window, or `--last` combined with `--since` / `--until` is an
+  error, exit code 2, done (v0.69.0).
+  Next: a CLI mirror of the one remaining resource template
+  without one — print one step's raw record as JSON, the same
+  record `blackbox://session/record/{seq}` serves.
 
 ## Layout
 

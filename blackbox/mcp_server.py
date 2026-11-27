@@ -41,7 +41,12 @@ templates, and eight prompts:
                               node the blackbox://session/trace
                               resource carries for that step, so a
                               client can read one branch without
-                              the whole tree
+                              the whole tree — the same --since /
+                              --until / --last window as
+                              `blackbox trace` rides in the query
+                              string after the step number too, and
+                              narrows the session before the
+                              subtree is built
     blackbox://session/aggregates/model/{model}
                               one model's totals as a resource
                               template: calls, input/output tokens
@@ -398,8 +403,17 @@ RESOURCE_TEMPLATES = [
                         "the blackbox://session/trace resource "
                         "carries for that step, with its children "
                         "in log order — so a client can read one "
-                        "branch without the whole tree. Read it by "
-                        "expanding the template with a step number, "
+                        "branch without the whole tree. The same "
+                        "--since / --until / --last window as "
+                        "`blackbox trace` rides in the query string "
+                        "after the step number too, e.g. "
+                        "blackbox://session/trace/2"
+                        "?since=2026-11-24T01:00:00Z, and narrows "
+                        "the session before the subtree is built; "
+                        "a bad bound, a reversed window, or --last "
+                        "combined with --since / --until is an "
+                        "error. Read it by expanding the template "
+                        "with a step number, "
                         "e.g. blackbox://session/trace/2."),
         "mimeType": "application/json",
     },
@@ -1471,7 +1485,8 @@ class MCPServer:
             {"uri": uri, "mimeType": "application/json",
              "text": text}]})
 
-    def _read_trace_subtree(self, msg_id, uri, seq_text):
+    def _read_trace_subtree(self, msg_id, uri, seq_text, last=None,
+                            since=None, until=None):
         """One branch of the session's causal trace, as a resource
         read.
 
@@ -1480,8 +1495,18 @@ class MCPServer:
         `trace_subtree` in trace.py — the same node
         `build_trace` builds for the whole session — so the
         template and the blackbox://session/trace resource always
-        agree. A step number that is not an integer, or a step the
-        session does not have, is an error.
+        agree. last / since / until are the same --last / --since /
+        --until window as `blackbox trace`, applied to the session
+        through the shared `_window_records` before the subtree is
+        built, so a step outside the window cannot change the
+        branch; the summary and checkpoint records are kept
+        untouched, like the CLI trace. A step number that is not
+        an integer, or a step the session does not have — including
+        one the window dropped — is an error, and a bad bound, a
+        reversed window, or --last combined with --since / --until
+        raises ValueError in `_window_records` and is an
+        INVALID_PARAMS error here — the resource-read analogue of
+        the CLI trace's exit code 2.
         """
         try:
             seq = int(unquote(seq_text))
@@ -1491,6 +1516,11 @@ class MCPServer:
                 "blackbox://session/trace/{seq} needs a step number, "
                 "e.g. blackbox://session/trace/2")
         records = load_records(self.log_path)
+        try:
+            records = _window_records(
+                records, last=last, since=since, until=until)
+        except ValueError as exc:
+            return _error(msg_id, INVALID_PARAMS, str(exc))
         node = trace_subtree(records, seq)
         if node is None:
             return _error(msg_id, INVALID_PARAMS,
@@ -1735,14 +1765,24 @@ class MCPServer:
         if uri.startswith("blackbox://session/trace/"):
             # The resource template blackbox://session/trace/{seq}:
             # the subtree rooted at step seq, the same node the
-            # trace resource carries for that step.
-            seq_text = uri[len("blackbox://session/trace/"):]
+            # trace resource carries for that step. The --since /
+            # --until / --last window rides in the query string
+            # after the step number, e.g.
+            # blackbox://session/trace/2?since=2026-11-24T01:00:00Z,
+            # so it is split off before the step number is parsed.
+            seq_part, _, query_text = uri.partition("?")
+            seq_text = seq_part[len("blackbox://session/trace/"):]
             if not seq_text:
                 return _error(
                     msg_id, INVALID_PARAMS,
                     "blackbox://session/trace/{seq} needs a step "
                     "number, e.g. blackbox://session/trace/2")
-            return self._read_trace_subtree(msg_id, uri, seq_text)
+            query = parse_qs(query_text)
+            return self._read_trace_subtree(
+                msg_id, uri, seq_text,
+                last=query.get("last", [None])[0],
+                since=query.get("since", [None])[0],
+                until=query.get("until", [None])[0])
         if (uri == "blackbox://session/diff"
                 or uri.startswith("blackbox://session/diff?")):
             # A resource read takes no arguments, so the other

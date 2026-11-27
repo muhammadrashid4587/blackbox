@@ -248,6 +248,12 @@ rooted at step seq — the same node the
 `blackbox://session/trace` resource carries for that step, with
 its children in log order — so a client can read one branch
 without the whole tree, e.g. `blackbox://session/trace/2`.
+The same `--since` / `--until` / `--last` window as
+`blackbox trace` rides in the query string after the step number
+too, e.g. `blackbox://session/trace/2?since=2026-11-24T01:00:00Z`,
+and narrows the session before the subtree is built; a bad
+bound, a reversed window, or `--last` combined with `--since` /
+`--until` is an error.
 Reading it with a step number that is not an integer, or a step
 the session does not have, is an error. Five more resource
 templates name one slice each:
@@ -567,7 +573,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 540 tests, all passing (`make test`).
+- 543 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1152,9 +1158,27 @@ and `max_records` counts printed steps, not skipped ones.
   untouched, so the trace still runs over the whole log's
   bookkeeping, not just the window's. Works on `.jsonl` logs and
   `.db` stores, done (v0.56.0).
-  Next: the same window for the `blackbox://session/trace/{seq}`
-  template, so one branch of the trace can be narrowed to a
-  window too.
+- Trace template time-range filters:
+  `blackbox://session/trace/{seq}` takes the same `--since` /
+  `--until` / `--last` window as `blackbox trace`, as query
+  parameters after the step number — e.g.
+  `blackbox://session/trace/2?since=2026-11-24T01:00:00Z&until=
+  2026-11-24T02:00:00Z` — through the shared `_window_records`
+  from `aggregates.py`, so a value that does not parse or carries
+  no timezone is an error, --since after --until is an error, and
+  --last cannot be combined with --since or --until is an error
+  (an INVALID_PARAMS error on a resource read, exit code 2 on the
+  CLI), and a step whose timestamp does not parse, or carries no
+  timezone, never matches. The window is applied to the session
+  before the subtree is built, so a step outside the window
+  cannot change the branch, and a step the window dropped is not
+  in the session. The summary and checkpoint records are kept
+  untouched, so the trace still runs over the whole log's
+  bookkeeping, not just the window's. Works on `.jsonl` logs and
+  `.db` stores, done (v0.57.0).
+  Next: the same window for the `blackbox://session/aggregates`
+  resource, so the session totals can be narrowed to a window
+  too.
 
 ## Layout
 
@@ -1238,5 +1262,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            540 tests, all passing
+tests/            543 tests, all passing
 ```

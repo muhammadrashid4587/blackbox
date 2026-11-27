@@ -745,6 +745,55 @@ class MCPServerTest(unittest.TestCase):
                      {"uri": "blackbox://session/trace/"}))
         self.assertEqual(response["error"]["code"], -32602)
 
+    def test_resources_read_session_trace_template_window_last(self):
+        # The same --last window as `blackbox trace --last`: the
+        # session was recorded just now, so last=1h keeps every
+        # step and the subtree is the unwindowed one.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/trace/1?last=1h"}))
+        node = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(node["seq"], 1)
+        self.assertEqual(node["type"], "tool_call")
+        self.assertEqual(len(node["children"]), 1)
+        self.assertEqual(node["children"][0]["seq"], 2)
+        self.assertEqual(node["children"][0]["children"][0]["seq"], 3)
+
+    def test_resources_read_session_trace_template_window_since_excludes_step(self):
+        # A --since window after every step drops the session to
+        # zero steps, so the windowed-out step is not in the
+        # session and the template read is an error — the window
+        # is applied before the subtree is built.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/trace/1"
+                            "?since=2999-01-01T00:00:00Z"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_trace_template_window_bad_bounds_are_errors(self):
+        # A bad bound, a reversed window, --last combined with
+        # --since, and a bad --last are INVALID_PARAMS errors —
+        # the resource-read analogue of the CLI trace's exit
+        # code 2.
+        self._init()
+        self._record_session()
+        base = "blackbox://session/trace/1"
+        for suffix in ("?since=not-a-time",
+                       "?since=2026-11-24T02:00:00Z"
+                       "&until=2026-11-24T01:00:00Z",
+                       "?last=1h&since=2026-11-24T01:00:00Z",
+                       "?last=soon"):
+            response = self.server.handle_message(
+                _request(2, "resources/read",
+                         {"uri": base + suffix}))
+            self.assertEqual(response["error"]["code"], -32602,
+                             suffix)
+
     def test_resources_read_session_aggregates_model_template(self):
         # The same per-model entry `blackbox costs` prints for
         # gpt-5: 2 calls, 1300 in + 390 out = $0.005525.

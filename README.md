@@ -199,7 +199,7 @@ the run's cost under the summary.
 **MCP server.** `python -m blackbox mcp data/run.jsonl` starts a
 minimal MCP server on stdio (newline-delimited JSON-RPC 2.0, no
 dependencies), so any MCP client can record through blackbox. It
-exposes seven tools: `blackbox_record` (append one step — same
+exposes eight tools: `blackbox_record` (append one step — same
 redaction, hash chain and fsync as the library), `blackbox_verify`
 (check the chain), `blackbox_replay` (read the transcript back),
 `blackbox_query` (filter the session's steps — by type, model,
@@ -231,7 +231,22 @@ only the steps in that window, the same window as
 `blackbox aggregates`; a bad bound, a reversed window, `--last`
 combined with `--since` / `--until`, or a wrongly typed
 argument is an INVALID_PARAMS error, the tool-call analogue of
-the CLI's exit code 2).
+the CLI's exit code 2), and `blackbox_trace` (one step's full
+record as JSON — the record for step `seq`, the same record the
+`blackbox://session/record/{seq}` template serves, so the tool
+and the template always agree — or with `before` / `after` a
+bounded window of consecutive steps around it, in log order,
+clamped at the session's ends and at most 100 steps; with
+`since` / `until` / `last` only the steps in that window, the
+same window as `blackbox trace` and the trace resource, so a
+step the window dropped is not in the session; a missing `seq`,
+a `seq` that is not an integer, a step the session does not
+have — including the summary record, which is bookkeeping, not
+a step — a negative `before` / `after`, a window over 100
+steps, a bad bound, a reversed window, `--last` combined with
+`--since` / `--until`, or a wrongly typed argument is an
+INVALID_PARAMS error, the tool-call analogue of the CLI's exit
+code 2; read-only, it removes or changes nothing).
 The session is also readable as five resources:
 `blackbox://session` (the transcript — the same `--since` /
 `--until` / `--last` window as `blackbox replay` rides in the
@@ -1349,9 +1364,26 @@ and `max_records` counts printed steps, not skipped ones.
   window, `--last` combined with `--since` / `--until`, an empty
   bound, or a wrongly typed argument is an INVALID_PARAMS error.
   Read-only: it removes or changes nothing, done (v0.64.0).
-  Next: an MCP trace tool, so a client can read the session's
-  causal trace as a tool call the same way `blackbox_aggregates`
-  serves the session totals.
+- MCP trace tool: `blackbox_trace` returns one step's full
+  record as JSON — the record for step `seq`, the same record
+  the `blackbox://session/record/{seq}` template serves, read
+  from the same `load_records`, so the tool and the template
+  always agree — or with `before` / `after` a bounded window
+  of consecutive steps around it, in log order, clamped at the
+  session's ends and at most 100 steps; with `since` / `until`
+  / `last` only the steps in that window, through the shared
+  `_window_records` from `aggregates.py`, the same window as
+  `blackbox trace` and the trace resource, so a step the window
+  dropped is not in the session. A missing `seq`, a `seq` that
+  is not an integer, a step the session does not have
+  (including the summary record, which is bookkeeping, not a
+  step), a negative `before` / `after`, a window over 100
+  steps, a bad bound, a reversed window, `--last` combined
+  with `--since` / `--until`, or a wrongly typed argument is
+  an INVALID_PARAMS error. Read-only: it removes or changes
+  nothing, done (v0.65.0).
+  Next: an MCP diff tool, so a client can compare two runs as a
+  tool call the same way `blackbox_trace` reads one run.
 
 ## Layout
 
@@ -1362,7 +1394,7 @@ blackbox/
   sqlite_store.py SQLite store: same records, same chain, WAL + synchronous=FULL
   costs.py        per-model cost tracking: list prices, cost math
   mcp_server.py   MCP server on stdio: record / verify / replay /
-                  query / cost / aggregates tools, session resources, resource
+                  query / cost / aggregates / trace tools, session resources, resource
                   templates for the
                   diff, a trace subtree, aggregates slices, one
                   step's raw record, one step's transcript line and

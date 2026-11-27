@@ -1,4 +1,4 @@
-"""MCP server: handshake, tools/list, and the three tools over
+"""MCP server: handshake, tools/list, and the tools over
 newline-delimited JSON-RPC on stdio."""
 
 import io
@@ -73,7 +73,7 @@ class MCPServerTest(unittest.TestCase):
         self.assertEqual(names, ["blackbox_record", "blackbox_verify",
                                  "blackbox_replay", "blackbox_query",
                                  "blackbox_cost", "blackbox_aggregates",
-                                 "blackbox_sample"])
+                                 "blackbox_trace", "blackbox_sample"])
         for tool in response["result"]["tools"]:
             self.assertIn("inputSchema", tool)
 
@@ -385,6 +385,116 @@ class MCPServerTest(unittest.TestCase):
                              arguments)
             self.assertEqual(response["error"]["code"], -32602,
                              arguments)
+
+    def _trace(self, msg_id, arguments):
+        response = _call(self.server, msg_id, "blackbox_trace",
+                         arguments)
+        self.assertNotIn("error", response)
+        self.assertFalse(response["result"]["isError"])
+        return json.loads(response["result"]["content"][0]["text"])
+
+    def test_trace_tool_returns_single_step(self):
+        self._init()
+        self._seed_aggregates_log()
+        result = self._trace(2, {"seq": 2})
+        self.assertEqual(result["seq"], 2)
+        self.assertEqual((result["before"], result["after"]), (0, 0))
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["total"], 6)
+        record = result["records"][0]
+        self.assertEqual(record["seq"], 2)
+        self.assertEqual(record["type"], "tool_result")
+        self.assertEqual(record["payload"]["tool"], "search")
+        self.assertIn("hash", record)
+        self.assertIn("prev_hash", record)
+
+    def test_trace_tool_agrees_with_record_template(self):
+        self._init()
+        self._seed_aggregates_log()
+        result = self._trace(2, {"seq": 4})
+        response = self.server.handle_message(_request(
+            3, "resources/read",
+            {"uri": "blackbox://session/record/4"}))
+        template = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(result["records"], [template])
+
+    def test_trace_tool_window_around_seq(self):
+        self._init()
+        self._seed_aggregates_log()
+        result = self._trace(2, {"seq": 2, "before": 1, "after": 2})
+        self.assertEqual([r["seq"] for r in result["records"]],
+                         [1, 2, 3, 4])
+        self.assertEqual(result["count"], 4)
+        # Clamped at the session's ends: no step before 0, none
+        # after the last.
+        result = self._trace(3, {"seq": 0, "before": 5})
+        self.assertEqual([r["seq"] for r in result["records"]], [0])
+        result = self._trace(4, {"seq": 5, "after": 5})
+        self.assertEqual([r["seq"] for r in result["records"]], [5])
+        # A window of exactly 100 steps is allowed.
+        result = self._trace(5, {"seq": 2, "before": 50, "after": 49})
+        self.assertEqual([r["seq"] for r in result["records"]],
+                         [0, 1, 2, 3, 4, 5])
+
+    def test_trace_tool_window_narrows_the_session(self):
+        self._init()
+        self._seed_aggregates_log()
+        # Every step was recorded just now, so a window starting in
+        # 2020 keeps the whole session and one ending in 2020 keeps
+        # none of it — the step is not in the session.
+        result = self._trace(
+            2, {"seq": 0, "since": "2020-01-01T00:00:00Z"})
+        self.assertEqual(result["total"], 6)
+        response = _call(self.server, 3, "blackbox_trace",
+                         {"seq": 0, "until": "2020-01-01T00:00:00Z"})
+        self.assertEqual(response["error"]["code"], -32602)
+        result = self._trace(4, {"seq": 5, "last": "1h"})
+        self.assertEqual(result["total"], 6)
+
+    def test_trace_tool_rejects_bad_arguments(self):
+        self._init()
+        self._seed_aggregates_log()
+        for arguments in (
+                {},  # seq is required
+                {"seq": "2"},  # must be an integer
+                {"seq": True},  # a bool is not an integer
+                {"seq": 2.0},  # a float is not an integer
+                {"seq": 99},  # no such step
+                {"seq": 0, "before": -1},
+                {"seq": 0, "after": -1},
+                {"seq": 0, "before": 1.5},
+                {"seq": 0, "after": "1"},
+                {"seq": 0, "before": 60, "after": 50},  # over 100
+                {"seq": 0, "since": 5},  # must be a string
+                {"seq": 0, "until": ["2020-01-01T00:00:00Z"]},
+                {"seq": 0, "last": 10},
+                {"seq": 0, "since": ""},  # empty is not a timestamp
+                {"seq": 0, "until": ""},
+                {"seq": 0, "last": ""},
+                {"seq": 0, "since": "2026-11-24T01:00:00"},  # no tz
+                {"seq": 0, "last": "10x"},  # not a duration
+                {"seq": 0, "since": "2026-11-24T02:00:00Z",
+                 "until": "2026-11-24T01:00:00Z"},  # reversed
+                {"seq": 0, "last": "10m",
+                 "since": "2026-11-24T01:00:00Z"},
+                {"seq": 0, "last": "10m",
+                 "until": "2026-11-24T01:00:00Z"},
+        ):
+            response = _call(self.server, 2, "blackbox_trace",
+                             arguments)
+            self.assertEqual(response["error"]["code"], -32602,
+                             arguments)
+
+    def test_trace_tool_rejects_summary_seq(self):
+        self._init()
+        self._seed_aggregates_log()
+        # Closing the server writes the summary record (seq 6):
+        # it is bookkeeping, not a step, so tracing it is an error.
+        self.server.close()
+        response = _call(self.server, 2, "blackbox_trace",
+                         {"seq": 6})
+        self.assertEqual(response["error"]["code"], -32602)
 
     def test_initialize_advertises_resources_and_prompts(self):
         response = self._init()

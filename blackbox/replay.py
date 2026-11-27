@@ -103,6 +103,24 @@ def format_record(record):
     return "%s  %s" % (header, _short(payload))
 
 
+def session_record(records, seq):
+    """One step's raw record, or None if the session has no record
+    with that seq.
+
+    The record the blackbox://session/record/{seq} MCP resource
+    template serves: the same record the blackbox://session.json
+    resource carries for that step — seq, timestamp, type, payload,
+    tokens and the hash chain — so the template, the resource and
+    the `blackbox show` command always agree. Any record counts,
+    including the summary and checkpoint records, which are
+    bookkeeping but are still records in the log; a span or a
+    transcript line for them would make no sense, but the raw
+    record is exactly what a client asks for here. Returns None
+    when no record has that seq.
+    """
+    return next((r for r in records if r["seq"] == seq), None)
+
+
 def session_transcript_step(records, seq):
     """One step's formatted transcript line, or None if the session
     has no record with that seq.

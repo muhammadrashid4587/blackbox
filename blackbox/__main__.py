@@ -15,6 +15,7 @@
     python -m blackbox span data/run.jsonl 0  # one step as an OTLP span
     python -m blackbox transcript data/run.jsonl 1  # one step's transcript line
     python -m blackbox transcript data/run.jsonl 1 --before 1 --after 1
+    python -m blackbox show data/run.jsonl 1  # one step's raw record
     python -m blackbox watch data/run.jsonl  # tail a live log
     python -m blackbox watch data/run.jsonl --type tool_call --errors-only
     python -m blackbox watch data/run.jsonl --since 2026-11-24T01:00:00Z --until 2026-11-24T02:00:00Z
@@ -46,7 +47,8 @@ from .mcp_server import serve_stdio
 from .otel import export_otlp, export_otlp_metrics, format_span, session_span
 from .query import query_log
 from .recorder import Recorder, _normalize_ts
-from .replay import diff, load_records, replay, transcript_window
+from .replay import (diff, format_record, load_records, replay,
+                     session_record, transcript_window)
 from .tail_sampling import (DEFAULT_MAX_COST_USD, DEFAULT_SLOW_MS,
                             export_tail_sampled_otlp)
 from .trace import trace_log
@@ -295,6 +297,16 @@ def main(argv=None):
                               "this ISO timestamp (with a timezone, e.g. "
                               "2026-11-24T01:00:00Z; the same window as "
                               "query --until)")
+
+    p_show = sub.add_parser(
+        "show", help="print one step's raw record: the same record "
+        "the blackbox://session/record/{seq} MCP resource template "
+        "serves, so the record is readable without an MCP client")
+    p_show.add_argument("logfile")
+    p_show.add_argument("seq", type=int, help="step number to print")
+    p_show.add_argument("--json", action="store_true", dest="as_json",
+                        help="print the record as JSON instead of a "
+                        "report")
 
     p_watch = sub.add_parser(
         "watch", help="tail a live log and print new steps as they "
@@ -728,6 +740,32 @@ def main(argv=None):
             sys.stdout.write("\n".join(line["line"]
                                        for line in window["lines"])
                              + "\n")
+        return 0
+    if args.command == "show":
+        try:
+            records = load_records(args.logfile)
+        except FileNotFoundError:
+            print("show: file not found: %s" % args.logfile,
+                  file=sys.stderr)
+            return 1
+        record = session_record(records, args.seq)
+        if record is None:
+            print("show: no step %d in %s" % (args.seq, args.logfile),
+                  file=sys.stderr)
+            return 2
+        if args.as_json:
+            # The same JSON the blackbox://session/record/{seq}
+            # template serves, byte for byte, so the command and
+            # the template always agree.
+            sys.stdout.write(json.dumps(record, indent=2, sort_keys=True)
+                             + "\n")
+        else:
+            # The transcript line for the step, plus the hash chain
+            # the line does not carry — the record itself, readable
+            # without parsing JSON.
+            sys.stdout.write("%s\n    hash: %s\n    prev_hash: %s\n"
+                             % (format_record(record), record["hash"],
+                                record["prev_hash"]))
         return 0
     if args.command == "watch":
         if args.poll_interval <= 0:

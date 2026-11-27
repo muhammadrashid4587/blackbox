@@ -202,8 +202,8 @@ from .query import _parse_bound, _record_cost, query_records
 from .recorder import Recorder, _tokens_total
 from .redact import REDACTED
 from .replay import (_short, diff_records, format_record, load_records,
-                    model_usage, session_diff, session_transcript_step,
-                    transcript_window)
+                    model_usage, session_diff, session_record,
+                    session_transcript_step, transcript_window)
 from .sampling import (Sampler, SamplingDeclinedError, SamplingError,
                        SamplingNotSupportedError, StdioTransport)
 from .tail_sampling import (_is_error, _span_durations_ms,
@@ -2437,11 +2437,12 @@ class MCPServer:
         """One step's raw record, as a resource read.
 
         One implementation for the blackbox://session/record/{seq}
-        template: the record for step seq, from `load_records` —
+        template: the record `session_record` finds for step seq —
         the same record the blackbox://session.json resource
-        carries for that step — so the template and the resource
-        always agree. A step number that is not an integer, or a
-        step the session does not have, is an error.
+        carries for that step, and the same helper the `blackbox
+        show` command calls, so the template, the resource and
+        the command always agree. A step number that is not an
+        integer, or a step the session does not have, is an error.
         """
         try:
             seq = int(unquote(seq_text))
@@ -2451,7 +2452,7 @@ class MCPServer:
                 "blackbox://session/record/{seq} needs a step number, "
                 "e.g. blackbox://session/record/2")
         records = load_records(self.log_path)
-        record = next((r for r in records if r["seq"] == seq), None)
+        record = session_record(records, seq)
         if record is None:
             return _error(msg_id, INVALID_PARAMS,
                           "no step %d in this session" % seq)

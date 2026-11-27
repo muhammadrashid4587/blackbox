@@ -45,6 +45,9 @@ python -m blackbox verify data/demo.jsonl
 # Read the run back as a transcript
 python -m blackbox replay data/demo.jsonl
 
+# Read one step's raw record, hash chain included
+python -m blackbox show data/demo.jsonl 1
+
 # Follow a live run as it happens
 python -m blackbox watch data/run.jsonl
 
@@ -695,7 +698,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 614 tests, all passing (`make test`).
+- 622 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1504,9 +1507,20 @@ and `max_records` counts printed steps, not skipped ones.
   `--after`, a window over 100 lines, a bad bound, a reversed
   window, or `--last` combined with `--since` / `--until` is an
   error, exit code 2, done (v0.69.0).
-  Next: a CLI mirror of the one remaining resource template
-  without one — print one step's raw record as JSON, the same
-  record `blackbox://session/record/{seq}` serves.
+- `blackbox show` CLI command: prints one step's raw record —
+  the same record the `blackbox://session/record/{seq}` template
+  serves, through the shared `session_record` from `replay.py`
+  (the template now calls it too), so the command and the
+  template always agree, byte for byte with `--json` — as a
+  readable report (the transcript line plus the hash chain) or
+  as JSON with `--json`, so the record is readable without an
+  MCP client; the summary record can be shown too, since it is
+  a record in the log even though it is bookkeeping, not a step;
+  an unknown step is an error, exit code 2. Works on `.jsonl`
+  logs and `.db` stores, done (v0.70.0).
+  Next: `--since` / `--until` / `--last` window flags for
+  `blackbox show`, so a step the window dropped is not in the
+  session, the same rule as `blackbox transcript`.
 
 ## Layout
 
@@ -1576,10 +1590,13 @@ blackbox/
   replay.py       transcript printer + run diff (`diff_records`,
                   `session_diff` as JSON, per-model token usage;
                   `session_transcript_step` renders one step's line
-                  for the transcript template and tool)
+                  for the transcript template and tool;
+                  `session_record` finds one step's raw record for
+                  the record template and the `blackbox show`
+                  command)
   __main__.py     CLI: verify | replay | diff | mcp | record | otel
                   | export | metrics | tail-sample | query | trace
-                  | compact | aggregates | costs | span | watch
+                  | compact | aggregates | costs | span | watch | show
   watch.py        live tail: follow a log and print new steps as
                   they land, in the replay transcript format —
                   .jsonl by byte offset, .db by polling past the

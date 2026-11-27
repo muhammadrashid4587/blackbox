@@ -5,7 +5,7 @@ A minimal MCP server over stdio, speaking newline-delimited JSON-RPC
 library, like the rest of blackbox.
 
 The server holds one Recorder open on the configured log and exposes
-nine tools:
+ten tools:
 
     blackbox_record   append one step to the log
     blackbox_verify   check the log's hash chain
@@ -20,6 +20,9 @@ nine tools:
                       blackbox://session/record/{seq} template
     blackbox_diff     what changed between this session and another
                       run, like `blackbox diff`
+    blackbox_span     one step as a single OTLP span, or a bounded
+                      window of consecutive spans around it, like
+                      the blackbox://session/span/{seq} template
 
 It also exposes the session as five resources, seven resource
 templates, and nine prompts:
@@ -419,6 +422,43 @@ TOOLS = [
                                         "or until"},
             },
             "required": ["otherPath"],
+        },
+    },
+    {
+        "name": "blackbox_span",
+        "description": ("One step as a single OTLP span, like the "
+                        "blackbox://session/span/{seq} template: "
+                        "the span for step 'seq', or with 'before' "
+                        "/ 'after' a bounded window of consecutive "
+                        "spans around it, in log order. With 'since' "
+                        "/ 'until' / 'last' only the steps in that "
+                        "window."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "seq": {"type": "integer",
+                        "description": "Step number to span"},
+                "before": {"type": "integer",
+                           "description": "Consecutive steps before "
+                                          "seq to include (default 0)"},
+                "after": {"type": "integer",
+                          "description": "Consecutive steps after "
+                                         "seq to include (default 0)"},
+                "since": {"type": "string",
+                          "description": "Keep steps at or after this "
+                                         "ISO 8601 timestamp with a "
+                                         "timezone"},
+                "until": {"type": "string",
+                          "description": "Keep steps at or before this "
+                                         "ISO 8601 timestamp with a "
+                                         "timezone"},
+                "last": {"type": "string",
+                         "description": "Keep steps from the last this "
+                                        "long, a duration like 10m — "
+                                        "cannot be combined with since "
+                                        "or until"},
+            },
+            "required": ["seq"],
         },
     },
     {
@@ -1114,6 +1154,8 @@ class MCPServer:
             return self._tool_trace(msg_id, arguments)
         if name == "blackbox_diff":
             return self._tool_diff(msg_id, arguments)
+        if name == "blackbox_span":
+            return self._tool_span(msg_id, arguments)
         if name == "blackbox_sample":
             return self._tool_sample(msg_id, arguments)
         return _error(msg_id, INVALID_PARAMS, "unknown tool: %r" % (name,))
@@ -1475,6 +1517,84 @@ class MCPServer:
             return _error(msg_id, INVALID_PARAMS, error)
         return self._tool_result(msg_id, json.dumps(
             diff, indent=2, sort_keys=True))
+
+    def _tool_span(self, msg_id, arguments):
+        """One step as a single OTLP span, or a bounded window of
+        consecutive spans around it.
+
+        The span for step `seq` — the same span the
+        blackbox://session/span/{seq} template serves, built by
+        the same `session_span` from otel.py, so the tool and the
+        template always agree — plus, with `before` / `after`,
+        the consecutive spans around it, in log order, clamped
+        at the session's ends. With no `before` / `after` that
+        is just the one span. With `since` / `until` / `last`
+        the session is narrowed first through the shared
+        `_window_records`, the same window as `blackbox trace`
+        and the trace resource, so a step the window dropped is
+        not in the session. A missing `seq`, a `seq` that is
+        not an integer, a step the session does not have
+        (including the summary record, which is bookkeeping,
+        not a step), a negative `before` / `after`, a window
+        over 100 steps, a bad bound, a reversed window, --last
+        combined with --since / --until, a wrongly typed
+        argument, or a step with no usable timestamp is an
+        INVALID_PARAMS error, the tool-call analogue of the
+        CLI's exit code 2. Read-only: it removes or changes
+        nothing.
+        """
+        seq = arguments.get("seq")
+        if (seq is None or isinstance(seq, bool)
+                or not isinstance(seq, int)):
+            return _error(msg_id, INVALID_PARAMS,
+                          "blackbox_span needs an integer 'seq'")
+        before = arguments.get("before", 0)
+        after = arguments.get("after", 0)
+        for flag, value in (("before", before), ("after", after)):
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value < 0):
+                return _error(msg_id, INVALID_PARAMS,
+                              "blackbox_span %r must be a "
+                              "non-negative integer" % flag)
+        if before + after + 1 > MAX_TRACE_WINDOW:
+            return _error(msg_id, INVALID_PARAMS,
+                          "blackbox_span window is at most %d steps "
+                          "(before + after + 1)" % MAX_TRACE_WINDOW)
+        since = arguments.get("since")
+        until = arguments.get("until")
+        last = arguments.get("last")
+        for flag, value in (("--since", since), ("--until", until),
+                            ("--last", last)):
+            if value is not None and not isinstance(value, str):
+                return _error(msg_id, INVALID_PARAMS,
+                              "blackbox_span %r must be a string"
+                              % flag)
+        try:
+            records = _window_records(
+                load_records(self.log_path),
+                last=last, since=since, until=until)
+        except ValueError as exc:
+            return _error(msg_id, INVALID_PARAMS, str(exc))
+        steps = [r for r in records
+                 if r["type"] not in ("summary", "checkpoint")]
+        index = next((i for i, r in enumerate(steps)
+                      if r["seq"] == seq), None)
+        if index is None:
+            return _error(msg_id, INVALID_PARAMS,
+                          "no step %d in this session" % seq)
+        window = steps[max(0, index - before):index + after + 1]
+        try:
+            spans = [session_span(records, r["seq"]) for r in window]
+        except ValueError as exc:
+            return _error(msg_id, INVALID_PARAMS, str(exc))
+        return self._tool_result(msg_id, json.dumps({
+            "seq": seq,
+            "before": before,
+            "after": after,
+            "count": len(spans),
+            "total": len(steps),
+            "spans": spans,
+        }, indent=2, sort_keys=True))
 
     def _tool_sample(self, msg_id, arguments):
         messages = arguments.get("messages")

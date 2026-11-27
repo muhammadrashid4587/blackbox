@@ -74,7 +74,7 @@ class MCPServerTest(unittest.TestCase):
                                  "blackbox_replay", "blackbox_query",
                                  "blackbox_cost", "blackbox_aggregates",
                                  "blackbox_trace", "blackbox_diff",
-                                 "blackbox_sample"])
+                                 "blackbox_span", "blackbox_sample"])
         for tool in response["result"]["tools"]:
             self.assertIn("inputSchema", tool)
 
@@ -640,6 +640,160 @@ class MCPServerTest(unittest.TestCase):
         with open(self.path, "rb") as f:
             before = f.read()
         self._diff(2, {"otherPath": other})
+        with open(self.path, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def _span(self, msg_id, arguments):
+        response = _call(self.server, msg_id, "blackbox_span",
+                         arguments)
+        self.assertNotIn("error", response)
+        self.assertFalse(response["result"]["isError"])
+        return json.loads(response["result"]["content"][0]["text"])
+
+    def _span_tool_seqs(self, result):
+        # The span id is the step number, zero-padded to 16 hex.
+        return [int(span["spanId"], 16) for span in result["spans"]]
+
+    def test_span_tool_returns_single_span(self):
+        self._init()
+        self._seed_aggregates_log()
+        result = self._span(2, {"seq": 2})
+        self.assertEqual(result["seq"], 2)
+        self.assertEqual((result["before"], result["after"]), (0, 0))
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["total"], 6)
+        span = result["spans"][0]
+        self.assertEqual(span["spanId"], "%016x" % 2)
+        self.assertEqual(span["name"], "tool_result")
+        records = load_records(self.path)
+        self.assertEqual(span["traceId"], records[0]["hash"][:32])
+        self.assertEqual(span["startTimeUnixNano"],
+                         _nanos(records[2]["ts"]))
+        self.assertEqual(span["endTimeUnixNano"],
+                         _nanos(records[3]["ts"]))
+
+    def test_span_tool_agrees_with_span_template(self):
+        self._init()
+        self._record_session()
+        result = self._span(2, {"seq": 0})
+        response = self.server.handle_message(_request(
+            3, "resources/read",
+            {"uri": "blackbox://session/span/0"}))
+        template = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(result["spans"], [template])
+        # The priced gpt-5 call carries its USD cost, never a
+        # guessed number: 1200 in + 340 out = $0.0049.
+        attrs = {a["key"]: a["value"]
+                 for a in result["spans"][0]["attributes"]}
+        self.assertEqual(attrs["blackbox.cost_usd"]["doubleValue"],
+                         0.0049)
+
+    def test_span_tool_window_around_seq(self):
+        self._init()
+        self._seed_aggregates_log()
+        result = self._span(2, {"seq": 2, "before": 1, "after": 2})
+        self.assertEqual(self._span_tool_seqs(result), [1, 2, 3, 4])
+        self.assertEqual(result["count"], 4)
+        # Clamped at the session's ends: no step before 0, none
+        # after the last.
+        result = self._span(3, {"seq": 0, "before": 5})
+        self.assertEqual(self._span_tool_seqs(result), [0])
+        result = self._span(4, {"seq": 5, "after": 5})
+        self.assertEqual(self._span_tool_seqs(result), [5])
+        # A window of exactly 100 steps is allowed.
+        result = self._span(5, {"seq": 2, "before": 50, "after": 49})
+        self.assertEqual(self._span_tool_seqs(result), [0, 1, 2, 3, 4, 5])
+
+    def test_span_tool_window_narrows_the_session(self):
+        self._init()
+        self._seed_aggregates_log()
+        # Every step was recorded just now, so a window starting in
+        # 2020 keeps the whole session and one ending in 2020 keeps
+        # none of it — the step is not in the session.
+        result = self._span(
+            2, {"seq": 0, "since": "2020-01-01T00:00:00Z"})
+        self.assertEqual(result["total"], 6)
+        response = _call(self.server, 3, "blackbox_span",
+                         {"seq": 0, "until": "2020-01-01T00:00:00Z"})
+        self.assertEqual(response["error"]["code"], -32602)
+        result = self._span(4, {"seq": 5, "last": "1h"})
+        self.assertEqual(result["total"], 6)
+
+    def test_span_tool_rejects_bad_arguments(self):
+        self._init()
+        self._seed_aggregates_log()
+        for arguments in (
+                {},  # seq is required
+                {"seq": "2"},  # must be an integer
+                {"seq": True},  # a bool is not an integer
+                {"seq": 2.0},  # a float is not an integer
+                {"seq": 99},  # no such step
+                {"seq": 0, "before": -1},
+                {"seq": 0, "after": -1},
+                {"seq": 0, "before": 1.5},
+                {"seq": 0, "after": "1"},
+                {"seq": 0, "before": 60, "after": 50},  # over 100
+                {"seq": 0, "since": 5},  # must be a string
+                {"seq": 0, "until": ["2020-01-01T00:00:00Z"]},
+                {"seq": 0, "last": 10},
+                {"seq": 0, "since": ""},  # empty is not a timestamp
+                {"seq": 0, "until": ""},
+                {"seq": 0, "last": ""},
+                {"seq": 0, "since": "2026-11-24T01:00:00"},  # no tz
+                {"seq": 0, "last": "10x"},  # not a duration
+                {"seq": 0, "since": "2026-11-24T02:00:00Z",
+                 "until": "2026-11-24T01:00:00Z"},  # reversed
+                {"seq": 0, "last": "10m",
+                 "since": "2026-11-24T01:00:00Z"},
+                {"seq": 0, "last": "10m",
+                 "until": "2026-11-24T01:00:00Z"},
+        ):
+            response = _call(self.server, 2, "blackbox_span",
+                             arguments)
+            self.assertEqual(response["error"]["code"], -32602,
+                             arguments)
+
+    def test_span_tool_rejects_summary_seq(self):
+        self._init()
+        self._seed_aggregates_log()
+        # Closing the server writes the summary record (seq 6):
+        # it is bookkeeping, not a step, so spanning it is an error.
+        self.server.close()
+        response = _call(self.server, 2, "blackbox_span",
+                         {"seq": 6})
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_span_tool_rejects_step_without_usable_timestamp(self):
+        # A step whose timestamp does not parse has no honest start
+        # or end time, so the tool is an error instead of a span
+        # with invented times — the same rule as the template.
+        path = os.path.join(self.tmp.name, "bad-ts.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "seq": 0, "ts": "not-a-time", "type": "model_call",
+                "payload": {"model": "gpt-5", "prompt": "hi"},
+                "tokens": {"input": 1, "output": 1},
+                "prev_hash": "0" * 64, "hash": "a" * 64}) + "\n")
+        server = MCPServer(path, task="bad ts")
+        try:
+            server.handle_message(
+                _request(1, "initialize",
+                         {"protocolVersion": "2024-11-05"}))
+            response = _call(server, 2, "blackbox_span", {"seq": 0})
+            self.assertEqual(response["error"]["code"], -32602)
+        finally:
+            try:
+                server.close()
+            except Exception:
+                pass
+
+    def test_span_tool_is_read_only(self):
+        self._init()
+        self._seed_aggregates_log()
+        with open(self.path, "rb") as f:
+            before = f.read()
+        self._span(2, {"seq": 2, "before": 1, "after": 1})
         with open(self.path, "rb") as f:
             self.assertEqual(f.read(), before)
 

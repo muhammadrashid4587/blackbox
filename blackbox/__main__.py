@@ -48,7 +48,7 @@ from .otel import export_otlp, export_otlp_metrics, format_span, session_span
 from .query import query_log
 from .recorder import Recorder, _normalize_ts
 from .replay import (diff, format_record, load_records, replay,
-                     session_record, transcript_window)
+                     show_window, transcript_window)
 from .tail_sampling import (DEFAULT_MAX_COST_USD, DEFAULT_SLOW_MS,
                             export_tail_sampled_otlp)
 from .trace import trace_log
@@ -299,14 +299,33 @@ def main(argv=None):
                               "query --until)")
 
     p_show = sub.add_parser(
-        "show", help="print one step's raw record: the same record "
-        "the blackbox://session/record/{seq} MCP resource template "
+        "show", help="print one step's raw record, or a window of "
+        "records around it: the same record the "
+        "blackbox://session/record/{seq} MCP resource template "
         "serves, so the record is readable without an MCP client")
     p_show.add_argument("logfile")
     p_show.add_argument("seq", type=int, help="step number to print")
+    p_show.add_argument("--before", type=int, default=0,
+                        help="print this many records before the "
+                        "step (default: %(default)s)")
+    p_show.add_argument("--after", type=int, default=0,
+                        help="print this many records after the "
+                        "step (default: %(default)s)")
     p_show.add_argument("--json", action="store_true", dest="as_json",
                         help="print the record as JSON instead of a "
-                        "report")
+                        "report (with --before / --after / --since / "
+                        "--until / --last, the window as JSON)")
+    p_show.add_argument("--last", help="keep steps from the last "
+                        "this long, e.g. 10m, 2h, 1d, 1h30m "
+                        "(the same relative window as query --last)")
+    p_show.add_argument("--since", help="keep steps at or after "
+                        "this ISO timestamp (with a timezone, e.g. "
+                        "2026-11-24T01:00:00Z; the same window as "
+                        "query --since)")
+    p_show.add_argument("--until", help="keep steps at or before "
+                        "this ISO timestamp (with a timezone, e.g. "
+                        "2026-11-24T01:00:00Z; the same window as "
+                        "query --until)")
 
     p_watch = sub.add_parser(
         "watch", help="tail a live log and print new steps as they "
@@ -748,24 +767,44 @@ def main(argv=None):
             print("show: file not found: %s" % args.logfile,
                   file=sys.stderr)
             return 1
-        record = session_record(records, args.seq)
-        if record is None:
-            print("show: no step %d in %s" % (args.seq, args.logfile),
-                  file=sys.stderr)
+        try:
+            window = show_window(records, args.seq,
+                                 before=args.before,
+                                 after=args.after,
+                                 last=args.last,
+                                 since=args.since,
+                                 until=args.until)
+        except ValueError as exc:
+            # A missing step, a negative --before / --after, a
+            # window over 100 records, a bad --since / --until /
+            # --last value, --since after --until, or --last
+            # combined with --since / --until.
+            print("show: %s" % exc, file=sys.stderr)
             return 2
         if args.as_json:
-            # The same JSON the blackbox://session/record/{seq}
-            # template serves, byte for byte, so the command and
-            # the template always agree.
-            sys.stdout.write(json.dumps(record, indent=2, sort_keys=True)
-                             + "\n")
+            if (args.before == 0 and args.after == 0
+                    and args.last is None and args.since is None
+                    and args.until is None):
+                # The same JSON the
+                # blackbox://session/record/{seq} template serves,
+                # byte for byte, so the command and the template
+                # always agree.
+                sys.stdout.write(json.dumps(window["records"][0],
+                                            indent=2, sort_keys=True)
+                                 + "\n")
+            else:
+                sys.stdout.write(json.dumps(window, indent=2,
+                                            sort_keys=True) + "\n")
         else:
-            # The transcript line for the step, plus the hash chain
-            # the line does not carry — the record itself, readable
-            # without parsing JSON.
-            sys.stdout.write("%s\n    hash: %s\n    prev_hash: %s\n"
-                             % (format_record(record), record["hash"],
-                                record["prev_hash"]))
+            # The transcript line for each record, plus the hash
+            # chain the line does not carry — the record itself,
+            # readable without parsing JSON — one block per record,
+            # in log order.
+            blocks = ["%s\n    hash: %s\n    prev_hash: %s\n"
+                      % (format_record(record), record["hash"],
+                         record["prev_hash"])
+                      for record in window["records"]]
+            sys.stdout.write("\n".join(blocks))
         return 0
     if args.command == "watch":
         if args.poll_interval <= 0:

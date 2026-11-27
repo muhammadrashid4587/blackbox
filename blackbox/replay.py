@@ -198,6 +198,59 @@ def transcript_window(records, seq, before=0, after=0, last=None,
             "lines": lines}
 
 
+MAX_SHOW_WINDOW = 100
+
+
+def show_window(records, seq, before=0, after=0, last=None,
+                since=None, until=None, now=None):
+    """One step's raw record, or a bounded window of records around it.
+
+    The record for step `seq` — the same record `session_record`
+    returns for the blackbox://session/record/{seq} template, so the
+    CLI and the template always agree — plus, with `before` /
+    `after`, the consecutive records around it, in log order,
+    clamped at the session's ends. With no `before` / `after` that
+    is just the one record. With `since` / `until` / `last` the
+    session is narrowed first through the shared `_window_records`,
+    the same window as `blackbox transcript` and `blackbox replay`,
+    so a step the window dropped is not in the session. Returns the
+    window as a dict — `seq`, `before`, `after`, `count`, `total`
+    (records in the session) and `records` (the raw records) — the
+    same shape `transcript_window` returns, with records in place
+    of lines.
+
+    Unlike a span or a transcript line, a raw record exists for
+    every record in the log, so the window is over all records —
+    the summary and checkpoint records included, since they are
+    records in the log even though they are bookkeeping, not steps.
+    A negative `before` / `after`, a window over 100 records, a
+    step the session does not have, a bad bound, a reversed window,
+    or --last combined with --since / --until raises ValueError.
+    """
+    for flag, value in (("before", before), ("after", after)):
+        if value < 0:
+            raise ValueError("%s must be a non-negative integer" % flag)
+    if before + after + 1 > MAX_SHOW_WINDOW:
+        raise ValueError("show window is at most %d records "
+                         "(before + after + 1)" % MAX_SHOW_WINDOW)
+    # Deferred: aggregates imports load_records from this module,
+    # so importing it at the top would be circular.
+    from .aggregates import _window_records
+    records = _window_records(records, last=last, since=since,
+                              until=until, now=now)
+    index = next((i for i, r in enumerate(records)
+                  if r["seq"] == seq), None)
+    if index is None:
+        raise ValueError("no step %d in this session" % seq)
+    window = records[max(0, index - before):index + after + 1]
+    return {"seq": seq,
+            "before": before,
+            "after": after,
+            "count": len(window),
+            "total": len(records),
+            "records": window}
+
+
 def replay(path, last=None, since=None, until=None, now=None):
     """Print the transcript of a log. Returns the records.
 

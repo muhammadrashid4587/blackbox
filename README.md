@@ -48,6 +48,9 @@ python -m blackbox replay data/demo.jsonl
 # Read one step's raw record, hash chain included
 python -m blackbox show data/demo.jsonl 1
 
+# ... or a window of records around it
+python -m blackbox show data/demo.jsonl 1 --before 1 --after 1
+
 # Follow a live run as it happens
 python -m blackbox watch data/run.jsonl
 
@@ -698,7 +701,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 622 tests, all passing (`make test`).
+- 629 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1518,9 +1521,28 @@ and `max_records` counts printed steps, not skipped ones.
   a record in the log even though it is bookkeeping, not a step;
   an unknown step is an error, exit code 2. Works on `.jsonl`
   logs and `.db` stores, done (v0.70.0).
-  Next: `--since` / `--until` / `--last` window flags for
-  `blackbox show`, so a step the window dropped is not in the
-  session, the same rule as `blackbox transcript`.
+- Window flags for `blackbox show`: prints a bounded window of
+  raw records around a step — `--before` / `--after` consecutive
+  records around it, in log order, clamped at the session's ends
+  and at most 100 records; `--since` / `--until` / `--last` narrows
+  the session first, so a step the window dropped is not in the
+  session — as readable reports (the transcript line plus the hash
+  chain, one block per record) or as JSON with `--json` (the window
+  as a dict; with no window flags, the single raw record, byte for
+  byte the record the `blackbox://session/record/{seq}` template
+  serves), reusing the shared `show_window` from `replay.py`
+  (the same `_window_records` the `blackbox_transcript` MCP tool
+  and `blackbox transcript` use), so the command and the template
+  always agree; the summary record can be shown in a window too,
+  since it is a record in the log even though it is bookkeeping,
+  not a step; an unknown step, a negative `--before` / `--after`,
+  a window over 100 records, a bad bound, a reversed window, or
+  `--last` combined with `--since` / `--until` is an error, exit
+  code 2, done (v0.71.0).
+  Next: `--before` / `--after` / `--since` / `--until` / `--last`
+  window flags for `blackbox span`, so a window of spans is
+  readable without an MCP client, the same rule as
+  `blackbox transcript`.
 
 ## Layout
 

@@ -16,7 +16,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from blackbox import Recorder
 from blackbox.__main__ import main
 from blackbox.mcp_server import MCPServer
-from blackbox.replay import format_record, load_records, session_record
+from blackbox.replay import (format_record, load_records, session_record,
+                             show_window)
 
 
 def _request(msg_id, method, params=None):
@@ -120,6 +121,91 @@ class ShowCliTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(out, "")
         self.assertIn("no step 99", err)
+
+    def test_window_around_seq_is_in_log_order(self):
+        code, out, err = self._run(1, "--before", "1", "--after", "1")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        # One three-line block per record, in log order, with a
+        # blank line between blocks (a model_call's transcript
+        # line is two lines, so a block can be four lines).
+        blocks = out.split("\n\n")
+        self.assertEqual(len(blocks), 3)
+        for seq, block in zip((0, 1, 2), blocks):
+            record = session_record(self.records, seq)
+            expected = ("%s\n    hash: %s\n    prev_hash: %s"
+                        % (format_record(record), record["hash"],
+                           record["prev_hash"]))
+            self.assertEqual(block.rstrip("\n"), expected)
+
+    def test_window_clamps_at_the_session_ends(self):
+        code, out, err = self._run(0, "--before", "5")
+        self.assertEqual(code, 0)
+        self.assertIn("[0]", out)
+        self.assertNotIn("[1]", out)
+        code, out, err = self._run(2, "--after", "5")
+        self.assertEqual(code, 0)
+        self.assertIn("[2]", out)
+        self.assertNotIn("[1]", out)
+
+    def test_window_json_matches_show_window(self):
+        code, out, err = self._run(1, "--before", "1", "--after", "1",
+                                   "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(json.loads(out),
+                         show_window(self.records, 1,
+                                     before=1, after=1))
+        data = json.loads(out)
+        self.assertEqual(data["seq"], 1)
+        self.assertEqual((data["before"], data["after"]), (1, 1))
+        self.assertEqual(data["count"], 3)
+        self.assertEqual(data["total"], 4)  # 3 steps + the summary
+        self.assertEqual([r["seq"] for r in data["records"]],
+                         [0, 1, 2])
+
+    def test_window_can_include_the_summary_record(self):
+        # The summary is a record in the log, so a window around
+        # it carries the step before it too.
+        with Recorder(self.path, task="t", model="gpt-5"):
+            pass  # closing writes the summary record (seq 3)
+        code, out, err = self._run(3, "--before", "1", "--json")
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertEqual([r["seq"] for r in data["records"]], [2, 3])
+        self.assertEqual(data["total"], 4)
+
+    def test_window_narrows_the_session(self):
+        # Every step was recorded just now, so a window starting in
+        # 2020 keeps the whole session and one ending in 2020 keeps
+        # none of it — the step is not in the session.
+        code, out, err = self._run(0, "--since", "2020-01-01T00:00:00Z")
+        self.assertEqual(code, 0)
+        self.assertIn("[0]", out)
+        code, out, err = self._run(0, "--until", "2020-01-01T00:00:00Z")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("no step 0", err)
+        code, out, err = self._run(2, "--last", "1h")
+        self.assertEqual(code, 0)
+        self.assertIn("[2]", out)
+
+    def test_window_errors_are_exit_code_2(self):
+        for argv in (("--before", "-1"), ("--after", "-1"),
+                     ("--before", "100"),
+                     ("--since", "not-a-timestamp"),
+                     ("--last", "not-a-duration"),
+                     ("--since", "2026-11-24T02:00:00Z",
+                      "--until", "2026-11-24T01:00:00Z"),
+                     ("--last", "1h",
+                      "--since", "2020-01-01T00:00:00Z")):
+            code, out, err = self._run(1, *argv)
+            self.assertEqual(code, 2, argv)
+            self.assertEqual(out, "")
+
+    def test_show_window_rejects_a_window_over_100_records(self):
+        with self.assertRaises(ValueError):
+            show_window(self.records, 1, before=50, after=50)
 
     def test_non_integer_seq_is_an_error(self):
         out, err = io.StringIO(), io.StringIO()

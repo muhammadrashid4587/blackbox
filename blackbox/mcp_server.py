@@ -13,7 +13,7 @@ four tools:
     blackbox_query    filter the log's steps, like `blackbox query`
 
 It also exposes the session as five resources, six resource
-templates, and eight prompts:
+templates, and nine prompts:
 
     blackbox://session        the session as a readable transcript,
                               the same transcript `blackbox replay`
@@ -146,6 +146,10 @@ templates, and eight prompts:
                               steps, the slowest step, and how many
                               records an earlier compaction removed
                               or sampling dropped
+    summarize_errors          a prompt template for summarising the
+                              session's recent error steps: grouped
+                              by type, tool and model, with counts,
+                              newest first, bounded
 
 Start it from the CLI:
 
@@ -683,6 +687,20 @@ PROMPTS = [
                         "sampling dropped."),
         "arguments": [],
     },
+    {
+        "name": "summarize_errors",
+        "description": ("Summarise the recorded session's recent "
+                        "error steps: grouped by type, tool and "
+                        "model, with counts, newest first, bounded."),
+        "arguments": [
+            {
+                "name": "limit",
+                "description": ("How many error groups to include "
+                                "(default 10)."),
+                "required": False,
+            },
+        ],
+    },
 ]
 
 PROMPT_FOCUS_LINES = {
@@ -826,6 +844,25 @@ SUMMARIZE_AGGREGATES_PROMPT = (
     "step is the step with the longest time until the next step, "
     "not necessarily the step that did the most work.\n\n"
     "Session totals:\n{aggregates}\n\n"
+    "Session transcript:\n{transcript}"
+)
+
+SUMMARIZE_ERRORS_PROMPT = (
+    "Summarise the recent errors in this blackbox session: which "
+    "steps errored, grouped by type, tool and model, how often "
+    "each kind failed, and what the failures have in common. The "
+    "groups below are the session's error steps from `blackbox "
+    "query --errors-only` — the same error rule, so the prompt "
+    "and the command always agree: an explicit error field, a "
+    "status of \"error\", or a tool result mentioning an error. "
+    "Groups are newest first and bounded to {limit} groups, so "
+    "a long session's oldest failures are left out — say so "
+    "where it matters, and do not claim the session was clean "
+    "when the summary only covers the newest groups. A repeated "
+    "failure may be a legitimate retry, and an error result may "
+    "be expected, so treat the groups as leads, not verdicts. "
+    "Asking for this prompt changes nothing.\n\n"
+    "Error summary:\n{errors}\n\n"
     "Session transcript:\n{transcript}"
 )
 
@@ -1637,6 +1674,54 @@ class MCPServer:
             return "No steps recorded yet."
         return format_aggregates(agg)
 
+    def _error_lines(self, limit=10):
+        """The session's recent error steps, as readable lines.
+
+        The same error rule as `blackbox query --errors-only`,
+        through the shared `query_records` from query.py, so the
+        prompt and the command always agree: an explicit error
+        field, a status of "error", or a tool result mentioning an
+        error. The summary record is never an error step — it is
+        bookkeeping, not agent behaviour. Errors are grouped by
+        (type, tool, model) with counts, groups newest first, and
+        bounded to `limit` groups; the step numbers inside a
+        group are newest first too. Read-only — asking for the
+        summary removes nothing.
+        """
+        records = load_records(self.log_path)
+        errors = query_records(records, errors_only=True)
+        if not errors:
+            return "No error steps recorded yet."
+        groups = {}
+        for record in errors:
+            payload = record.get("payload") or {}
+            key = (record["type"],
+                   str(payload.get("tool", "") or ""),
+                   str(payload.get("model", "") or ""))
+            groups.setdefault(key, []).append(record["seq"])
+        ordered = sorted(groups.items(),
+                         key=lambda item: max(item[1]), reverse=True)
+        lines = ["%d error steps in %d groups:"
+                 % (len(errors), len(groups))]
+        shown = 0
+        for (step_type, tool, model), seqs in ordered[:limit]:
+            name = step_type
+            if tool:
+                name += " " + tool
+            if model:
+                name += " " + model
+            seqs = sorted(seqs, reverse=True)
+            lines.append("  %s: %d error%s (seqs %s)"
+                         % (name, len(seqs),
+                            "s" if len(seqs) != 1 else "",
+                            ", ".join(str(s) for s in seqs)))
+            shown += len(seqs)
+        if len(ordered) > limit:
+            lines.append("  ... and %d more error steps in %d more "
+                         "groups" % (len(errors) - shown,
+                                     len(ordered) - limit))
+        return "\n".join(lines)
+
     def _read_diff(self, msg_id, uri, other_path, last=None, since=None,
                    until=None):
         """The session-vs-other-run diff as a resource read.
@@ -2195,6 +2280,26 @@ class MCPServer:
                               "cannot read session: %s" % exc)
             text = SUMMARIZE_AGGREGATES_PROMPT.format(
                 aggregates=aggregates, transcript=self._transcript())
+            return _result(msg_id, {
+                "description": description,
+                "messages": [{"role": "user",
+                              "content": {"type": "text", "text": text}}],
+            })
+        if name == "summarize_errors":
+            limit = arguments.get("limit", 10)
+            if (not isinstance(limit, int) or isinstance(limit, bool)
+                    or limit < 1):
+                return _error(
+                    msg_id, INVALID_PARAMS,
+                    "limit must be a positive integer")
+            try:
+                errors = self._error_lines(limit=limit)
+            except (OSError, ValueError) as exc:
+                return _error(msg_id, INVALID_PARAMS,
+                              "cannot read session: %s" % exc)
+            text = SUMMARIZE_ERRORS_PROMPT.format(
+                limit=limit, errors=errors,
+                transcript=self._transcript())
             return _result(msg_id, {
                 "description": description,
                 "messages": [{"role": "user",

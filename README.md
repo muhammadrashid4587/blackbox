@@ -351,7 +351,16 @@ removed or sampling dropped — with the transcript included so
 the client can see the totals in context. The totals count
 steps only, so compacted-away records and sampled-out steps
 are reported separately, and asking for the prompt removes
-nothing.
+nothing. A ninth prompt, `summarize_errors`, hands the client
+a prompt for the session's recent error steps: the error
+steps from `blackbox query --errors-only`, grouped by type,
+tool and model with counts, newest first, bounded to a
+`limit` argument (default 10 groups), with the transcript
+included so the client can see the failures in context. The
+prompt says the groups are leads, not verdicts — a repeated
+failure may be a legitimate retry — and that a bounded summary
+only covers the newest groups, so it never claims a session
+was clean when older failures were left out.
 Point a client at that command as a stdio server. Closing the server
 (EOF / Ctrl-C) writes the summary record, like closing a Recorder.
 
@@ -602,7 +611,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 558 tests, all passing (`make test`).
+- 563 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1277,6 +1286,21 @@ and `max_records` counts printed steps, not skipped ones.
   `--last` combined with `--since` / `--until`, or a wrongly
   typed argument is an INVALID_PARAMS error, the tool-call
   analogue of the CLI's exit code 2, done (v0.61.0).
+- Ninth MCP prompt: `summarize_errors` hands the client a prompt
+  for the session's recent error steps — the error steps from
+  `blackbox query --errors-only`, through the shared
+  `query_records` from `query.py`, so the prompt and the command
+  always agree (an explicit error field, a status of "error", or
+  a tool result mentioning an error) — grouped by type, tool and
+  model with counts, groups newest first, step numbers inside a
+  group newest first too, and bounded to a `limit` argument
+  (default 10 groups, a positive integer, anything else an
+  INVALID_PARAMS error), with the groups beyond the bound
+  reported as "N more error steps in M more groups" so a bounded
+  summary never claims a session was clean when older failures
+  were left out; the prompt says the groups are leads, not
+  verdicts, and includes the transcript so the client can see
+  the failures in context, done (v0.62.0).
 
 ## Layout
 
@@ -1293,7 +1317,8 @@ blackbox/
                   one step's OTLP span, analyze_session,
                   summarize_costs, summarize_anomalies,
                   summarize_sampling, summarize_trace,
-                  summarize_diff and summarize_retention prompts,
+                  summarize_diff, summarize_retention,
+                  summarize_aggregates and summarize_errors prompts,
                   blackbox_sample tool (MCP sampling)
   sampling.py     MCP sampling client: Sampler, StdioTransport,
                   SamplingError / NotSupported / Declined
@@ -1360,5 +1385,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            558 tests, all passing
+tests/            563 tests, all passing
 ```

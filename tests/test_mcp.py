@@ -1444,7 +1444,7 @@ class MCPServerTest(unittest.TestCase):
                           "summarize_anomalies", "summarize_sampling",
                           "summarize_trace", "summarize_diff",
                           "summarize_retention",
-                          "summarize_aggregates"])
+                          "summarize_aggregates", "summarize_errors"])
         self.assertEqual(prompts[0]["arguments"][0]["name"], "focus")
         self.assertFalse(prompts[0]["arguments"][0]["required"])
         self.assertEqual(prompts[1]["arguments"], [])
@@ -1458,6 +1458,10 @@ class MCPServerTest(unittest.TestCase):
             [a["name"] for a in prompts[6]["arguments"]],
             ["keep_days", "keep_n"])
         self.assertFalse(prompts[6]["arguments"][0]["required"])
+        self.assertEqual(prompts[7]["arguments"], [])
+        self.assertEqual(
+            [a["name"] for a in prompts[8]["arguments"]], ["limit"])
+        self.assertFalse(prompts[8]["arguments"][0]["required"])
         self.assertFalse(prompts[6]["arguments"][1]["required"])
         self.assertEqual(prompts[7]["arguments"], [])
 
@@ -2036,6 +2040,100 @@ class MCPServerTest(unittest.TestCase):
                      {"name": "summarize_aggregates"}))
         text = response["result"]["messages"][0]["content"]["text"]
         self.assertIn("No steps recorded yet.", text)
+
+    def test_prompts_get_summarize_errors(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "search",
+                           "args": {"query": "mcp"}}})
+        _call(self.server, 3, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "search",
+                           "result": "error: timeout"}})
+        _call(self.server, 4, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "search",
+                           "result": "error: timeout"}})
+        _call(self.server, 5, "blackbox_record",
+              {"type": "tool_call",
+               "payload": {"tool": "fetch",
+                           "args": {"url": "https://x"}}})
+        _call(self.server, 6, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "fetch", "result": "error: 404"}})
+        _call(self.server, 7, "blackbox_record",
+              {"type": "model_call",
+               "payload": {"model": "gpt-5", "error": "rate limited"}})
+        response = self.server.handle_message(
+            _request(8, "prompts/get",
+                     {"name": "summarize_errors"}))
+        message = response["result"]["messages"][0]
+        self.assertEqual(message["role"], "user")
+        text = message["content"]["text"]
+        self.assertIn("4 error steps in 3 groups:", text)
+        self.assertIn("  model_call gpt-5: 1 error (seqs 5)", text)
+        self.assertIn("  tool_result fetch: 1 error (seqs 4)", text)
+        self.assertIn("  tool_result search: 2 errors (seqs 2, 1)",
+                      text)
+        # Groups newest first: the gpt-5 error (seq 5) before the
+        # fetch error (seq 4) before the search errors (seqs 2, 1).
+        self.assertLess(text.index("model_call gpt-5"),
+                        text.index("tool_result fetch"))
+        self.assertLess(text.index("tool_result fetch"),
+                        text.index("tool_result search"))
+        self.assertIn("leads, not verdicts", text)
+        self.assertIn("search", text)  # transcript included too
+
+    def test_prompts_get_summarize_errors_limit(self):
+        self._init()
+        _call(self.server, 2, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "search",
+                           "result": "error: timeout"}})
+        _call(self.server, 3, "blackbox_record",
+              {"type": "tool_result",
+               "payload": {"tool": "fetch", "result": "error: 404"}})
+        _call(self.server, 4, "blackbox_record",
+              {"type": "model_call",
+               "payload": {"model": "gpt-5", "error": "rate limited"}})
+        response = self.server.handle_message(
+            _request(5, "prompts/get",
+                     {"name": "summarize_errors",
+                      "arguments": {"limit": 1}}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("3 error steps in 3 groups:", text)
+        self.assertIn("  model_call gpt-5: 1 error (seqs 2)", text)
+        self.assertNotIn("tool_result fetch", text)
+        self.assertIn("... and 2 more error steps in 2 more groups",
+                      text)
+
+    def test_prompts_get_summarize_errors_clean_session(self):
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "prompts/get",
+                     {"name": "summarize_errors"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("No error steps recorded yet.", text)
+
+    def test_prompts_get_summarize_errors_empty_session(self):
+        self._init()
+        response = self.server.handle_message(
+            _request(2, "prompts/get",
+                     {"name": "summarize_errors"}))
+        text = response["result"]["messages"][0]["content"]["text"]
+        self.assertIn("No error steps recorded yet.", text)
+
+    def test_prompts_get_summarize_errors_bad_limit(self):
+        self._init()
+        for arguments in ({"limit": 0}, {"limit": -1},
+                          {"limit": "10"}, {"limit": True}):
+            response = self.server.handle_message(
+                _request(2, "prompts/get",
+                         {"name": "summarize_errors",
+                          "arguments": arguments}))
+            self.assertEqual(response["error"]["code"], -32602)
 
     def test_resources_read_before_initialize_is_rejected(self):
         response = self.server.handle_message(

@@ -1701,10 +1701,25 @@ and `max_records` counts printed steps, not skipped ones.
   with no cost — the windowed totals never charge spend from
   outside the window. Works on `.jsonl` logs and `.db` stores,
   done (v0.78.0).
-  Next: a `--since` / `--until` / `--last` window for the
+- A `--since` / `--until` / `--last` window for the
   `blackbox_cost` MCP tool, so a client can read one model's or
   one tool's windowed totals as a tool call the same way the
-  aggregates templates serve them.
+  aggregates templates serve them: the tool takes the same
+  `since` / `until` / `last` arguments, narrows the session
+  first through the shared `_window_records` from
+  `aggregates.py`, then computes the same `cost_totals`, so the
+  tool, the `blackbox costs` CLI report and the aggregates
+  templates always agree — a model or tool with no steps in the
+  window is not in the session, and a tool whose invoking model
+  call fell outside the window is still counted, with no cost.
+  A bad bound, a reversed window, `--last` combined with
+  `--since` / `--until`, or a wrongly typed argument is an
+  INVALID_PARAMS error, the tool-call analogue of the CLI's exit
+  code 2. Works on `.jsonl` logs and `.db` stores,
+  done (v0.79.0).
+  Next: a `--since` / `--until` / `--last` window for the
+  `summarize_costs` prompt, so a client can summarise one
+  window's spend the same way the cost tool totals it.
 
 ## Layout
 

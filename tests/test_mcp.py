@@ -275,6 +275,35 @@ class MCPServerTest(unittest.TestCase):
                                places=6)
         self.assertIsNone(result["tool"]["cost_usd"])
 
+    def test_cost_tool_window_narrows_the_session(self):
+        self._init()
+        self._seed_cost_log()
+        # Every step was recorded just now, so a window starting in
+        # 2020 keeps the whole session and one ending in 2020 keeps
+        # none of it.
+        result = self._cost(2, {"since": "2020-01-01T00:00:00Z"})
+        self.assertAlmostEqual(result["total_cost_usd"], 0.0049,
+                               places=6)
+        self.assertEqual(result["unpriced_model_calls"], 1)
+        result = self._cost(3, {"until": "2020-01-01T00:00:00Z"})
+        self.assertEqual(result["per_model"], {})
+        self.assertEqual(result["per_tool"], {})
+        self.assertEqual(result["total_cost_usd"], 0.0)
+        self.assertEqual(result["unpriced_model_calls"], 0)
+        result = self._cost(4, {"last": "1h"})
+        self.assertAlmostEqual(result["total_cost_usd"], 0.0049,
+                               places=6)
+        # A model slice inside the window, and a model with no steps
+        # in the window is not in the session.
+        result = self._cost(5, {"model": "gpt-5",
+                                "since": "2020-01-01T00:00:00Z"})
+        self.assertAlmostEqual(result["model"]["cost_usd"], 0.0049,
+                               places=6)
+        response = _call(self.server, 6, "blackbox_cost",
+                         {"model": "gpt-5",
+                          "until": "2020-01-01T00:00:00Z"})
+        self.assertEqual(response["error"]["code"], -32602)
+
     def test_cost_tool_rejects_unknown_and_bad_arguments(self):
         self._init()
         self._seed_cost_log()
@@ -285,6 +314,18 @@ class MCPServerTest(unittest.TestCase):
                 {"tool": ""},
                 {"model": 5},
                 {"tool": ["search"]},
+                {"since": 5},  # must be a string
+                {"until": ["2020-01-01T00:00:00Z"]},
+                {"last": 10},
+                {"since": ""},  # empty is not a timestamp
+                {"until": ""},
+                {"last": ""},
+                {"since": "2026-11-24T01:00:00"},  # no timezone
+                {"last": "10x"},  # not a duration
+                {"since": "2026-11-24T02:00:00Z",
+                 "until": "2026-11-24T01:00:00Z"},  # reversed
+                {"last": "10m", "since": "2026-11-24T01:00:00Z"},
+                {"last": "10m", "until": "2026-11-24T01:00:00Z"},
         ):
             response = _call(self.server, 2, "blackbox_cost", arguments)
             self.assertEqual(response["error"]["code"], -32602,

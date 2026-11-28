@@ -343,7 +343,9 @@ TOOLS = [
                         "costs`: per-model and per-tool calls, tokens "
                         "and USD cost. With no arguments returns the "
                         "whole breakdown; with 'model' or 'tool' "
-                        "returns just that model's or tool's slice."),
+                        "returns just that model's or tool's slice. "
+                        "With 'since' / 'until' / 'last' only the "
+                        "steps in that window."),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -353,6 +355,19 @@ TOOLS = [
                 "tool": {"type": "string",
                          "description": "One tool's totals only, "
                                         "e.g. \"search\""},
+                "since": {"type": "string",
+                          "description": "Keep steps at or after this "
+                                         "ISO 8601 timestamp with a "
+                                         "timezone"},
+                "until": {"type": "string",
+                          "description": "Keep steps at or before this "
+                                         "ISO 8601 timestamp with a "
+                                         "timezone"},
+                "last": {"type": "string",
+                         "description": "Keep steps from the last this "
+                                        "long, a duration like 10m — "
+                                        "cannot be combined with since "
+                                        "or until"},
             },
         },
     },
@@ -1415,20 +1430,30 @@ class MCPServer:
     def _tool_cost(self, msg_id, arguments):
         """Cost totals for the session, like `blackbox costs`.
 
-        The same computation — `cost_totals` from aggregates.py —
-        so the tool, the CLI report and the aggregates templates
-        always agree: per model the shared `model_usage` and
-        `cost_for`, so an unpriced call costs None, never a
-        guessed number; per tool the cost of the model call that
-        invoked it, by the same causal rule as `link_parents`.
-        With no arguments the whole breakdown is returned, the
-        same dict `blackbox costs --json` prints. With 'model'
-        or 'tool' only that model's or tool's slice is returned,
-        the same entry the aggregates/model and aggregates/tool
-        templates serve (`{"model": name, ...entry}`). A model or
-        tool the session does not have, an empty name, or a
-        wrongly typed argument is an INVALID_PARAMS error, the
-        tool-call analogue of the CLI's exit code 2.
+        The same computation — `cost_totals` over `_window_records`
+        from aggregates.py — so the tool, the CLI report and the
+        aggregates templates always agree: per model the shared
+        `model_usage` and `cost_for`, so an unpriced call costs
+        None, never a guessed number; per tool the cost of the
+        model call that invoked it, by the same causal rule as
+        `link_parents`. With no arguments the whole breakdown is
+        returned, the same dict `blackbox costs --json` prints.
+        With 'model' or 'tool' only that model's or tool's slice
+        is returned, the same entry the aggregates/model and
+        aggregates/tool templates serve (`{"model": name,
+        ...entry}`). With 'since' / 'until' / 'last' only the
+        steps in that window are totalled, the same window as
+        `blackbox costs` and the aggregates templates; the window
+        is applied to the session before the totals are computed,
+        so a model or tool with no steps in the window is not in
+        the session, and a tool whose invoking model call fell
+        outside the window is still counted, with no cost — the
+        windowed totals never charge spend from outside the
+        window. A model or tool the session does not have, an
+        empty name, a bad bound, a reversed window, --last
+        combined with --since / --until, or a wrongly typed
+        argument is an INVALID_PARAMS error, the tool-call
+        analogue of the CLI's exit code 2.
         """
         model = arguments.get("model")
         if model is not None and not isinstance(model, str):
@@ -1438,7 +1463,22 @@ class MCPServer:
         if tool is not None and not isinstance(tool, str):
             return _error(msg_id, INVALID_PARAMS,
                           "blackbox_cost 'tool' must be a string")
-        totals = cost_totals(load_records(self.log_path))
+        since = arguments.get("since")
+        until = arguments.get("until")
+        last = arguments.get("last")
+        for flag, value in (("--since", since), ("--until", until),
+                            ("--last", last)):
+            if value is not None and not isinstance(value, str):
+                return _error(msg_id, INVALID_PARAMS,
+                              "blackbox_cost %r must be a string"
+                              % flag)
+        try:
+            records = _window_records(
+                load_records(self.log_path),
+                last=last, since=since, until=until)
+        except ValueError as exc:
+            return _error(msg_id, INVALID_PARAMS, str(exc))
+        totals = cost_totals(records)
         result = {}
         if model is not None:
             if not model:

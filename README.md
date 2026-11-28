@@ -388,7 +388,11 @@ a bounded window of consecutive records around the step instead, the
 same window dict `blackbox show` returns, and with `?since=` /
 `?until=` / `?last=` the session is narrowed first, so a step the
 window dropped is not in the session), `blackbox://session/transcript/{seq}` (one step's
-formatted line), and `blackbox://session/span/{seq}` (one step as
+formatted line — with `?before=` / `?after=` in the query string it returns
+a bounded window of consecutive lines around the step instead, the
+same window dict `blackbox transcript` returns, and with `?since=` /
+`?until=` / `?last=` the session is narrowed first, so a step the
+window dropped is not in the session), and `blackbox://session/span/{seq}` (one step as
 a single OTLP span — the step kind as the span name, the step
 number as the span id, start/end times from the record's
 timestamps, and a USD cost attribute on a priced model_call,
@@ -718,7 +722,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 661 tests, all passing (`make test`).
+- 667 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1651,9 +1655,29 @@ and `max_records` counts printed steps, not skipped ones.
   window, or `--last` combined with `--since` / `--until` is an
   INVALID_PARAMS error. Works on `.jsonl` logs and `.db` stores,
   done (v0.76.0).
-  Next: window flags for the `blackbox://session/transcript/{seq}`
-  template, so a client can read a window of transcript lines
-  around a step the same way the template serves one line.
+- Window flags for the `blackbox://session/transcript/{seq}`
+  template: reading `blackbox://session/transcript/2?before=1&after=1`
+  returns a bounded window of consecutive lines around the step —
+  the same window dict `transcript_window` from `replay.py` builds
+  for the `blackbox transcript` CLI command and the
+  `blackbox_transcript` MCP tool, so the template, the tool and the
+  command always agree — in log order, clamped at the session's ends
+  and at most 100 lines, the summary record excluded since it is
+  bookkeeping, not a step; with `?since=` / `?until=` / `?last=` the
+  session is narrowed first through the shared `_window_records`, so
+  a step the window dropped is not in the session, the same window as
+  `blackbox transcript`; with no window flags the template still
+  returns the single line, byte for byte as before. A `before` /
+  `after` value that is not a non-negative integer, a window over 100
+  lines, a step the session does not have, a bad bound, a reversed
+  window, or `--last` combined with `--since` / `--until` is an
+  INVALID_PARAMS error. Works on `.jsonl` logs and `.db` stores,
+  done (v0.77.0).
+  Next: `--since` / `--until` / `--last` time-range filters for the
+  `blackbox://session/aggregates/model/{model}` and
+  `blackbox://session/aggregates/tool/{tool}` templates, so one
+  model's or one tool's totals can be narrowed to a window the
+  same way `blackbox costs` can.
 
 ## Layout
 
@@ -1753,5 +1777,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            661 tests, all passing
+tests/            667 tests, all passing
 ```

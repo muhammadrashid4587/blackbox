@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from blackbox import Recorder
 from blackbox.mcp_server import MCPServer
 from blackbox.otel import records_to_spans, session_span, span_window
-from blackbox.replay import load_records, show_window
+from blackbox.replay import load_records, show_window, transcript_window
 from blackbox.verify import verify
 
 
@@ -2133,6 +2133,130 @@ class MCPServerTest(unittest.TestCase):
         response = self.server.handle_message(
             _request(2, "resources/read",
                      {"uri": "blackbox://session/transcript/"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_transcript_template_window_around_seq(self):
+        # With ?before= / ?after= the template returns a bounded
+        # window of consecutive lines around the step — the same
+        # window dict transcript_window builds for `blackbox
+        # transcript` — clamped at the session's ends, in log
+        # order.
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/transcript/1"
+                            "?before=1&after=2"}))
+        content = response["result"]["contents"][0]
+        self.assertEqual(content["uri"],
+                         "blackbox://session/transcript/1"
+                         "?before=1&after=2")
+        self.assertEqual(content["mimeType"], "application/json")
+        window = json.loads(content["text"])
+        self.assertEqual(window["seq"], 1)
+        self.assertEqual((window["before"], window["after"]), (1, 2))
+        self.assertEqual(window["count"], 4)
+        records = load_records(self.path)
+        self.assertEqual(window["total"], len(records))
+        self.assertEqual([line["seq"] for line in window["lines"]],
+                         [0, 1, 2, 3])
+        self.assertEqual(window, transcript_window(
+            records, 1, before=1, after=2))
+        self.assertIn("model_call", window["lines"][0]["line"])
+        self.assertIn("prompt: hi", window["lines"][0]["line"])
+        self.assertIn("search(query=mcp)", window["lines"][1]["line"])
+        # Clamped at the start: no line before 0.
+        response = self.server.handle_message(
+            _request(8, "resources/read",
+                     {"uri": "blackbox://session/transcript/0"
+                            "?before=5"}))
+        window = json.loads(response["result"]["contents"][0]["text"])
+        self.assertEqual([line["seq"] for line in window["lines"]],
+                         [0])
+        self.assertEqual(window["count"], 1)
+
+    def test_resources_read_session_transcript_template_window_with_since_until(self):
+        # With ?since= / ?until= the session is narrowed first
+        # through the same window as `blackbox transcript`, so a
+        # step the window dropped is not in the session.
+        self._init()
+        self._record_session()
+        records = load_records(self.path)
+        since = records[0]["ts"]
+        until = records[1]["ts"]
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/transcript/1"
+                            "?before=1&after=1&since=%s&until=%s"
+                            % (since, until)}))
+        window = json.loads(response["result"]["contents"][0]["text"])
+        self.assertEqual([line["seq"] for line in window["lines"]],
+                         [0, 1])
+        self.assertEqual(window, transcript_window(
+            records, 1, before=1, after=1, since=since, until=until))
+        # Step 2 fell outside the window: not in the session.
+        response = self.server.handle_message(
+            _request(7, "resources/read",
+                     {"uri": "blackbox://session/transcript/2"
+                            "?before=1&since=%s&until=%s"
+                            % (since, until)}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_transcript_template_window_with_last(self):
+        # With ?last= the session is narrowed to the recent past,
+        # the same relative window as `blackbox transcript --last`.
+        self._init()
+        self._record_session()
+        records = load_records(self.path)
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/transcript/1"
+                            "?before=1&after=1&last=1d"}))
+        window = json.loads(response["result"]["contents"][0]["text"])
+        self.assertEqual([line["seq"] for line in window["lines"]],
+                         [0, 1, 2])
+        self.assertEqual(window, transcript_window(
+            records, 1, before=1, after=1, last="1d"))
+
+    def test_resources_read_session_transcript_template_window_bad_value_is_an_error(self):
+        self._init()
+        self._record_session()
+        for uri in ("blackbox://session/transcript/2?before=abc",
+                    "blackbox://session/transcript/2?before=-1",
+                    "blackbox://session/transcript/2?after=1.5",
+                    "blackbox://session/transcript/2?before=60&after=60",
+                    "blackbox://session/transcript/2?since=not-a-time",
+                    "blackbox://session/transcript/2"
+                    "?since=2026-11-24T02:00:00Z"
+                    "&until=2026-11-24T01:00:00Z",
+                    "blackbox://session/transcript/2"
+                    "?last=1h&since=2026-11-24T01:00:00Z"):
+            response = self.server.handle_message(
+                _request(2, "resources/read", {"uri": uri}))
+            self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_transcript_template_window_unknown_seq_is_an_error(self):
+        self._init()
+        self._record_session()
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/transcript/99"
+                            "?before=1"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_session_transcript_template_window_summary_is_not_a_step(self):
+        # The summary record is bookkeeping, not a step: it has
+        # no transcript line in a window, even though the single
+        # line read formats any record.
+        self._init()
+        self._record_session()
+        self.server.close()
+        records = load_records(self.path)
+        summary = next(r for r in records if r["type"] == "summary")
+        response = self.server.handle_message(
+            _request(2, "resources/read",
+                     {"uri": "blackbox://session/transcript/%d"
+                            "?before=1" % summary["seq"]}))
         self.assertEqual(response["error"]["code"], -32602)
 
     def test_resources_read_session_span_template(self):

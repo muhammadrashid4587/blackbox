@@ -119,7 +119,15 @@ templates, and nine prompts:
                               for step seq — the same line
                               `blackbox replay` prints for that
                               step — so a client can read one step
-                              without the whole transcript
+                              without the whole transcript; with
+                              `?before=` / `?after=` it returns
+                              a bounded window of consecutive lines
+                              around the step instead — the same
+                              window dict `blackbox transcript`
+                              returns — and with `?since=` /
+                              `?until=` / `?last=` the session is
+                              narrowed first, so a step the window
+                              dropped is not in the session
     blackbox://session/span/{seq}
                               one step as a single OTLP span as a
                               resource template: the span for step
@@ -809,9 +817,19 @@ RESOURCE_TEMPLATES = [
                         "resource carries for step seq — the same "
                         "line `blackbox replay` prints for that "
                         "step — so a client can read one step "
-                        "without the whole transcript. Read it by "
-                        "expanding the template with a step number, "
-                        "e.g. blackbox://session/transcript/2."),
+                        "without the whole transcript. With "
+                        "`?before=` / `?after=` in the query "
+                        "string it returns a bounded window of "
+                        "consecutive lines around the step instead "
+                        "— the same window dict the `blackbox "
+                        "transcript` command returns — clamped at "
+                        "the session's ends and at most 100 lines, "
+                        "and with `?since=` / `?until=` / `?last=` "
+                        "the session is narrowed first, so a step "
+                        "the window dropped is not in the session. "
+                        "Read it by expanding the template with a "
+                        "step number, e.g. "
+                        "blackbox://session/transcript/2."),
         "mimeType": "text/plain",
     },
     {
@@ -2539,7 +2557,9 @@ class MCPServer:
             {"uri": uri, "mimeType": "application/json",
              "text": text}]})
 
-    def _read_transcript_step(self, msg_id, uri, seq_text):
+    def _read_transcript_step(self, msg_id, uri, seq_text, before=None,
+                              after=None, since=None, until=None,
+                              last=None):
         """One step's formatted transcript line, as a resource read.
 
         One implementation for the
@@ -2547,10 +2567,44 @@ class MCPServer:
         `session_transcript_step` line for step seq — the same
         line the blackbox://session resource carries for that
         step, and the same helper the blackbox_transcript tool
-        calls, so the template and the tool always agree. A step
-        number that is not an integer, or a step the session does
-        not have, is an error.
+        calls, so the template and the tool always agree. With
+        `before` / `after` in the query string the template
+        returns a bounded window of consecutive lines around the
+        step instead — the same window dict `transcript_window`
+        in replay.py builds for the `blackbox transcript` CLI
+        command and the `blackbox_transcript` tool, so the
+        template, the tool and the command always agree —
+        clamped at the session's ends and at most 100 lines, and
+        with `since` / `until` / `last` the session is narrowed
+        first, so a step the window dropped is not in the
+        session. A step number that is not an integer, a step
+        the session does not have (including the summary record,
+        which is bookkeeping, not a step), a `before` / `after`
+        value that is not a non-negative integer (or a window
+        over 100 lines), a bad bound, a reversed window, or
+        --last combined with --since / --until, is an error.
         """
+        window_flags = {}
+        for flag, value in (("before", before), ("after", after)):
+            if value is None:
+                continue
+            try:
+                parsed = int(value)
+            except ValueError:
+                return _error(
+                    msg_id, INVALID_PARAMS,
+                    "blackbox://session/transcript/{seq} %r must be "
+                    "a non-negative integer" % flag)
+            if parsed < 0:
+                return _error(
+                    msg_id, INVALID_PARAMS,
+                    "blackbox://session/transcript/{seq} %r must be "
+                    "a non-negative integer" % flag)
+            window_flags[flag] = parsed
+        for flag, value in (("since", since), ("until", until),
+                            ("last", last)):
+            if value is not None:
+                window_flags[flag] = value
         try:
             seq = int(unquote(seq_text))
         except ValueError:
@@ -2559,6 +2613,15 @@ class MCPServer:
                 "blackbox://session/transcript/{seq} needs a step "
                 "number, e.g. blackbox://session/transcript/2")
         records = load_records(self.log_path)
+        if window_flags:
+            try:
+                window = transcript_window(records, seq, **window_flags)
+            except ValueError as exc:
+                return _error(msg_id, INVALID_PARAMS, str(exc))
+            text = json.dumps(window, indent=2, sort_keys=True)
+            return _result(msg_id, {"contents": [
+                {"uri": uri, "mimeType": "application/json",
+                 "text": text}]})
         text = session_transcript_step(records, seq)
         if text is None:
             return _error(msg_id, INVALID_PARAMS,
@@ -2820,14 +2883,30 @@ class MCPServer:
             # blackbox://session/transcript/{seq}: one step's
             # formatted transcript line, the same line the
             # blackbox://session resource carries for that step.
-            seq_text = uri[len("blackbox://session/transcript/"):]
+            # The window flags ride in the query string after the
+            # step number, e.g.
+            # blackbox://session/transcript/2?before=1&after=1,
+            # which returns a bounded window of consecutive lines
+            # around the step instead of the single line — the
+            # same window dict the `blackbox transcript` command
+            # returns — so they are split off before the step
+            # number is parsed.
+            seq_part, _, query_text = uri.partition("?")
+            seq_text = seq_part[len("blackbox://session/transcript/"):]
             if not seq_text:
                 return _error(
                     msg_id, INVALID_PARAMS,
                     "blackbox://session/transcript/{seq} needs a "
                     "step number, e.g. "
                     "blackbox://session/transcript/2")
-            return self._read_transcript_step(msg_id, uri, seq_text)
+            query = parse_qs(query_text)
+            return self._read_transcript_step(
+                msg_id, uri, seq_text,
+                before=query.get("before", [None])[0],
+                after=query.get("after", [None])[0],
+                since=query.get("since", [None])[0],
+                until=query.get("until", [None])[0],
+                last=query.get("last", [None])[0])
         if uri.startswith("blackbox://session/span/"):
             # The resource template blackbox://session/span/{seq}:
             # one step as a single OTLP span — the same span the

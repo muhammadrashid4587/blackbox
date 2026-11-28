@@ -767,9 +767,20 @@ RESOURCE_TEMPLATES = [
                         "model — the same per-model entry the "
                         "`blackbox costs` report carries, so a "
                         "client can read one model's spend without "
-                        "the whole breakdown. Read it by expanding "
-                        "the template with a model name, e.g. "
-                        "blackbox://session/aggregates/model/gpt-5."),
+                        "the whole breakdown. The same --since / "
+                        "--until / --last window as `blackbox "
+                        "costs` rides in the query string after "
+                        "the model name, e.g. blackbox://session/"
+                        "aggregates/model/gpt-5"
+                        "?since=2026-11-24T01:00:00Z, and narrows "
+                        "the session before the totals are "
+                        "computed, so a model with no steps in the "
+                        "window is not in the session; a bad bound, "
+                        "a reversed window, or --last combined "
+                        "with --since / --until is an error. Read "
+                        "it by expanding the template with a model "
+                        "name, e.g. blackbox://session/aggregates/"
+                        "model/gpt-5."),
         "mimeType": "application/json",
     },
     {
@@ -781,8 +792,18 @@ RESOURCE_TEMPLATES = [
                         "same per-tool entry the `blackbox costs` "
                         "report carries, so a client can read one "
                         "tool's cost without the whole breakdown. "
-                        "Read it by expanding the template with a "
-                        "tool name, e.g. blackbox://session/"
+                        "The same --since / --until / --last window "
+                        "as `blackbox costs` rides in the query "
+                        "string after the tool name, e.g. "
+                        "blackbox://session/aggregates/tool/search"
+                        "?since=2026-11-24T01:00:00Z, and narrows "
+                        "the session before the totals are "
+                        "computed, so a tool with no steps in the "
+                        "window is not in the session; a bad bound, "
+                        "a reversed window, or --last combined "
+                        "with --since / --until is an error. Read "
+                        "it by expanding the template with a tool "
+                        "name, e.g. blackbox://session/"
                         "aggregates/tool/search."),
         "mimeType": "application/json",
     },
@@ -2452,7 +2473,8 @@ class MCPServer:
             {"uri": uri, "mimeType": "application/json",
              "text": text}]})
 
-    def _read_aggregates_slice(self, msg_id, uri, kind, name_text):
+    def _read_aggregates_slice(self, msg_id, uri, kind, name_text,
+                               since=None, until=None, last=None):
         """One model's or one tool's cost totals, as a resource
         read.
 
@@ -2462,8 +2484,13 @@ class MCPServer:
         `cost_totals` from aggregates.py — the same totals the
         `blackbox costs` report prints — so the template and the
         report always agree, and an unpriced call costs None,
-        never a guessed number. A model or tool the session does
-        not have, or an empty name, is an error.
+        never a guessed number. With `since` / `until` / `last`
+        in the query string the session is narrowed first through
+        the shared `_window_records`, so a model or tool with no
+        steps in the window is not in the session, the same window
+        as `blackbox costs`. A model or tool the session does not
+        have, an empty name, a bad bound, a reversed window, or
+        --last combined with --since / --until is an error.
         """
         name = unquote(name_text)
         if not name:
@@ -2474,6 +2501,11 @@ class MCPServer:
                 % (kind, kind, kind, kind,
                    "gpt-5" if kind == "model" else "search"))
         records = load_records(self.log_path)
+        try:
+            records = _window_records(
+                records, last=last, since=since, until=until)
+        except ValueError as exc:
+            return _error(msg_id, INVALID_PARAMS, str(exc))
         totals = cost_totals(records)
         section = ("per_model" if kind == "model" else "per_tool")
         entry = totals[section].get(name)
@@ -2836,10 +2868,21 @@ class MCPServer:
             # `cost_totals` computes for the `blackbox costs`
             # report. The name is the whole remainder of the URI,
             # percent-decoded, so a model name with a slash in it
-            # still names one model.
-            name_text = uri[len("blackbox://session/aggregates/model/"):]
-            return self._read_aggregates_slice(msg_id, uri, "model",
-                                               name_text)
+            # still names one model. The --since / --until / --last
+            # window rides in the query string after the name,
+            # e.g. blackbox://session/aggregates/model/gpt-5
+            # ?since=2026-11-24T01:00:00Z, and narrows the session
+            # before the totals are computed — so it is split off
+            # before the name is read.
+            name_part, _, query_text = uri.partition("?")
+            name_text = name_part[
+                len("blackbox://session/aggregates/model/"):]
+            query = parse_qs(query_text)
+            return self._read_aggregates_slice(
+                msg_id, uri, "model", name_text,
+                since=query.get("since", [None])[0],
+                until=query.get("until", [None])[0],
+                last=query.get("last", [None])[0])
         if uri.startswith("blackbox://session/aggregates/tool/"):
             # The resource template
             # blackbox://session/aggregates/tool/{tool}: the
@@ -2847,10 +2890,21 @@ class MCPServer:
             # `cost_totals` computes for the `blackbox costs`
             # report. The name is the whole remainder of the URI,
             # percent-decoded, so a tool name with a slash in it
-            # still names one tool.
-            name_text = uri[len("blackbox://session/aggregates/tool/"):]
-            return self._read_aggregates_slice(msg_id, uri, "tool",
-                                               name_text)
+            # still names one tool. The --since / --until / --last
+            # window rides in the query string after the name,
+            # e.g. blackbox://session/aggregates/tool/search
+            # ?since=2026-11-24T01:00:00Z, and narrows the session
+            # before the totals are computed — so it is split off
+            # before the name is read.
+            name_part, _, query_text = uri.partition("?")
+            name_text = name_part[
+                len("blackbox://session/aggregates/tool/"):]
+            query = parse_qs(query_text)
+            return self._read_aggregates_slice(
+                msg_id, uri, "tool", name_text,
+                since=query.get("since", [None])[0],
+                until=query.get("until", [None])[0],
+                last=query.get("last", [None])[0])
         if uri.startswith("blackbox://session/record/"):
             # The resource template blackbox://session/record/{seq}:
             # one step's raw record as JSON, the same record the

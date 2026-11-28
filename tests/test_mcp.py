@@ -1920,6 +1920,124 @@ class MCPServerTest(unittest.TestCase):
                      {"uri": "blackbox://session/aggregates/tool/"}))
         self.assertEqual(response["error"]["code"], -32602)
 
+    def _seed_windowed_aggregates(self):
+        """Two gpt-5 calls an hour ago, a search tool call between
+        them: the first call invoked the search, the second did
+        not."""
+        from datetime import timedelta
+        base = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._w0 = base.isoformat().replace("+00:00", "Z")
+        self._w1 = (base + timedelta(minutes=1)).isoformat().replace(
+            "+00:00", "Z")
+        self._w2 = (base + timedelta(minutes=2)).isoformat().replace(
+            "+00:00", "Z")
+        rec = self.server.recorder
+        rec.record("model_call", {"model": "gpt-5", "prompt": "hi"},
+                   tokens={"input": 1200, "output": 340}, ts=self._w0)
+        rec.record("tool_call", {"tool": "search",
+                                 "args": {"query": "mcp"}}, ts=self._w1)
+        rec.record("model_call", {"model": "gpt-5", "prompt": "again"},
+                   tokens={"input": 100, "output": 50}, ts=self._w2)
+
+    def test_resources_read_aggregates_model_template_window_since(self):
+        # A --since window after the first gpt-5 call narrows the
+        # model's totals to the second call only: 1 call, 100 in +
+        # 50 out = $0.000625, the same slice `blackbox costs
+        # --since` prints.
+        self._init()
+        self._seed_windowed_aggregates()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/aggregates/model/"
+                            "gpt-5?since=" + self._w1}))
+        entry = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(entry["model"], "gpt-5")
+        self.assertEqual(entry["calls"], 1)
+        self.assertEqual(entry["input_tokens"], 100)
+        self.assertEqual(entry["output_tokens"], 50)
+        self.assertEqual(entry["cost_usd"], 0.000625)
+
+    def test_resources_read_aggregates_model_template_window_last(self):
+        # A --last window covering the whole hour-old session
+        # returns the full entry; a --last window of 30 minutes
+        # drops every step, so the model is not in the session.
+        self._init()
+        self._seed_windowed_aggregates()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/aggregates/model/"
+                            "gpt-5?last=2h"}))
+        entry = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(entry["calls"], 2)
+        self.assertEqual(entry["cost_usd"], 0.005525)
+        response = self.server.handle_message(
+            _request(7, "resources/read",
+                     {"uri": "blackbox://session/aggregates/model/"
+                            "gpt-5?last=30m"}))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_resources_read_aggregates_tool_template_window_until(self):
+        # An --until window up to the tool call keeps the first
+        # model call and the search it invoked, and drops the
+        # second call: 1 call charged with 1200 in + 340 out =
+        # $0.0049.
+        self._init()
+        self._seed_windowed_aggregates()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/aggregates/tool/"
+                            "search?until=" + self._w1}))
+        entry = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(entry["tool"], "search")
+        self.assertEqual(entry["calls"], 1)
+        self.assertEqual(entry["input_tokens"], 1200)
+        self.assertEqual(entry["output_tokens"], 340)
+        self.assertEqual(entry["cost_usd"], 0.0049)
+        self.assertEqual(entry["unpriced_calls"], 0)
+
+    def test_resources_read_aggregates_tool_template_window_drops_invoker(self):
+        # A --since window after the model call that invoked the
+        # search keeps the tool call but not the spend that
+        # decided it: the call is still counted, with no cost —
+        # the windowed totals never charge spend from outside the
+        # window.
+        self._init()
+        self._seed_windowed_aggregates()
+        response = self.server.handle_message(
+            _request(6, "resources/read",
+                     {"uri": "blackbox://session/aggregates/tool/"
+                            "search?since=" + self._w1}))
+        entry = json.loads(
+            response["result"]["contents"][0]["text"])
+        self.assertEqual(entry["tool"], "search")
+        self.assertEqual(entry["calls"], 1)
+        self.assertEqual(entry["input_tokens"], 0)
+        self.assertEqual(entry["output_tokens"], 0)
+        self.assertIsNone(entry["cost_usd"])
+
+    def test_resources_read_aggregates_templates_window_bad_bounds(self):
+        # A bad bound, a reversed window, --last combined with
+        # --since, and a bad --last are INVALID_PARAMS errors on
+        # both templates — the resource-read analogue of the CLI
+        # costs' exit code 2.
+        self._init()
+        self._seed_windowed_aggregates()
+        for base in ("blackbox://session/aggregates/model/gpt-5",
+                     "blackbox://session/aggregates/tool/search"):
+            for suffix in ("?since=not-a-time",
+                           "?since=2026-11-24T02:00:00Z"
+                           "&until=2026-11-24T01:00:00Z",
+                           "?last=1h&since=2026-11-24T01:00:00Z",
+                           "?last=soon"):
+                response = self.server.handle_message(
+                    _request(2, "resources/read",
+                             {"uri": base + suffix}))
+                self.assertEqual(response["error"]["code"], -32602,
+                                 base + suffix)
+
     def test_resources_read_session_record_template(self):
         # The same record the blackbox://session.json resource
         # carries for step 1: the tool_call, hash chain included.

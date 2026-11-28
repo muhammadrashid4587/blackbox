@@ -382,7 +382,10 @@ the session does not have, is an error. Five more resource
 templates name one slice each:
 `blackbox://session/aggregates/model/{model}` and
 `blackbox://session/aggregates/tool/{tool}` (one model's or one
-tool's totals), `blackbox://session/record/{seq}` (one step's raw
+tool's totals — with `?since=` / `?until=` / `?last=` in the query
+string the session is narrowed first, the same window as
+`blackbox costs`, so a model or tool with no steps in the window
+is not in the session), `blackbox://session/record/{seq}` (one step's raw
 record — with `?before=` / `?after=` in the query string it returns
 a bounded window of consecutive records around the step instead, the
 same window dict `blackbox show` returns, and with `?since=` /
@@ -722,7 +725,7 @@ and `max_records` counts printed steps, not skipped ones.
 
 ## Measured
 
-- 667 tests, all passing (`make test`).
+- 672 tests, all passing (`make test`).
 - Demo run: 8 steps + summary, 9 records, 510 tokens
   (`make demo`, then `verify` and `replay`).
 
@@ -1678,6 +1681,30 @@ and `max_records` counts printed steps, not skipped ones.
   `blackbox://session/aggregates/tool/{tool}` templates, so one
   model's or one tool's totals can be narrowed to a window the
   same way `blackbox costs` can.
+- Time-range filters for the aggregates templates:
+  `blackbox://session/aggregates/model/{model}` and
+  `blackbox://session/aggregates/tool/{tool}` take the same
+  `--since` / `--until` / `--last` window as `blackbox costs`,
+  as query parameters after the model or tool name — e.g.
+  `blackbox://session/aggregates/model/gpt-5?since=
+  2026-11-24T01:00:00Z&until=2026-11-24T02:00:00Z` — through
+  the shared `_window_records` from `aggregates.py`, so a value
+  that does not parse or carries no timezone is an error,
+  --since after --until is an error, and --last cannot be
+  combined with --since or --until is an error (an
+  INVALID_PARAMS error on a resource read, exit code 2 on the
+  CLI), and a step whose timestamp does not parse, or carries no
+  timezone, never matches. The window is applied to the session
+  before the totals are computed, so a model or tool with no
+  steps in the window is not in the session, and a tool whose
+  invoking model call fell outside the window is still counted,
+  with no cost — the windowed totals never charge spend from
+  outside the window. Works on `.jsonl` logs and `.db` stores,
+  done (v0.78.0).
+  Next: a `--since` / `--until` / `--last` window for the
+  `blackbox_cost` MCP tool, so a client can read one model's or
+  one tool's windowed totals as a tool call the same way the
+  aggregates templates serve them.
 
 ## Layout
 
@@ -1777,5 +1804,5 @@ blackbox/
 scripts/
   demo.py         scripted fake agent run, 8 steps, no real model calls
   demo_sampling.py  MCP sampling against a fake client, no real model
-tests/            667 tests, all passing
+tests/            672 tests, all passing
 ```
